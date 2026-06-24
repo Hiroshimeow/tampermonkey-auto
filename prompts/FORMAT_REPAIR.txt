@@ -1,0 +1,25 @@
+[FORMAT REPAIR]
+ALLOWED_TARGETS: {allowed_targets}
+CURRENT_ROLE: {current_role}
+
+If complete, reply with:
+TASK COMPLETE
+<brief evidence>
+
+Otherwise reply with exactly one fenced JSON object and nothing after it:
+
+```json
+{
+  "target": "{default_target}",
+  "reason": "continue_required",
+  "message": "Next concrete action, relevant state/evidence, blocker if any, and expected verification."
+}
+```
+
+Rules:
+- keys exactly: target, reason, message.
+- target must be in ALLOWED_TARGETS. Do not invent roles.
+- non-MANAGER roles must choose exactly one target, never comma-separated targets.
+- reason and message must be non-empty.
+- no other JSON objects.
+- MANAGER parallel only: comma targets require reason "parallel_dispatch".

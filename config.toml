@@ -1,0 +1,11 @@
+# agents.py runtime defaults
+max_turns = 500
+timeout_s = 5000
+sleep_s = 4
+state_wait_s = 4
+state_reload_after_errors = 10
+send_max_retries = 30
+max_state_chars = 50000
+system_prompt_every_n_asks = 0
+repair_prompt_on_missing_target = true
+max_format_repairs = 4

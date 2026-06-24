@@ -143,7 +143,43 @@ class DiagnosticState:
             "stop_visible": dom.get("stop_visible"),
             "voice_visible": dom.get("voice_visible"),
             "message_counts": counts,
+            "image_count": counts.get("images", 0) if isinstance(counts, dict) else 0,
         }
+
+    @staticmethod
+    def dom_has_no_messages(dom: Dict[str, Any]) -> bool:
+        messages = (dom or {}).get("messages")
+        if not isinstance(messages, dict):
+            return False
+        counts = messages.get("counts") or {}
+        parsed_messages = messages.get("messages")
+        user_count = int(counts.get("user") or 0)
+        assistant_count = int(counts.get("assistant") or 0)
+        return user_count == 0 and assistant_count == 0 and isinstance(parsed_messages, list) and not parsed_messages
+
+    def clear_transcript_cache(self, role: str) -> None:
+        self.transcripts[role] = []
+        self.last_user_message[role] = ""
+        self.last_response[role] = ""
+
+    def apply_dom_transcript_cache(self, role: str, dom: Dict[str, Any]) -> bool:
+        messages = (dom or {}).get("messages")
+        if not isinstance(messages, dict):
+            return False
+
+        parsed_messages = messages.get("messages")
+        if self.dom_has_no_messages(dom):
+            self.clear_transcript_cache(role)
+            return True
+
+        if isinstance(parsed_messages, list):
+            self.transcripts[role] = parsed_messages
+
+        last_user = messages.get("last_user")
+        last_assistant = messages.get("last_assistant")
+        self.last_user_message[role] = last_user.get("text", "") if isinstance(last_user, dict) else ""
+        self.last_response[role] = last_assistant.get("text", "") if isinstance(last_assistant, dict) else ""
+        return True
 
     def create_command(self, role: str, action: str, payload: Optional[dict] = None):
         command_id = str(uuid.uuid4())
@@ -185,6 +221,7 @@ class DiagnosticState:
         command_id = report.command_id or ""
         report_state = report.state
         ignored_session = self.is_ignored_session(report.session_id)
+        empty_dom = self.dom_has_no_messages(report.dom_info)
 
         with self.lock:
             if not ignored_session:
@@ -195,12 +232,14 @@ class DiagnosticState:
 
             if report.dom_info and not ignored_session:
                 self.dom_info[role] = report.dom_info
+                self.apply_dom_transcript_cache(role, report.dom_info)
 
             if command_id:
                 self.command_status[command_id] = report_state
 
             if (
                 not ignored_session
+                and not empty_dom
                 and report_state in {"ASSISTANT_DONE", "TRANSCRIPT_SAVE_ACK", "TRANSCRIPT_SAVED"}
                 and report.text
             ):
@@ -236,6 +275,8 @@ class DiagnosticState:
         last_user = transcript.get("last_user")
         last_assistant = transcript.get("last_assistant")
         ignored_session = self.is_ignored_session(req.session_id)
+        empty_snapshot = self.dom_has_no_messages(snapshot)
+        snapshot_applied = False
 
         with self.lock:
             if req.session_id:
@@ -243,15 +284,16 @@ class DiagnosticState:
 
             if snapshot and not ignored_session:
                 self.dom_info[role] = snapshot
+                snapshot_applied = self.apply_dom_transcript_cache(role, snapshot)
 
-            if messages and not ignored_session:
+            if isinstance(messages, list) and not ignored_session and not empty_snapshot and not snapshot_applied:
                 self.transcripts[role] = messages
 
-            if not ignored_session and isinstance(last_user, dict):
-                self.last_user_message[role] = last_user.get("text", "") or ""
+            if not ignored_session and not empty_snapshot and not snapshot_applied:
+                self.last_user_message[role] = last_user.get("text", "") if isinstance(last_user, dict) else ""
 
-            if not ignored_session and isinstance(last_assistant, dict):
-                self.last_response[role] = last_assistant.get("text", "") or ""
+            if not ignored_session and not empty_snapshot and not snapshot_applied:
+                self.last_response[role] = last_assistant.get("text", "") if isinstance(last_assistant, dict) else ""
 
             self.log(
                 role,
@@ -288,6 +330,7 @@ def api_status(req: StatusRequest):
             state.sessions[role].add(req.session_id)
         if req.dom_info and not state.is_ignored_session(req.session_id):
             state.dom_info[role] = req.dom_info
+            state.apply_dom_transcript_cache(role, req.dom_info)
         if not state.is_ignored_session(req.session_id):
             state.status[role] = "ONLINE"
 

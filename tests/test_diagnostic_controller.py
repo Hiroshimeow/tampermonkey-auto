@@ -211,6 +211,142 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.last_user_message["A"], "")
         self.assertEqual(controller.state.last_response["A"], "")
 
+    def test_empty_sync_clears_stale_transcript_state(self):
+        self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/old",
+                "reason": "initial",
+                "transcript": {
+                    "messages": [{"role": "user", "text": "old prompt"}],
+                    "last_user": {"text": "old prompt"},
+                    "last_assistant": {"text": "old answer"},
+                    "counts": {"user": 1, "assistant": 1},
+                },
+                "snapshot": {"messages": {"messages": [], "counts": {}}},
+            },
+        )
+
+        self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/",
+                "reason": "empty_chat",
+                "transcript": {
+                    "messages": [],
+                    "last_user": None,
+                    "last_assistant": None,
+                    "counts": {},
+                },
+                "snapshot": {"messages": {"messages": [], "counts": {}}},
+            },
+        )
+
+        self.assertEqual(controller.state.transcripts["DEV"], [])
+        self.assertEqual(controller.state.last_user_message["DEV"], "")
+        self.assertEqual(controller.state.last_response["DEV"], "")
+
+    def test_empty_status_clears_stale_transcript_state(self):
+        self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV2",
+                "session_id": "/c/old",
+                "reason": "initial",
+                "transcript": {
+                    "messages": [{"role": "user", "text": "old prompt"}],
+                    "last_user": {"text": "old prompt"},
+                    "last_assistant": {"text": "old answer"},
+                    "counts": {"user": 1, "assistant": 1},
+                },
+                "snapshot": {"messages": {"messages": [{"role": "user", "text": "old prompt"}], "counts": {"user": 1, "assistant": 1}}},
+            },
+        )
+
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "DEV2",
+                "session_id": "/",
+                "dom_info": {
+                    "composer_text_len": 0,
+                    "stop_visible": False,
+                    "messages": {"messages": [], "counts": {"user": 0, "assistant": 0}},
+                },
+            },
+        )
+
+        role_response = self.client.get("/api/admin/role/DEV2")
+        role_payload = role_response.json()
+        self.assertEqual(role_payload["last_user"], "")
+        self.assertEqual(role_payload["last_response"], "")
+        self.assertEqual(controller.state.transcripts["DEV2"], [])
+
+    def test_status_replaces_stale_transcript_state_from_current_dom(self):
+        self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/old",
+                "reason": "initial",
+                "transcript": {
+                    "messages": [
+                        {"role": "user", "text": "old prompt"},
+                        {"role": "assistant", "text": "old answer"},
+                    ],
+                    "last_user": {"text": "old prompt"},
+                    "last_assistant": {"text": "old answer"},
+                    "counts": {"user": 1, "assistant": 1},
+                },
+                "snapshot": {
+                    "messages": {
+                        "messages": [
+                            {"role": "user", "text": "old prompt"},
+                            {"role": "assistant", "text": "old answer"},
+                        ],
+                        "counts": {"user": 1, "assistant": 1},
+                        "last_user": {"text": "old prompt"},
+                        "last_assistant": {"text": "old answer"},
+                    }
+                },
+            },
+        )
+
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "DEV",
+                "session_id": "/c/new",
+                "dom_info": {
+                    "composer_text_len": 0,
+                    "stop_visible": False,
+                    "messages": {
+                        "messages": [
+                            {"role": "user", "text": "new prompt"},
+                            {"role": "assistant", "text": "new answer"},
+                        ],
+                        "counts": {"user": 1, "assistant": 1},
+                        "last_user": {"text": "new prompt"},
+                        "last_assistant": {"text": "new answer"},
+                    },
+                },
+            },
+        )
+
+        role_response = self.client.get("/api/admin/role/DEV")
+        role_payload = role_response.json()
+        self.assertEqual(role_payload["last_user"], "new prompt")
+        self.assertEqual(role_payload["last_response"], "new answer")
+        self.assertEqual(
+            controller.state.transcripts["DEV"],
+            [
+                {"role": "user", "text": "new prompt"},
+                {"role": "assistant", "text": "new answer"},
+            ],
+        )
+
     @patch("diagnostic_controller.time.sleep")
     @patch("diagnostic_controller.os.kill")
     @patch("diagnostic_controller.find_pid_on_port")

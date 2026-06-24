@@ -152,8 +152,36 @@
         ]);
     }
 
+    function chatRootElement() {
+        return document.querySelector('main') || document.body;
+    }
+
     function messageElements() {
-        return Array.from(document.querySelectorAll('[data-message-author-role]'));
+        const root = chatRootElement();
+        return Array.from(root.querySelectorAll('[data-message-author-role]')).filter((node) => {
+            const role = node.getAttribute('data-message-author-role') || '';
+            return ['user', 'assistant'].includes(role) && isVisible(node);
+        });
+    }
+
+    function imageSummary(root) {
+        if (!root) {
+            return [];
+        }
+        return Array.from(root.querySelectorAll('img')).map((img) => {
+            const rect = typeof img.getBoundingClientRect === 'function' ? img.getBoundingClientRect() : null;
+            return {
+                src: img.currentSrc || img.src || '',
+                alt: img.getAttribute('alt') || '',
+                title: img.getAttribute('title') || '',
+                natural_width: Number(img.naturalWidth || 0),
+                natural_height: Number(img.naturalHeight || 0),
+                rendered_width: rect ? Math.round(rect.width) : 0,
+                rendered_height: rect ? Math.round(rect.height) : 0,
+                visible: isVisible(img),
+                path: domPath(img)
+            };
+        }).filter((item) => item.src || item.alt || item.visible);
     }
 
     function textOf(el) {
@@ -451,15 +479,21 @@
         const messages = messageElements().map((node) => {
             const role = node.getAttribute('data-message-author-role') || 'unknown';
             const text = textOf(node);
+            const images = imageSummary(node);
             return {
                 role,
                 text,
-                length: text.length
+                length: text.length,
+                image_count: images.length,
+                images,
+                path: domPath(node),
+                visible: isVisible(node)
             };
         });
 
         const counts = messages.reduce((acc, item) => {
             acc[item.role] = (acc[item.role] || 0) + 1;
+            acc.images = (acc.images || 0) + item.image_count;
             return acc;
         }, {});
 

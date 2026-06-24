@@ -17,6 +17,11 @@ assert.match(source, /await sleep\(randomBetween\(config\.action_delay_min_ms,\s
 assert.match(source, /await sleep\(randomBetween\(config\.send_delay_min_ms,\s*config\.send_delay_max_ms\)\)/, 'CLICK_SEND path must wait with send delay');
 assert.match(source, /function buildTurnContext\(snapshot,\s*commandId\)/, 'tampermonkey.js must define buildTurnContext()');
 assert.match(source, /function isSendAccepted\(reasons\)/, 'tampermonkey.js must define isSendAccepted()');
+assert.match(source, /function chatRootElement\(\)/, 'message parsing must be scoped to the chat root');
+assert.match(source, /root\.querySelectorAll\('\[data-message-author-role\]'\)/, 'messageElements must not query the whole document');
+assert.match(source, /function imageSummary\(root\)/, 'message parsing must include image metadata');
+assert.match(source, /image_count:\s*images\.length/, 'each parsed message must expose image_count');
+assert.match(source, /acc\.images = \(acc\.images \|\| 0\) \+ item\.image_count;/, 'message counts must include total images');
 assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must persist accepted turn context');
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');

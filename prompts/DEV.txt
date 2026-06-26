@@ -161,26 +161,6 @@ Your implementation should be:
 - clear enough for REVIEW,
 - concrete enough for AUDIT or MANAGER verification.
 
-[DECISION PRINCIPLES]
-Choose the next target based on the actual state.
-
-Use REVIEW when:
-- implementation is complete,
-- evidence is present,
-- engineering judgment is needed before independent validation.
-
-Use PLAN when:
-- the instruction is unclear,
-- the scope conflicts with the goal,
-- the task needs replanning,
-- you discover a better direction that changes the task shape,
-- you cannot choose safely between multiple implementation strategies.
-
-Use MANAGER when:
-- MANAGER is already in the workflow and requires report-back,
-- implementation is complete and the next coordination decision belongs to MANAGER,
-- a blocker or risk must be escalated for routing.
-
 [DO NOT]
 - Do not claim completion without evidence.
 - Do not hide failed commands.

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -63,6 +64,8 @@ class AgentConfig:
     repair_prompt_on_missing_target: bool = True
     busy_reload_after_s: int = 600
     busy_reload_wait_s: int = 10
+    soft_stuck_stable_samples: int = 2
+    soft_stuck_sample_s: float = 1.0
 
     def __post_init__(self):
         self.role = self.role.upper().strip()
@@ -83,6 +86,8 @@ SYNC_TIMEOUT_S = 600
 SEND_MAX_RETRIES = 5
 ROLE_ASK_COUNTS: dict[str, int] = {}
 ACTIVE_ROLES: list[str] = []
+ROLE_UI_DIRTY: dict[str, bool] = {}
+ROLE_PROCESSED_RESPONSE_HASH: dict[str, str] = {}
 
 _HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
 _HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "")
@@ -229,6 +234,40 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
+def response_fingerprint(text: str) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def routing_fingerprint(text: str) -> str:
+    for candidate in iter_json_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and any(key in parsed for key in ["target", "reason", "message"]):
+            canonical = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+            return response_fingerprint(canonical)
+    return ""
+
+
+def mark_processed_response(role: str, response: str) -> str:
+    digest = response_fingerprint(response)
+    if digest:
+        ROLE_PROCESSED_RESPONSE_HASH[str(role or "").upper().strip()] = digest
+    return response
+
+
+def mark_role_ui_dirty(role: str) -> None:
+    ROLE_UI_DIRTY[str(role or "").upper().strip()] = True
+
+
+def clear_role_ui_dirty(role: str) -> None:
+    ROLE_UI_DIRTY.pop(str(role or "").upper().strip(), None)
+
+
 def load_prompt_template(name: str, prompts_dir: str | Path = "prompts") -> str:
     path = Path(prompts_dir) / name
     if not path.exists():
@@ -250,6 +289,52 @@ def build_routing_contract_prompt(
 ) -> str:
     template = load_prompt_template("ROUTING_CONTRACT.txt", prompts_dir)
     return render_prompt_template(template, {"allowed_targets": ", ".join(allowed_targets)})
+
+
+def load_decision_prompt(target: str, prompts_dir: str | Path = "prompts") -> str:
+    target = str(target or "").upper().strip()
+    if not target:
+        return ""
+    path = Path(prompts_dir) / "decisions" / f"{target}.txt"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def build_target_decision_guide(
+    allowed_targets: list[str],
+    current_role: str = "",
+    *,
+    prompts_dir: str | Path = "prompts",
+) -> str:
+    targets = allowed_targets_for(allowed_targets)
+    cards = []
+    for target in targets:
+        card = load_decision_prompt(target, prompts_dir)
+        if card:
+            cards.append(card)
+
+    current = str(current_role or "").upper().strip()
+    dispatchable = [target for target in targets if target not in {"MANAGER", "FINISH"}]
+    if current == "MANAGER" and len(dispatchable) >= 2:
+        cards.append(
+            "[PARALLEL DISPATCH]\n"
+            "Only MANAGER may dispatch multiple active non-MANAGER targets.\n"
+            f"Allowed parallel targets in this run: {', '.join(dispatchable)}.\n"
+            "Use parallel_dispatch only when the target tasks are independent."
+        )
+    elif current == "MANAGER":
+        cards.append(
+            "[PARALLEL DISPATCH]\n"
+            "Parallel dispatch is not available in this run because fewer than two active non-MANAGER targets exist."
+        )
+
+    if not cards:
+        return ""
+    return "\n\n".join([
+        "[TARGET DECISION GUIDE]\nOnly consider targets present in ALLOWED_TARGETS.",
+        *cards,
+    ])
 
 
 def build_agent_prompt(
@@ -278,6 +363,9 @@ def build_agent_prompt(
         parts.append(f"CURRENT_STATE:\n{state}")
     else:
         parts.append(f"CURRENT_STATE:\nNo prior state in this {config.role} run.")
+    decision_guide = build_target_decision_guide(allowed_targets, config.role, prompts_dir=prompts_dir)
+    if decision_guide:
+        parts.append(decision_guide)
     parts.append(build_routing_contract_prompt(allowed_targets, prompts_dir=prompts_dir))
     return "\n\n".join(parts)
 
@@ -322,10 +410,14 @@ def classify_chat_state(snapshot: dict) -> dict:
         "message_count": len(parsed_messages) if isinstance(parsed_messages, list) else 0,
         "last_user_len": len(last_user),
         "response_len": len(response),
+        "response_hash": response_fingerprint(response),
+        "routing_hash": routing_fingerprint(response),
     }
 
     if composer_len > 0 or composer_text.strip():
         return {**base, "kind": "composer_has_text"}
+    if stop_visible and response:
+        return {**base, "kind": "assistant_soft_stuck", "should_wait_response": True}
     if stop_visible:
         return {**base, "kind": "assistant_generating", "should_wait_response": True}
     if response:
@@ -445,6 +537,33 @@ class BrowserAgent:
         time.sleep(wait_s)
         return classify_chat_state(self.get_role_snapshot(reason="agent_after_busy_reload"))
 
+    def record_processed_response(self, response: str) -> str:
+        return mark_processed_response(self.config.role, response)
+
+    def stabilize_soft_stuck_response(self, initial_state: dict, stale_response: str = "") -> dict | None:
+        response = str(initial_state.get("response") or "").strip()
+        if not response:
+            return None
+        if stale_response and response_fingerprint(response) == response_fingerprint(stale_response):
+            return None
+
+        stable_state = initial_state
+        last_hash = initial_state.get("response_hash") or response_fingerprint(response)
+        samples = max(1, safe_int(self.config.soft_stuck_stable_samples, 2))
+        for _ in range(samples):
+            time.sleep(float(self.config.soft_stuck_sample_s))
+            next_state = classify_chat_state(self.get_role_snapshot(reason="agent_soft_stuck_sample"))
+            if not next_state.get("response"):
+                return None
+            next_hash = next_state.get("response_hash") or response_fingerprint(next_state.get("response"))
+            if next_hash != last_hash:
+                return None
+            stable_state = next_state
+
+        mark_role_ui_dirty(self.config.role)
+        print(f"[recover] {self.config.role}: accepting stable response while STOP button is still visible; reload queued before next send")
+        return {**stable_state, "kind": "assistant_soft_stuck_response", "can_send_prompt": True, "soft_stuck": True}
+
     def wait_for_sendable_chat(
         self,
         stale_response: str = "",
@@ -454,6 +573,12 @@ class BrowserAgent:
         time = __import__("time")
         consecutive_errors = 0
         blocked_since = None
+        if ROLE_UI_DIRTY.get(self.config.role):
+            state = self.reload_wait_and_reclassify("previous response was accepted from soft-stuck UI")
+            clear_role_ui_dirty(self.config.role)
+            if state.get("can_send_prompt"):
+                return state
+
         while True:
             try:
                 state = classify_chat_state(self.get_role_snapshot(reason="agent_before_send"))
@@ -474,6 +599,22 @@ class BrowserAgent:
                 f"messages={state['message_count']} images={state['image_count']} "
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
+            if state["kind"] == "assistant_soft_stuck" and state.get("response"):
+                if allow_processed_response and (
+                    allow_any_processed_response
+                    or response_fingerprint(state["response"]) != response_fingerprint(stale_response)
+                ):
+                    stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                    if stable_state:
+                        blocked_since = None
+                        return stable_state
+                if response_fingerprint(state["response"]) == response_fingerprint(stale_response):
+                    state = self.reload_wait_and_reclassify("soft-stuck UI is showing an already processed response")
+                    clear_role_ui_dirty(self.config.role)
+                    blocked_since = None
+                    if state.get("can_send_prompt"):
+                        return state
+
             if (
                 allow_processed_response
                 and state["kind"] == "assistant_ready"
@@ -511,7 +652,7 @@ class BrowserAgent:
             print(f"[wait] {self.config.role}: chat is busy or has user draft; waiting before SET_PROMPT")
             time.sleep(self.config.state_wait_s)
 
-    def wait_for_live_response(self) -> str:
+    def wait_for_live_response(self, stale_response: str = "") -> str:
         time = __import__("time")
         consecutive_errors = 0
         while True:
@@ -535,7 +676,11 @@ class BrowserAgent:
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
             if state["kind"] == "assistant_ready" and state["response"]:
-                return state["response"]
+                return self.record_processed_response(state["response"])
+            if state["kind"] == "assistant_soft_stuck" and state.get("response"):
+                stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                if stable_state:
+                    return self.record_processed_response(stable_state["response"])
             time.sleep(self.config.state_wait_s)
 
     def send_and_wait(
@@ -555,16 +700,16 @@ class BrowserAgent:
                     allow_processed_response=use_existing_response,
                     allow_any_processed_response=allow_any_existing_response,
                 )
-                if use_existing_response and state["kind"] == "assistant_ready" and state["response"]:
+                if use_existing_response and state["kind"] in {"assistant_ready", "assistant_soft_stuck_response"} and state["response"]:
                     print(f"[send] {role}: existing response became available before send; using it")
-                    return state["response"]
+                    return self.record_processed_response(state["response"])
                 if (
-                    state["kind"] == "assistant_ready"
+                    state["kind"] in {"assistant_ready", "assistant_soft_stuck_response"}
                     and state["response"]
-                    and state["response"] != stale_response
+                    and response_fingerprint(state["response"]) != response_fingerprint(stale_response)
                 ):
                     print(f"[send] {role}: new response became available before send; using it")
-                    return state["response"]
+                    return self.record_processed_response(state["response"])
 
                 self.run_command(role, "PROBE", timeout=self.probe_timeout_s, print_every=1.0)
                 self.run_command(
@@ -601,10 +746,10 @@ class BrowserAgent:
             assistant = self.run_command(role, "WAIT_ASSISTANT_DONE", timeout=self.config.timeout_s, print_every=5.0)
             if assistant.get("state") != "ASSISTANT_DONE":
                 print(f"[wait] {role}: WAIT_ASSISTANT_DONE state={assistant.get('state')}; polling live response")
-                return self.wait_for_live_response()
+                return self.wait_for_live_response(stale_response=stale_response)
         except Exception as e:
             print(f"[wait] {role}: WAIT_ASSISTANT_DONE failed; polling live response: {e}")
-            return self.wait_for_live_response()
+            return self.wait_for_live_response(stale_response=stale_response)
 
         try:
             self.run_command(role, "SYNC_TRANSCRIPT", {"reason": "agent_ask"}, timeout=self.sync_timeout_s, print_every=1.0)
@@ -613,8 +758,8 @@ class BrowserAgent:
 
         response = (assistant.get("text") or "").strip()
         if not response:
-            return self.wait_for_live_response()
-        return response
+            return self.wait_for_live_response(stale_response=stale_response)
+        return self.record_processed_response(response)
 
 
 def parse_routing(text: str) -> dict | None:
@@ -722,6 +867,8 @@ def make_browser_agent_from_core(role: str, active_roles: list[str], timeout_s: 
         repair_prompt_on_missing_target=bool(settings.get("repair_prompt_on_missing_target", True)),
         busy_reload_after_s=safe_int(settings.get("busy_reload_after_s"), 600),
         busy_reload_wait_s=safe_int(settings.get("busy_reload_wait_s"), 10),
+        soft_stuck_stable_samples=safe_int(settings.get("soft_stuck_stable_samples"), 2),
+        soft_stuck_sample_s=float(settings.get("soft_stuck_sample_s", 1.0)),
     )
     return BrowserAgent(
         config,

@@ -64,22 +64,6 @@ In the JSON message, include:
 - the consequence of each option,
 - the recommended default if any.
 
-[DECISION PRINCIPLES]
-Use A when:
-- A should revise, synthesize, or answer critique,
-- the discussion needs a stronger framing,
-- tradeoffs should be converted into a proposal.
-
-Use PLAN when:
-- the idea is sufficiently clear,
-- risks are understood,
-- remaining caveats can be handled during planning.
-
-Use MANAGER when:
-- user input is needed,
-- MANAGER is active,
-- coordination or a pause is required.
-
 [DO NOT]
 - Do not implement.
 - Do not write code.

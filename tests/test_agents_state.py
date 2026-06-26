@@ -438,6 +438,124 @@ def test_routing_contract_is_loaded_from_prompts_dir(tmp_path):
     assert "CONTRACT DEV, FINISH" in prompt
 
 
+def test_decision_guide_loads_only_allowed_target_cards(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    decisions = prompts / "decisions"
+    decisions.mkdir(parents=True)
+    (prompts / "ROUTING_CONTRACT.txt").write_text("CONTRACT {allowed_targets}", encoding="utf-8")
+    (decisions / "DEV.txt").write_text("[DECISION: DEV] use dev", encoding="utf-8")
+    (decisions / "REVIEW.txt").write_text("[DECISION: REVIEW] use review", encoding="utf-8")
+    (decisions / "PLAN.txt").write_text("[DECISION: PLAN] use plan", encoding="utf-8")
+    (decisions / "FINISH.txt").write_text("[DECISION: FINISH] use finish", encoding="utf-8")
+    config = agents.AgentConfig("DEV", ["DEV", "REVIEW"])
+
+    prompt = agents.build_agent_prompt("", "Goal", "State", 1, config, attach_system=False, prompts_dir=prompts)
+
+    assert "[TARGET DECISION GUIDE]" in prompt
+    assert "[DECISION: DEV]" in prompt
+    assert "[DECISION: REVIEW]" in prompt
+    assert "[DECISION: FINISH]" in prompt
+    assert "[DECISION: PLAN]" not in prompt
+
+
+def test_manager_parallel_guide_uses_active_targets_only(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    decisions = prompts / "decisions"
+    decisions.mkdir(parents=True)
+    (prompts / "ROUTING_CONTRACT.txt").write_text("CONTRACT {allowed_targets}", encoding="utf-8")
+    (decisions / "DEV.txt").write_text("[DECISION: DEV]", encoding="utf-8")
+    (decisions / "REVIEW.txt").write_text("[DECISION: REVIEW]", encoding="utf-8")
+    (decisions / "A.txt").write_text("[DECISION: A]", encoding="utf-8")
+    config = agents.AgentConfig("MANAGER", ["MANAGER", "DEV", "REVIEW"])
+
+    prompt = agents.build_agent_prompt("", "Goal", "State", 1, config, attach_system=False, prompts_dir=prompts)
+
+    assert "Allowed parallel targets in this run: DEV, REVIEW." in prompt
+    assert "[DECISION: A]" not in prompt
+
+
+def test_soft_stuck_stop_with_response_is_candidate_state():
+    agents = load_agents_module()
+    response = '{"target":"REVIEW","reason":"ready","message":"check"}'
+
+    state = agents.classify_chat_state({
+        "dom_info": {
+            "composer_text_len": 0,
+            "stop_visible": True,
+            "messages": {"counts": {"user": 1, "assistant": 1}, "messages": []},
+        },
+        "last_response": response,
+        "last_user": "prompt",
+    })
+
+    assert state["kind"] == "assistant_soft_stuck"
+    assert state["response_hash"] == agents.response_fingerprint(response)
+    assert state["routing_hash"]
+
+
+def test_wait_for_live_response_accepts_stable_soft_stuck_response(monkeypatch):
+    agents = load_agents_module()
+    agents.ROLE_UI_DIRTY.clear()
+    response = '{"target":"REVIEW","reason":"ready","message":"check"}'
+    snapshots = [
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": True, "messages": {"counts": {"user": 1, "assistant": 1}, "messages": []}},
+            "last_response": response,
+            "last_user": "prompt",
+        },
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": True, "messages": {"counts": {"user": 1, "assistant": 1}, "messages": []}},
+            "last_response": response,
+            "last_user": "prompt",
+        },
+    ]
+
+    agent = agents.BrowserAgent(
+        agents.AgentConfig("DEV", ["DEV"], soft_stuck_stable_samples=1, soft_stuck_sample_s=0),
+        run_command_fn=lambda *args, **_kwargs: {"state": "TRANSCRIPT_SAVED"},
+        http_json_fn=lambda *_args, **_kwargs: snapshots.pop(0),
+        try_reset_page_fn=lambda *_args: None,
+    )
+    monkeypatch.setattr(agents.time, "sleep", lambda *_args: None)
+
+    assert agent.wait_for_live_response(stale_response="old") == response
+    assert agents.ROLE_UI_DIRTY["DEV"] is True
+    assert agents.ROLE_PROCESSED_RESPONSE_HASH["DEV"] == agents.response_fingerprint(response)
+
+
+def test_wait_for_sendable_chat_reloads_duplicate_soft_stuck_response(monkeypatch):
+    agents = load_agents_module()
+    response = '{"target":"REVIEW","reason":"ready","message":"check"}'
+    snapshots = [
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": True, "messages": {"counts": {"user": 1, "assistant": 1}, "messages": []}},
+            "last_response": response,
+            "last_user": "prompt",
+        },
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": False, "messages": {"counts": {"user": 0, "assistant": 0}, "messages": []}},
+            "last_response": "",
+            "last_user": "",
+        },
+    ]
+    resets = []
+
+    agent = agents.BrowserAgent(
+        agents.AgentConfig("DEV", ["DEV"], busy_reload_wait_s=0),
+        run_command_fn=lambda *args, **_kwargs: {"state": "TRANSCRIPT_SAVED"},
+        http_json_fn=lambda *_args, **_kwargs: snapshots.pop(0),
+        try_reset_page_fn=lambda role: resets.append(role),
+    )
+    monkeypatch.setattr(agents.time, "sleep", lambda *_args: None)
+
+    state = agent.wait_for_sendable_chat(stale_response=response, allow_processed_response=True)
+
+    assert state["kind"] == "empty_chat"
+    assert resets == ["DEV"]
+
+
 def test_target_allowed_by_selected_roles():
     agents = load_agents_module()
 

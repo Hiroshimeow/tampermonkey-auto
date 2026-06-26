@@ -1,0 +1,4 @@
+[DECISION: A]
+Use A when the workflow needs problem framing, option generation, or product/design exploration.
+Use A when a vague idea needs practical directions before planning.
+Do not route to A for implementation, code review, or final audit.

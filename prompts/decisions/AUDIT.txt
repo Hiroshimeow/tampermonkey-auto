@@ -1,0 +1,4 @@
+[DECISION: AUDIT]
+Use AUDIT when actual outputs, files, formats, tests, logs, counts, or artifacts must be independently verified.
+Use AUDIT after REVIEW passes or when claims need direct reality checks.
+Do not route to AUDIT when implementation evidence is missing or review judgment is still required.

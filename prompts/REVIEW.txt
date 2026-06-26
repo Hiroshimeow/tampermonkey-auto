@@ -142,26 +142,6 @@ A blocker is an issue that can cause:
 
 Non-blocking suggestions should not cause REVIEW FAIL.
 
-[DECISION PRINCIPLES]
-Choose the next target based on the actual state.
-
-Use AUDIT when:
-- implementation is acceptable,
-- no blocker remains,
-- evidence is sufficient for independent validation.
-
-Use DEV when:
-- concrete fixes are required,
-- implementation is incomplete, incorrect, risky, unmaintainable, or unsupported by evidence.
-
-Use PLAN when:
-- scope, acceptance criteria, architecture direction, or product direction is unclear,
-- the issue is not simply a DEV fix but requires replanning.
-
-Use MANAGER when:
-- MANAGER is already in the workflow and requires report-back,
-- review is complete and routing should return to MANAGER for the next decision.
-
 [DO NOT]
 - Do not re-implement the solution.
 - Do not perform AUDIT’s final validation.

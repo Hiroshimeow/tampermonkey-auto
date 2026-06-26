@@ -101,6 +101,70 @@ def test_ask_agent_once_attaches_system_only_first_time(monkeypatch):
     assert "DEV SYSTEM PROMPT" not in sent_prompts[1]
 
 
+def test_manager_alias_prompt_falls_back_to_manager_prompt(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "MANAGER.txt").write_text("MANAGER SYSTEM", encoding="utf-8")
+
+    assert agents.load_role_prompt("MANAGER1", prompts_dir=prompts) == "MANAGER SYSTEM"
+    assert agents.load_role_prompt("MANAGER_2", prompts_dir=prompts) == "MANAGER SYSTEM"
+    assert agents.load_role_prompt("MANAGERabc", prompts_dir=prompts) == "MANAGER SYSTEM"
+
+
+def test_manager_alias_uses_manager_decision_card(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    decisions = prompts / "decisions"
+    decisions.mkdir(parents=True)
+    (prompts / "ROUTING_CONTRACT.txt").write_text("CONTRACT {allowed_targets}", encoding="utf-8")
+    (decisions / "MANAGER.txt").write_text("[DECISION: MANAGER]", encoding="utf-8")
+    config = agents.AgentConfig("DEV", ["MANAGER_1", "DEV"])
+
+    prompt = agents.build_agent_prompt("", "Goal", "State", 1, config, attach_system=False, prompts_dir=prompts)
+
+    assert "ALLOWED_TARGETS: [MANAGER_1]" in prompt
+    assert "[DECISION: MANAGER]" in prompt
+    assert "FINISH" not in prompt.split("ALLOWED_TARGETS:", 1)[1].split("CURRENT TURN:", 1)[0]
+
+
+def test_manager_mode_allowed_targets_are_role_specific():
+    agents = load_agents_module()
+
+    assert agents.allowed_targets_for(["MANAGER1", "DEV", "REVIEW"], "DEV") == ["MANAGER1"]
+    assert agents.allowed_targets_for(["MANAGER1", "DEV", "REVIEW"], "MANAGER1") == ["MANAGER1", "DEV", "REVIEW", "FINISH"]
+    assert agents.allowed_targets_for(["DEV", "REVIEW"], "DEV") == ["DEV", "REVIEW", "FINISH"]
+
+
+def test_manager_mode_non_manager_must_return_to_manager_alias():
+    agents = load_agents_module()
+    ok = {"target": "MANAGER1", "reason": "report", "message": "DEV report."}
+    bad_peer = {"target": "REVIEW", "reason": "review", "message": "Review this."}
+    bad_finish = {"target": "FINISH", "reason": "done", "message": "complete."}
+
+    assert agents.validate_routing_contract(ok, ["MANAGER1"], "DEV").ok
+    assert not agents.validate_routing_contract(bad_peer, ["MANAGER1"], "DEV").ok
+    assert not agents.validate_routing_contract(bad_finish, ["MANAGER1"], "DEV").ok
+
+
+def test_manager_alias_can_finish_and_parallel_dispatch():
+    agents = load_agents_module()
+    finish = {"target": "FINISH", "reason": "done", "message": "verified."}
+    parallel = {"target": "DEV,REVIEW", "reason": "parallel_dispatch", "message": "Work independently."}
+
+    assert agents.validate_routing_contract(finish, ["MANAGER1", "DEV", "REVIEW", "FINISH"], "MANAGER1").ok
+    assert agents.validate_routing_contract(parallel, ["MANAGER1", "DEV", "REVIEW", "FINISH"], "MANAGER1").ok
+    assert agents.parse_parallel_targets(parallel, ["MANAGER1", "DEV", "REVIEW", "FINISH"], "MANAGER1") == ["DEV", "REVIEW"]
+
+
+def test_resolve_next_target_blocks_finish_for_worker_in_manager_mode():
+    agents = load_agents_module()
+
+    assert agents.resolve_next_target("FINISH", ["MANAGER1", "DEV"], ["MANAGER1"], "DEV") == ""
+    assert agents.resolve_next_target("MANAGER1", ["MANAGER1", "DEV"], ["MANAGER1"], "DEV") == "MANAGER1"
+    assert agents.resolve_next_target("FINISH", ["MANAGER1", "DEV"], ["MANAGER1", "DEV", "FINISH"], "MANAGER1") == "FINISH"
+
+
 def test_load_role_prompt_uses_base_prompt_for_numbered_role(tmp_path):
     agents = load_agents_module()
     prompts = tmp_path / "prompts"
@@ -374,9 +438,9 @@ def test_validate_routing_contract_requires_exact_schema_and_real_values():
     missing_reason = {"target": "PLAN", "message": "Create a plan."}
     placeholder = {"target": "xxx", "reason": "ready", "message": "Create a plan."}
 
-    assert agents.validate_routing_contract(valid, ["B", "PLAN", "MANAGER"], "A").ok
-    assert not agents.validate_routing_contract(missing_reason, ["B", "PLAN", "MANAGER"], "A").ok
-    assert not agents.validate_routing_contract(placeholder, ["B", "PLAN", "MANAGER"], "A").ok
+    assert agents.validate_routing_contract(valid, ["B", "PLAN"], "A").ok
+    assert not agents.validate_routing_contract(missing_reason, ["B", "PLAN"], "A").ok
+    assert not agents.validate_routing_contract(placeholder, ["B", "PLAN"], "A").ok
 
 
 def test_validate_routing_contract_allows_manager_parallel_only():
@@ -561,6 +625,33 @@ def test_target_allowed_by_selected_roles():
 
     assert agents.resolve_next_target("B", ["A", "B"], ["A", "B"]) == "B"
     assert agents.resolve_next_target("PLAN", ["A", "B"], ["A", "B"]) == ""
+
+
+def test_run_agent_loop_rejects_worker_finish_in_manager_mode(monkeypatch):
+    agents = load_agents_module()
+    calls = []
+
+    def fake_ask(role, *args, extra_instruction="", **_kwargs):
+        calls.append((role, extra_instruction))
+        if len(calls) == 1:
+            return '```json\n{"target":"FINISH","reason":"done","message":"worker tried to finish"}\n```'
+        return '```json\n{"target":"MANAGER1","reason":"report","message":"report back"}\n```'
+
+    monkeypatch.setattr(agents, "ask_agent_once", fake_ask)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    result = agents.run_agent_loop(
+        ["MANAGER1", "DEV"],
+        "build feature",
+        start_role="DEV",
+        max_turns=2,
+        core={},
+        settings={"sleep_s": 0},
+    )
+
+    assert result["status"] == "max_turns"
+    assert [role for role, _instruction in calls] == ["DEV", "DEV"]
+    assert "FORMAT REPAIR" in calls[1][1]
 
 
 def test_repeated_bad_routing_escalates_to_manager(monkeypatch):

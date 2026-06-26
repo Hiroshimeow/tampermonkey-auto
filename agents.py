@@ -34,8 +34,12 @@ from workflow_engine import (
     format_parallel_results,
     is_complete,
     iter_json_candidates,
+    is_manager_role,
+    manager_mode_enabled,
+    manager_roles_in,
     normalize_completion_target,
     normalize_role_list,
+    primary_manager_role,
     parse_parallel_role_instructions,
     parse_parallel_targets,
     parse_routing_safe,
@@ -295,10 +299,14 @@ def load_decision_prompt(target: str, prompts_dir: str | Path = "prompts") -> st
     target = str(target or "").upper().strip()
     if not target:
         return ""
-    path = Path(prompts_dir) / "decisions" / f"{target}.txt"
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8").strip()
+    candidates = [target]
+    if is_manager_role(target):
+        candidates.append("MANAGER")
+    for candidate in candidates:
+        path = Path(prompts_dir) / "decisions" / f"{candidate}.txt"
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def build_target_decision_guide(
@@ -307,7 +315,7 @@ def build_target_decision_guide(
     *,
     prompts_dir: str | Path = "prompts",
 ) -> str:
-    targets = allowed_targets_for(allowed_targets)
+    targets = normalize_role_list(allowed_targets)
     cards = []
     for target in targets:
         card = load_decision_prompt(target, prompts_dir)
@@ -315,15 +323,15 @@ def build_target_decision_guide(
             cards.append(card)
 
     current = str(current_role or "").upper().strip()
-    dispatchable = [target for target in targets if target not in {"MANAGER", "FINISH"}]
-    if current == "MANAGER" and len(dispatchable) >= 2:
+    dispatchable = [target for target in targets if target not in COMPLETION_TARGETS and not is_manager_role(target)]
+    if is_manager_role(current) and len(dispatchable) >= 2:
         cards.append(
             "[PARALLEL DISPATCH]\n"
             "Only MANAGER may dispatch multiple active non-MANAGER targets.\n"
             f"Allowed parallel targets in this run: {', '.join(dispatchable)}.\n"
             "Use parallel_dispatch only when the target tasks are independent."
         )
-    elif current == "MANAGER":
+    elif is_manager_role(current):
         cards.append(
             "[PARALLEL DISPATCH]\n"
             "Parallel dispatch is not available in this run because fewer than two active non-MANAGER targets exist."
@@ -347,7 +355,7 @@ def build_agent_prompt(
     *,
     prompts_dir: str | Path = "prompts",
 ) -> str:
-    allowed_targets = allowed_targets_for(config.active_roles)
+    allowed_targets = allowed_targets_for(config.active_roles, config.role)
     parts = [f"You are {config.role}:"]
     if attach_system and prompt_base:
         parts.append(prompt_base)
@@ -802,7 +810,9 @@ def prompt_role_candidates(role: str) -> list[str]:
     candidates = []
     if role:
         candidates.append(role)
-    base = re.sub(r"\d+$", "", role).strip()
+    if is_manager_role(role) and "MANAGER" not in candidates:
+        candidates.append("MANAGER")
+    base = re.sub(r"(?:[_-]?\d+)$", "", role).strip()
     if base and base not in candidates:
         candidates.append(base)
     return candidates
@@ -1018,7 +1028,7 @@ def run_agent_loop(
         stale_response = last_response_by_role.get(current_role, "")
         extra_instruction = ""
         agent_config = AgentConfig(current_role, active_roles)
-        current_allowed_targets = allowed_targets_for(active_roles)
+        current_allowed_targets = allowed_targets_for(active_roles, current_role)
         if repair_next_turn and agent_config.repair_prompt_on_missing_target:
             extra_instruction = build_routing_repair_prompt(current_allowed_targets, current_role)
             print(f"[repair] asking {current_role} for valid short routing")
@@ -1045,21 +1055,25 @@ def run_agent_loop(
         history.append((current_role, response))
         last_response_by_role[current_role] = response
 
-        if is_complete(response):
-            print("\nFINISH routing received")
-            return {"status": "complete", "history": history, "last_response": response}
-
         routing = parse_routing_safe(response)
         validation = validate_routing_contract(routing, current_allowed_targets, current_role)
+        if (
+            routing
+            and validation.ok
+            and normalize_completion_target(routing.get("target") or "") in COMPLETION_TARGETS
+        ):
+            print("\nFINISH routing received")
+            return {"status": "complete", "history": history, "last_response": response}
         if not validation.ok:
             print(f"[warn] invalid routing contract: {validation.reason}")
         if not validation.ok:
             state = append_routing_error_state(state, turn, validation.reason)
             format_repair_counts[current_role] = format_repair_counts.get(current_role, 0) + 1
             if format_repair_counts[current_role] > max_format_repairs:
-                if "MANAGER" not in active_roles:
-                    active_roles.append("MANAGER")
-                    ask_counts.setdefault("MANAGER", 0)
+                manager_target = primary_manager_role(active_roles)
+                if manager_target not in active_roles:
+                    active_roles.append(manager_target)
+                    ask_counts.setdefault(manager_target, 0)
                 print(
                     f"[routing] {current_role}: invalid routing repeated "
                     f"{format_repair_counts[current_role]} times; escalating format_blocked"
@@ -1110,14 +1124,14 @@ def run_agent_loop(
                     print(f"\n[parallel error] {role}: {error_text}")
                     history.append((role, f"PARALLEL ERROR\n{error_text}"))
             state = format_parallel_results(parallel_results)
-            current_role = "MANAGER"
+            current_role = primary_manager_role(active_roles)
             __import__("time").sleep(loop_sleep_s)
             continue
 
         target = ""
         if routing:
             raw_target = str(routing.get("target") or "")
-            target = resolve_next_target(raw_target, active_roles, current_allowed_targets)
+            target = resolve_next_target(raw_target, active_roles, current_allowed_targets, current_role)
         if target:
             if target not in active_roles and target != "FINISH":
                 active_roles.append(target)
@@ -1272,16 +1286,19 @@ def resolve_team_roles(roles, available_roles: list[str]) -> list[str]:
     available = normalize_role_list(available_roles)
     requested = normalize_role_list(roles)
 
+    available_manager = primary_manager_role(available) if manager_mode_enabled(available) else ""
     if requested:
-        if "MANAGER" not in requested and "MANAGER" in available:
-            requested.insert(0, "MANAGER")
+        if not manager_mode_enabled(requested) and available_manager:
+            requested.insert(0, available_manager)
         return requested
 
     default_team = [role for role in DEFAULT_TEAM_ORDER if role in available]
+    if available_manager and available_manager not in default_team:
+        default_team.insert(0, available_manager)
     if default_team:
         return default_team
-    if "MANAGER" in available:
-        return ["MANAGER"]
+    if available_manager:
+        return [available_manager]
     return available[:1]
 
 
@@ -1289,7 +1306,7 @@ def response_is_complete(response: str) -> bool:
     routing = parse_routing_safe(response)
     if not routing:
         return False
-    return str(routing.get("target") or "").upper().strip() == "FINISH"
+    return normalize_completion_target(routing.get("target") or "") == "FINISH"
 
 
 def response_preview(response: str, max_chars: int = 900) -> str:
@@ -1316,7 +1333,7 @@ def run_team_loop(
     if not active_roles:
         raise ValueError("At least one role is required")
 
-    current_role = (start_role or "MANAGER").upper().strip()
+    current_role = (start_role or primary_manager_role(active_roles)).upper().strip()
     if current_role not in active_roles:
         active_roles.insert(0, current_role)
 
@@ -1328,9 +1345,7 @@ def run_team_loop(
     loop_sleep_s = safe_int(settings.get("sleep_s"), 3)
 
     for turn in range(1, max_turns + 1):
-        allowed_targets = normalize_role_list(active_roles)
-        if "FINISH" not in allowed_targets:
-            allowed_targets.append("FINISH")
+        allowed_targets = allowed_targets_for(active_roles, current_role)
         ask_counts.setdefault(current_role, 0)
         print(f"\n=== TEAM TURN {turn}: {current_role} ===")
 
@@ -1361,12 +1376,15 @@ def run_team_loop(
         print("[response]")
         print(response_preview(response))
 
-        if response_is_complete(response):
-            print("[result] FINISH routing received")
-            return {"status": "complete", "history": history, "last_response": response}
-
         routing = parse_routing_safe(response)
         validation = validate_routing_contract(routing, allowed_targets, current_role)
+        if (
+            routing
+            and validation.ok
+            and normalize_completion_target(routing.get("target") or "") in COMPLETION_TARGETS
+        ):
+            print("[result] FINISH routing received")
+            return {"status": "complete", "history": history, "last_response": response}
         if not validation.ok:
             print(f"[routing] invalid: {validation.reason}")
             state = append_routing_error_state(state, turn, validation.reason)
@@ -1419,11 +1437,11 @@ def run_team_loop(
                     history.append((role, f"PARALLEL ERROR\n{error_text}"))
                     print(f"[parallel:{role}] error={error_text}")
             state = f"{state}\n\n{format_parallel_results(parallel_results)}"
-            current_role = "MANAGER"
+            current_role = primary_manager_role(active_roles)
             time.sleep(loop_sleep_s)
             continue
 
-        next_target = resolve_next_target(target, active_roles, allowed_targets)
+        next_target = resolve_next_target(target, active_roles, allowed_targets, current_role)
         if next_target in COMPLETION_TARGETS:
             print(f"[routing] completion target={next_target}")
             return {"status": "complete", "history": history, "last_response": response}
@@ -1451,8 +1469,6 @@ def parse_team_args(argv=None):
     parser.add_argument("--no-parallel", action="store_true", help="Request repair when MANAGER emits comma targets.")
     parser.add_argument("--prompts-dir", default="prompts")
     parser.add_argument("--config", default="config.toml")
-    parser.add_argument("--team", action="store_true", help="Start MANAGER-first team flow.")
-    parser.add_argument("--no-parallel", action="store_true", help="In team mode, repair comma targets instead of dispatching them.")
     return parser.parse_args(argv)
 
 

@@ -137,6 +137,28 @@ def normalize_completion_target(target: str) -> str:
         return "FINISH"
     return raw
 
+
+
+def is_manager_role(role: str) -> bool:
+    return str(role or "").upper().strip().startswith("MANAGER")
+
+
+def manager_roles_in(roles) -> list[str]:
+    return [role for role in normalize_role_list(roles) if is_manager_role(role)]
+
+
+def primary_manager_role(roles) -> str:
+    managers = manager_roles_in(roles)
+    return managers[0] if managers else "MANAGER"
+
+
+def manager_mode_enabled(roles) -> bool:
+    return bool(manager_roles_in(roles))
+
+
+def is_worker_role_in_manager_mode(role: str, active_roles) -> bool:
+    return manager_mode_enabled(active_roles) and not is_manager_role(role)
+
 def validate_routing_contract(routing, allowed_targets: list[str], current_role: str = "") -> RoutingValidation:
     if not isinstance(routing, dict):
         return RoutingValidation(False, "missing JSON object")
@@ -155,17 +177,28 @@ def validate_routing_contract(routing, allowed_targets: list[str], current_role:
     if any(is_placeholder_value(value) for value in [target, reason, message]):
         return RoutingValidation(False, "placeholder values are not valid routing output")
 
-    allowed = set(normalize_role_list(allowed_targets))
+    allowed_list = normalize_role_list(allowed_targets)
+    allowed = set(allowed_list)
+    role = str(current_role or "").upper().strip()
+    manager_mode = manager_mode_enabled(allowed_list)
+    manager_targets = manager_roles_in(allowed_list)
+
     if target in COMPLETION_TARGETS:
+        if manager_mode and not is_manager_role(role):
+            return RoutingValidation(False, "non-MANAGER roles cannot route to FINISH when manager mode is active")
         return RoutingValidation(True)
 
-    role = str(current_role or "").upper().strip()
+    if manager_mode and not is_manager_role(role):
+        if target not in manager_targets:
+            return RoutingValidation(False, f"non-MANAGER roles must report back to manager target: {', '.join(manager_targets)}")
+        return RoutingValidation(True)
+
     if "," in target:
-        if role != "MANAGER" or reason.lower() != "parallel_dispatch":
+        if not is_manager_role(role) or reason.lower() != "parallel_dispatch":
             return RoutingValidation(False, "comma-separated targets are only valid for MANAGER parallel_dispatch")
         invalid = [
             item for item in normalize_role_list(target)
-            if item not in allowed or item == "MANAGER" or item in COMPLETION_TARGETS
+            if item not in allowed or is_manager_role(item) or item in COMPLETION_TARGETS
         ]
         if invalid:
             return RoutingValidation(False, f"parallel target outside ALLOWED_TARGETS: {', '.join(invalid)}")
@@ -176,14 +209,14 @@ def validate_routing_contract(routing, allowed_targets: list[str], current_role:
     return RoutingValidation(True)
 
 def parse_parallel_targets(routing, active_roles: list[str], current_role: str) -> list[str]:
-    if not routing or str(current_role or "").upper().strip() != "MANAGER":
+    if not routing or not is_manager_role(current_role):
         return []
     reason = str(routing.get("reason") or "").lower().strip()
     if reason != "parallel_dispatch":
         return []
     allowed = set(normalize_role_list(active_roles))
     targets = normalize_role_list(str(routing.get("target") or ""))
-    return [role for role in targets if role in allowed and role != "MANAGER" and role not in COMPLETION_TARGETS]
+    return [role for role in targets if role in allowed and not is_manager_role(role) and role not in COMPLETION_TARGETS]
 
 def format_parallel_results(results: list[dict]) -> str:
     has_error = any(not result.get("ok") for result in results)
@@ -272,18 +305,29 @@ def build_parallel_instruction(role: str, manager_message: str, targets: list[st
         f"ASSIGNED_INSTRUCTION:\n{message_body}"
     ).strip()
 
-def allowed_targets_for(active_roles: list[str]) -> list[str]:
-    targets = normalize_role_list(active_roles)
+def allowed_targets_for(active_roles: list[str], current_role: str = "") -> list[str]:
+    roles = normalize_role_list(active_roles)
+    managers = manager_roles_in(roles)
+    current = str(current_role or "").upper().strip()
+
+    if managers and current and not is_manager_role(current):
+        return managers
+
+    targets = roles[:]
     for completion_target in sorted(COMPLETION_TARGETS):
         if completion_target not in targets:
             targets.append(completion_target)
     return targets
 
-def resolve_next_target(raw_target: str, active_roles: list[str], allowed_targets: list[str]) -> str:
+
+def resolve_next_target(raw_target: str, active_roles: list[str], allowed_targets: list[str], current_role: str = "") -> str:
     target = normalize_completion_target(raw_target)
-    allowed = set(normalize_role_list(allowed_targets) or normalize_role_list(active_roles))
-    if target in COMPLETION_TARGETS and (not allowed or target in allowed):
-        return target
+    allowed_list = normalize_role_list(allowed_targets) or allowed_targets_for(active_roles, current_role)
+    allowed = set(allowed_list)
+    if target in COMPLETION_TARGETS:
+        if manager_mode_enabled(allowed_list) and current_role and not is_manager_role(current_role):
+            return ""
+        return target if not allowed or target in allowed else ""
     return target if target in allowed else ""
 
 def normalize_role_list(value) -> list[str]:

@@ -19,6 +19,42 @@ def route(target, reason="next", message="continue"):
     return f'```json\n{{"target":"{target}","reason":"{reason}","message":"{message}"}}\n```'
 
 
+def test_team_uses_manager_alias_when_available():
+    teams = load_teams_module()
+
+    roles = teams.resolve_team_roles("DEV,REVIEW", ["DEV", "MANAGER_1", "REVIEW"])
+
+    assert roles == ["MANAGER_1", "DEV", "REVIEW"]
+
+
+def test_worker_in_manager_mode_cannot_route_directly_to_review(monkeypatch):
+    teams = load_teams_module()
+    calls = []
+
+    def fake_ask(role, *args, extra_instruction="", **_kwargs):
+        calls.append((role, extra_instruction))
+        if len(calls) == 1:
+            return route("DEV", "delegate", "Implement and report back.")
+        if len(calls) == 2:
+            return route("REVIEW", "bad_peer_route", "This must be rejected.")
+        return route("MANAGER1", "report", "Corrected report.")
+
+    monkeypatch.setattr(teams, "ask_agent_once", fake_ask)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    result = teams.run_team_loop(
+        ["MANAGER1", "DEV", "REVIEW"],
+        "build feature",
+        max_turns=3,
+        core={},
+        settings={"sleep_s": 0},
+    )
+
+    assert result["status"] == "max_turns"
+    assert [role for role, _instruction in calls] == ["MANAGER1", "DEV", "DEV"]
+    assert "FORMAT REPAIR" in calls[2][1]
+
+
 def test_default_team_uses_manager_dev_review_audit_when_available():
     teams = load_teams_module()
 

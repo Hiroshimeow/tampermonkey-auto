@@ -399,6 +399,23 @@ def test_allowed_targets_follow_selected_active_roles():
     assert targets == ["B", "PLAN", "MANAGER", "FINISH"]
 
 
+def test_role_prompts_do_not_duplicate_routing_contract():
+    root = Path(__file__).resolve().parents[1]
+    template_files = {"ROUTING_CONTRACT.txt", "FORMAT_REPAIR.txt", "SOLO_CONTINUE.txt", "SOLO_FOLLOWUP.txt"}
+    forbidden = ["ALLOWED_TARGETS", "FINISH", "routing JSON", "FINAL JSON", "STATUS LINE", "\"target\""]
+
+    offenders = []
+    for prompt_file in (root / "prompts").glob("*.txt"):
+        if prompt_file.name in template_files:
+            continue
+        text = prompt_file.read_text(encoding="utf-8")
+        hits = [term for term in forbidden if term in text]
+        if hits:
+            offenders.append((prompt_file.name, hits))
+
+    assert offenders == []
+
+
 def test_discover_prompt_roles_excludes_runtime_templates(tmp_path):
     agents = load_agents_module()
     prompts = tmp_path / "prompts"

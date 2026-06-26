@@ -320,7 +320,7 @@ def test_initial_prompt_without_role_prompt_keeps_goal_context_only():
         attach_system=False,
     )
 
-    assert "ALLOWED_TARGETS: [CUSTOM]" in prompt
+    assert "ALLOWED_TARGETS: [CUSTOM, FINISH]" in prompt
     assert "GOAL:\nFix issue" in prompt
     assert "prompts/CUSTOM" not in prompt
 
@@ -338,7 +338,7 @@ def test_followup_prompt_includes_goal_reason_and_message():
     assert "target: DEV\nreason: needs manual acceptance\nmessage: Check all emitted crops." in prompt
     assert "---\nGoal/context:\nParse all PDF pages\n---\ncontinue\n" in prompt
     assert "target is FINISH" in prompt
-    assert "textual TASK COMPLETE" in prompt
+    assert "textual completion/status prose" in prompt
 
 
 def test_followup_prompt_falls_back_for_target_only_json():

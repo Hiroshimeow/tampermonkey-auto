@@ -148,10 +148,21 @@ def load_role_prompt_optional(role: str) -> str:
 
 
 def load_continue_prompt() -> str:
-    path = SCRIPT_DIR / "prompts" / "SOLO_CONTINUE.txt"
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
-    return "continue"
+    return load_prompt_template("SOLO_CONTINUE.txt")
+
+
+def load_prompt_template(name: str) -> str:
+    path = SCRIPT_DIR / "prompts" / name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing prompt template: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def render_prompt_template(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
 
 
 def compact_followup_text(text: str, max_chars: int = 2000) -> str:
@@ -194,18 +205,15 @@ def build_followup_prompt(kind: str, goal: str, previous_response: str = "") -> 
 
     goal_text = str(goal or "").strip() or "No explicit new goal was provided. Continue from the current chat state."
     target_text = target or "N/A"
-    return (
-        "Previous response context:\n"
-        f"target: {target_text}\n"
-        f"reason: {reason}\n"
-        f"message: {message}\n"
-        "---\n"
-        "Goal/context:\n"
-        f"{goal_text}\n"
-        "---\n"
-        f"{kind}\n"
-        "If the goal is fully complete and verified, end with exactly one fenced JSON object whose target is FINISH.\n"
-        "Do not use textual TASK COMPLETE as a completion signal."
+    return render_prompt_template(
+        load_prompt_template("SOLO_FOLLOWUP.txt"),
+        {
+            "target": target_text,
+            "reason": reason,
+            "message": message,
+            "goal": goal_text,
+            "kind": kind,
+        },
     )
 
 

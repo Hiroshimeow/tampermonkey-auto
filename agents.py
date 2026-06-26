@@ -52,6 +52,7 @@ class RoutingValidation:
 ROUTING_KEYS = {"target", "reason", "message"}
 COMPLETION_TARGETS = {"FINISH"}
 STATE_COMPACT_TAIL_CHARS = 4000
+PROMPT_TEMPLATE_FILES = {"FORMAT_REPAIR", "ROUTING_CONTRACT", "SOLO_CONTINUE", "SOLO_FOLLOWUP"}
 
 
 def safe_int(value, default: int = 0) -> int:
@@ -61,6 +62,29 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
+def load_prompt_template(name: str, prompts_dir: str | Path = "prompts") -> str:
+    path = Path(prompts_dir) / name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing prompt template: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def render_prompt_template(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+def build_routing_contract_prompt(
+    allowed_targets: list[str],
+    *,
+    prompts_dir: str | Path = "prompts",
+) -> str:
+    template = load_prompt_template("ROUTING_CONTRACT.txt", prompts_dir)
+    return render_prompt_template(template, {"allowed_targets": ", ".join(allowed_targets)})
+
+
 def build_agent_prompt(
     prompt_base: str,
     goal: str,
@@ -68,12 +92,15 @@ def build_agent_prompt(
     turn: int,
     config: AgentConfig,
     attach_system: bool = True,
+    *,
+    prompts_dir: str | Path = "prompts",
 ) -> str:
+    allowed_targets = allowed_targets_for(config.active_roles)
     parts = [f"You are {config.role}:"]
-    if attach_system:
+    if attach_system and prompt_base:
         parts.append(prompt_base)
     parts += [
-        f"ALLOWED_TARGETS: [{', '.join(config.active_roles)}]",
+        f"ALLOWED_TARGETS: [{', '.join(allowed_targets)}]",
         f"CURRENT TURN: {turn}",
     ]
     if goal:
@@ -84,17 +111,7 @@ def build_agent_prompt(
         parts.append(f"CURRENT_STATE:\n{state}")
     else:
         parts.append(f"CURRENT_STATE:\nNo prior state in this {config.role} run.")
-    parts.append(
-        "ROUTING CONTRACT:\n"
-        "- Completion is valid only when the final routing JSON has target: FINISH.\n"
-        "- Do not use textual TASK COMPLETE, DONE, or status prose as a completion signal; runtime ignores it.\n"
-        "- End with exactly one fenced JSON object and nothing after it.\n"
-        "- JSON keys must be exactly: target, reason, message.\n"
-        "- target must be one of ALLOWED_TARGETS, or FINISH only when the full goal is complete. Do not invent roles.\n"
-        "- Non-MANAGER roles must choose exactly one target, never comma-separated targets.\n"
-        "- Do not include other JSON objects in the response.\n"
-        "- MANAGER parallel only: target may be comma-separated roles and reason must be parallel_dispatch."
-    )
+    parts.append(build_routing_contract_prompt(allowed_targets, prompts_dir=prompts_dir))
     return "\n\n".join(parts)
 
 
@@ -278,20 +295,7 @@ def apply_role_toggle(selected_roles: list[str], role: str) -> list[str]:
 
 
 def load_format_repair_template(prompts_dir: str | Path = "prompts") -> str:
-    path = Path(prompts_dir) / "FORMAT_REPAIR.txt"
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
-    return (
-        "[FORMAT REPAIR]\n"
-        "ALLOWED_TARGETS: {allowed_targets}\n"
-        "CURRENT_ROLE: {current_role}\n"
-        "If complete: reply with exactly one fenced JSON object whose target is FINISH.\n"
-        "Otherwise reply with exactly one fenced JSON object and nothing after it:\n"
-        "```json\n"
-        '{"target":"{default_target}","reason":"continue_required","message":"next concrete action"}\n'
-        "```\n"
-        "Rules: keys exactly target/reason/message; target must be in ALLOWED_TARGETS; no extra JSON."
-    )
+    return load_prompt_template("FORMAT_REPAIR.txt", prompts_dir)
 
 
 def build_routing_repair_prompt(
@@ -351,7 +355,10 @@ def validate_routing_contract(routing, allowed_targets: list[str], current_role:
     if "," in target:
         if role != "MANAGER" or reason.lower() != "parallel_dispatch":
             return RoutingValidation(False, "comma-separated targets are only valid for MANAGER parallel_dispatch")
-        invalid = [item for item in normalize_role_list(target) if item not in allowed or item == "MANAGER"]
+        invalid = [
+            item for item in normalize_role_list(target)
+            if item not in allowed or item == "MANAGER" or item in COMPLETION_TARGETS
+        ]
         if invalid:
             return RoutingValidation(False, f"parallel target outside ALLOWED_TARGETS: {', '.join(invalid)}")
         return RoutingValidation(True)
@@ -369,7 +376,7 @@ def parse_parallel_targets(routing, active_roles: list[str], current_role: str) 
         return []
     allowed = set(normalize_role_list(active_roles))
     targets = normalize_role_list(str(routing.get("target") or ""))
-    return [role for role in targets if role in allowed and role != "MANAGER"]
+    return [role for role in targets if role in allowed and role != "MANAGER" and role not in COMPLETION_TARGETS]
 
 
 def format_parallel_results(results: list[dict]) -> str:
@@ -484,7 +491,11 @@ def load_simple_toml(path: str | Path = "config.toml") -> dict:
 
 
 def allowed_targets_for(active_roles: list[str]) -> list[str]:
-    return normalize_role_list(active_roles)
+    targets = normalize_role_list(active_roles)
+    for completion_target in sorted(COMPLETION_TARGETS):
+        if completion_target not in targets:
+            targets.append(completion_target)
+    return targets
 
 
 def resolve_next_target(raw_target: str, active_roles: list[str], allowed_targets: list[str]) -> str:
@@ -757,7 +768,7 @@ def discover_prompt_roles(prompts_dir: str | Path = "prompts") -> list[str]:
         if prompt_file.suffix.lower() not in {".txt", ".json"}:
             continue
         role = prompt_file.stem.upper().strip()
-        if role and role not in roles:
+        if role and role not in PROMPT_TEMPLATE_FILES and role not in roles:
             roles.append(role)
     return roles
 
@@ -831,20 +842,18 @@ def make_browser_agent_from_core(role: str, active_roles: list[str], timeout_s: 
     )
 
 
-def load_role_prompt(role: str, *, core=None) -> str:
-    core = core or globals()
-    loader = core.get("load_prompt")
-    if loader:
-        for prompt_role in prompt_role_candidates(role):
-            try:
-                return loader(prompt_role)
-            except FileNotFoundError:
-                pass
-    return (
-        f"You are {role}. Work on the assigned task. "
-        "If complete, end with one fenced JSON object whose target is FINISH. "
-        "Otherwise end with one fenced JSON object containing exactly target, reason, and message."
-    )
+def load_role_prompt(role: str, *, core=None, prompts_dir: str | Path = "prompts") -> str:
+    path = Path(prompts_dir)
+    for prompt_role in prompt_role_candidates(role):
+        for suffix in [".txt", ".json"]:
+            prompt_path = path / f"{prompt_role}{suffix}"
+            if not prompt_path.exists():
+                continue
+            if suffix == ".txt":
+                return prompt_path.read_text(encoding="utf-8").strip()
+            data = json.loads(prompt_path.read_text(encoding="utf-8"))
+            return str(data.get("prompt", "")).strip()
+    return ""
 
 
 def ask_agent_once(
@@ -866,10 +875,19 @@ def ask_agent_once(
 ) -> str:
     agent = make_browser_agent_from_core(role, active_roles, timeout_s, core=core, settings=settings)
     attach_system = force_system or ask_counts.get(role, 0) == 0
-    prompt_base = load_role_prompt(role, core=core) if attach_system else ""
+    prompts_dir = settings.get("prompts_dir", "prompts")
+    prompt_base = load_role_prompt(role, core=core, prompts_dir=prompts_dir) if attach_system else ""
     if attach_system:
         print(f"[prompt] attach {role} prompt at ask #{ask_counts.get(role, 0) + 1}")
-    prompt = build_agent_prompt(prompt_base, goal, state, turn, agent.config, attach_system=attach_system)
+    prompt = build_agent_prompt(
+        prompt_base,
+        goal,
+        state,
+        turn,
+        agent.config,
+        attach_system=attach_system,
+        prompts_dir=prompts_dir,
+    )
     if extra_instruction:
         prompt = f"{prompt}\n\n{extra_instruction.strip()}"
     response = agent.send_and_wait(
@@ -1160,6 +1178,7 @@ def prompt_for_roles(available_roles: list[str]) -> list[str]:
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = load_simple_toml(args.config)
+    settings["prompts_dir"] = args.prompts_dir
     available_roles = discover_prompt_roles(args.prompts_dir)
     roles = normalize_role_list(args.roles) if args.roles else prompt_for_role_checklist(available_roles)
     goal = args.goal.strip() or input("Goal: ").strip()

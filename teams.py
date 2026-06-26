@@ -97,6 +97,8 @@ def run_team_loop(
 
     for turn in range(1, max_turns + 1):
         allowed_targets = normalize_role_list(active_roles)
+        if "FINISH" not in allowed_targets:
+            allowed_targets.append("FINISH")
         ask_counts.setdefault(current_role, 0)
         print(f"\n=== TEAM TURN {turn}: {current_role} ===")
 
@@ -223,6 +225,7 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = load_simple_toml(args.config)
+    settings["prompts_dir"] = args.prompts_dir
     available_roles = discover_prompt_roles(args.prompts_dir)
     roles = resolve_team_roles(args.roles, available_roles)
     goal = args.goal.strip() or input("Goal: ").strip()

@@ -1,0 +1,11 @@
+ROUTING CONTRACT:
+- ALLOWED_TARGETS is: {allowed_targets}
+- Completion is valid only when the final routing JSON has target: FINISH.
+- Do not use textual completion/status prose as a completion signal; runtime ignores it.
+- End with exactly one fenced JSON object and nothing after it.
+- JSON keys must be exactly: target, reason, message.
+- target must be one of ALLOWED_TARGETS. Do not invent roles.
+- Use FINISH only when the full goal is complete and verified.
+- Non-MANAGER roles must choose exactly one target, never comma-separated targets.
+- Do not include other JSON objects in the response.
+- MANAGER parallel only: target may be comma-separated active non-MANAGER roles and reason must be parallel_dispatch.

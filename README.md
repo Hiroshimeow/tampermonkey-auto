@@ -102,7 +102,7 @@ uv run agents.py --roles MANAGER,T1,T2,T3,T4 --start-role MANAGER --goal "resear
 ### AGENTS flow
 
 - Khong truyen `--roles`: hien menu chon role tu `prompts/`.
-- Co `--roles`: danh sach nay la `ALLOWED_TARGETS`.
+- Co `--roles`: danh sach role dang ky se tao `ALLOWED_TARGETS = roles + FINISH`.
 - `--goal` la bat buoc theo logic runtime. Neu khong truyen thi script se hoi `Goal:` qua stdin.
 - Agent chi duoc route toi role trong `ALLOWED_TARGETS`, hoac `FINISH` khi goal da hoan thanh.
 - Role co so fallback prompt: `DEV1`, `DEV2` dung `prompts/DEV.txt` neu khong co prompt rieng.

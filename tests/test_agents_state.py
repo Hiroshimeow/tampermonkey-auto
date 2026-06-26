@@ -27,13 +27,14 @@ def test_role_config_builds_prompt_with_selected_role():
     assert prompt.startswith("You are DEV:")
     assert "DEV SYSTEM" in prompt
     assert "ACTIVE_ROLES:" not in prompt
-    assert "ALLOWED_TARGETS: [DEV, REVIEW]" in prompt
+    assert "ALLOWED_TARGETS: [DEV, REVIEW, FINISH]" in prompt
     assert "CURRENT TURN: 2" in prompt
     assert "GOAL:\nFix bug" in prompt
     assert "CURRENT_STATE:\nPrevious state" in prompt
     assert "ROUTING CONTRACT:" in prompt
     assert "JSON keys must be exactly: target, reason, message." in prompt
-    assert "target must be one of ALLOWED_TARGETS, or FINISH only when the full goal is complete." in prompt
+    assert "target must be one of ALLOWED_TARGETS" in prompt
+    assert "Use FINISH only when the full goal is complete and verified." in prompt
     assert "Non-MANAGER roles must choose exactly one target" in prompt
 
 
@@ -52,7 +53,7 @@ def test_prompt_without_system_keeps_runtime_context_only():
 
     assert prompt.startswith("You are DEV:")
     assert "DEV SYSTEM" not in prompt
-    assert "ALLOWED_TARGETS: [DEV, REVIEW]" in prompt
+    assert "ALLOWED_TARGETS: [DEV, REVIEW, FINISH]" in prompt
     assert "GOAL:\nFix bug" in prompt
     assert "CURRENT_STATE:\nNext action" in prompt
 
@@ -100,20 +101,15 @@ def test_ask_agent_once_attaches_system_only_first_time(monkeypatch):
     assert "DEV SYSTEM PROMPT" not in sent_prompts[1]
 
 
-def test_load_role_prompt_uses_base_prompt_for_numbered_role():
+def test_load_role_prompt_uses_base_prompt_for_numbered_role(tmp_path):
     agents = load_agents_module()
-    loaded_roles = []
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "REVIEW.txt").write_text("REVIEW SYSTEM", encoding="utf-8")
 
-    def fake_load_prompt(role):
-        loaded_roles.append(role)
-        if role == "REVIEW":
-            return "REVIEW SYSTEM"
-        raise FileNotFoundError(role)
-
-    prompt = agents.load_role_prompt("REVIEW2", core={"load_prompt": fake_load_prompt})
+    prompt = agents.load_role_prompt("REVIEW2", prompts_dir=prompts)
 
     assert prompt == "REVIEW SYSTEM"
-    assert loaded_roles == ["REVIEW2", "REVIEW"]
 
 
 def test_classify_chat_state_blocks_draft_for_any_role():
@@ -400,7 +396,29 @@ def test_allowed_targets_follow_selected_active_roles():
 
     targets = agents.allowed_targets_for(["B", "PLAN", "MANAGER"])
 
-    assert targets == ["B", "PLAN", "MANAGER"]
+    assert targets == ["B", "PLAN", "MANAGER", "FINISH"]
+
+
+def test_discover_prompt_roles_excludes_runtime_templates(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    for name in ["DEV.txt", "ROUTING_CONTRACT.txt", "FORMAT_REPAIR.txt", "SOLO_CONTINUE.txt", "SOLO_FOLLOWUP.txt"]:
+        (prompts / name).write_text(name, encoding="utf-8")
+
+    assert agents.discover_prompt_roles(prompts) == ["DEV"]
+
+
+def test_routing_contract_is_loaded_from_prompts_dir(tmp_path):
+    agents = load_agents_module()
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "ROUTING_CONTRACT.txt").write_text("CONTRACT {allowed_targets}", encoding="utf-8")
+    config = agents.AgentConfig("DEV", ["DEV"])
+
+    prompt = agents.build_agent_prompt("", "Goal", "State", 1, config, attach_system=False, prompts_dir=prompts)
+
+    assert "CONTRACT DEV, FINISH" in prompt
 
 
 def test_target_allowed_by_selected_roles():

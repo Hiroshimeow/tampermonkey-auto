@@ -1,0 +1,11 @@
+Previous response context:
+target: {target}
+reason: {reason}
+message: {message}
+---
+Goal/context:
+{goal}
+---
+{kind}
+If the goal is fully complete and verified, end with exactly one fenced JSON object whose target is FINISH.
+Do not use textual completion/status prose as a completion signal.

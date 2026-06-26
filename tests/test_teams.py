@@ -69,7 +69,7 @@ def test_manager_parallel_dispatch_returns_to_manager(monkeypatch):
         seen_asks.append(role)
         if len(seen_asks) == 1:
             return route("DEV,REVIEW", "parallel_dispatch", "Work independently and report back to MANAGER.")
-        return "TASK COMPLETE\nsynthesized"
+        return route("FINISH", "done", "synthesized")
 
     def fake_parallel(targets, manager_message, *args, **_kwargs):
         seen_parallel.append((targets, manager_message))
@@ -104,7 +104,7 @@ def test_invalid_json_triggers_repair_without_changing_role(monkeypatch):
         calls.append((role, extra_instruction))
         if len(calls) == 1:
             return "DEV should work next, but no JSON."
-        return "TASK COMPLETE\nrepaired"
+        return route("FINISH", "done", "repaired")
 
     monkeypatch.setattr(teams, "ask_agent_once", fake_ask)
     monkeypatch.setattr(time, "sleep", lambda *_: None)
@@ -131,7 +131,7 @@ def test_no_parallel_rejects_comma_target_and_requests_repair(monkeypatch):
         calls.append((role, extra_instruction))
         if len(calls) == 1:
             return route("DEV,REVIEW", "parallel_dispatch", "Work independently.")
-        return "TASK COMPLETE\nrepaired"
+        return route("FINISH", "done", "repaired")
 
     monkeypatch.setattr(teams, "ask_agent_once", fake_ask)
     monkeypatch.setattr(time, "sleep", lambda *_: None)
@@ -150,13 +150,13 @@ def test_no_parallel_rejects_comma_target_and_requests_repair(monkeypatch):
     assert "FORMAT REPAIR" in calls[1][1]
 
 
-def test_task_complete_status_line_stops_loop(monkeypatch):
+def test_finish_routing_stops_loop(monkeypatch):
     teams = load_teams_module()
     calls = []
 
     def fake_ask(role, *args, **_kwargs):
         calls.append(role)
-        return "TASK COMPLETE\nverified"
+        return route("FINISH", "done", "verified")
 
     monkeypatch.setattr(teams, "ask_agent_once", fake_ask)
     monkeypatch.setattr(time, "sleep", lambda *_: None)

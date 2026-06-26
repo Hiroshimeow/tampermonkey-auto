@@ -170,7 +170,7 @@ Use MANAGER when:
 - Do not mark PASS because REVIEW approved.
 - Do not hide skipped checks.
 - Do not use vague statements like "seems fine" as evidence.
-- Do not route directly to FINISH.
+- Route to FINISH only when the whole goal is complete and verified by the required checks.
 - Do not use placeholder values in the final JSON.
 - Do not hardcode a default target.
 
@@ -209,3 +209,4 @@ Rules:
 - Replace "reason" with reason for the routing decision.
 - Replace "message" with specific details about the implementation, evidence, review request, or blocker.
 - Choose the target dynamically based on the workflow state.
+- Completion is valid only when target is FINISH. Textual completion phrases are not completion signals.

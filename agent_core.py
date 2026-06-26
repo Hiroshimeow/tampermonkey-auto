@@ -410,14 +410,9 @@ def normalize_routing_target(target: str) -> str:
     if not raw:
         return ""
     compact = _re.sub(r"[\s_\-]+", "", raw)
-    if "FINISH" in compact and "TASKCOMPLETE" in compact:
-        return "TASK COMPLETE"
-    if compact == "FINISH" or compact.startswith("FINISH") or compact.endswith("FINISH"):
+    if compact == "FINISH":
         return "FINISH"
-    if compact == "TASKCOMPLETE" or compact.startswith("TASKCOMPLETE") or compact.endswith("TASKCOMPLETE"):
-        return "TASK COMPLETE"
     return raw
-
 
 def first_status_line(text: str) -> str:
     for line in (text or "").splitlines():
@@ -428,8 +423,10 @@ def first_status_line(text: str) -> str:
 
 
 def is_task_complete(text: str) -> bool:
-    return first_status_line(text).startswith("TASK COMPLETE")
-
+    routing = parse_routing(text)
+    if not routing:
+        return False
+    return normalize_routing_target(routing.get("target", "")) == "FINISH"
 
 def is_changes_requested(text: str) -> bool:
     return first_status_line(text).startswith("CHANGES REQUESTED")

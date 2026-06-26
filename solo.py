@@ -16,7 +16,7 @@ Behavior:
 - Never opens a new chat automatically.
 - If the current chat has an assistant response, continues from that response.
 - If the current chat has no assistant response, sends the role system prompt plus optional goal.
-- Stops only when the first non-empty response line starts with TASK COMPLETE.
+- Stops only when the response contains valid routing JSON with target FINISH.
 - If not complete, sends a short continue prompt in the same session.
 - System prompt is attached once on ask #1.
 - Uses agent_core.py for all shared HTTP/command/routing helpers.
@@ -204,8 +204,8 @@ def build_followup_prompt(kind: str, goal: str, previous_response: str = "") -> 
         f"{goal_text}\n"
         "---\n"
         f"{kind}\n"
-        "If the goal is fully complete and verified, make the first non-empty line exactly:\n"
-        "TASK COMPLETE"
+        "If the goal is fully complete and verified, end with exactly one fenced JSON object whose target is FINISH.\n"
+        "Do not use textual TASK COMPLETE as a completion signal."
     )
 
 
@@ -345,15 +345,15 @@ def main() -> int:
 
         if is_complete(response):
             print("\n" + "!" * 60)
-            print("TASK COMPLETE")
+            print("FINISH routing received")
             print("!" * 60)
             print(f"\n[done] {len(history)} turns completed")
             return 0
 
-        print("\n[continue] response was not exactly TASK COMPLETE; continuing same chat")
+        print("\n[continue] FINISH routing not received; continuing same chat")
         core.time.sleep(SLEEP_S)
 
-    print(f"\nReached max turns ({MAX_TURNS}) without TASK COMPLETE")
+    print(f"\nReached max turns ({MAX_TURNS}) without FINISH routing")
     print(f"[done] {len(history)} turns completed")
     return 2
 

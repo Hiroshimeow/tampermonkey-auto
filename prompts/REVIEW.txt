@@ -207,3 +207,4 @@ Rules:
 - Replace "reason" with reason for the routing decision.
 - Replace "message" with specific details about the implementation, evidence, review request, or blocker.
 - Choose the target dynamically based on the workflow state.
+- Completion is valid only when target is FINISH. Textual completion phrases are not completion signals.

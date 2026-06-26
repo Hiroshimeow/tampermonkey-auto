@@ -50,7 +50,7 @@ uv run solo.py DEV2 --goal "noi dung task"
 - Neu `prompts/DEV2.txt` khong ton tai thi fallback sang `prompts/DEV.txt`.
 - System prompt chi attach o ask dau tien cua process run.
 - Neu response chua complete thi gui continue prompt ngan trong cung chat.
-- Stop khi dong khong rong dau tien cua response bat dau bang `TASK COMPLETE`.
+- Stop khi response co routing JSON hop le voi `target: "FINISH"`.
 
 ### SOLO wait behavior
 
@@ -104,7 +104,7 @@ uv run agents.py --roles MANAGER,T1,T2,T3,T4 --start-role MANAGER --goal "resear
 - Khong truyen `--roles`: hien menu chon role tu `prompts/`.
 - Co `--roles`: danh sach nay la `ALLOWED_TARGETS`.
 - `--goal` la bat buoc theo logic runtime. Neu khong truyen thi script se hoi `Goal:` qua stdin.
-- Agent chi duoc route toi role trong `ALLOWED_TARGETS`, hoac `FINISH` / `TASK COMPLETE`.
+- Agent chi duoc route toi role trong `ALLOWED_TARGETS`, hoac `FINISH` khi goal da hoan thanh.
 - Role co so fallback prompt: `DEV1`, `DEV2` dung `prompts/DEV.txt` neu khong co prompt rieng.
 - Luot dau cua moi role co the attach system prompt; cac luot sau gui goal/state/message ngan hon.
 - Neu response thieu JSON hoac JSON sai target: script gui format repair prompt.
@@ -125,10 +125,10 @@ Agent nen ket thuc bang mot fenced JSON object:
 }
 ```
 
-Neu task da xong, response co the bat dau bang:
+Neu task da xong, response phai ket thuc bang routing JSON:
 
-```text
-TASK COMPLETE
+```json
+{"target":"FINISH","reason":"complete_verified","message":"evidence summary"}
 ```
 
 Rule runtime quan trong:

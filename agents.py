@@ -50,7 +50,7 @@ class RoutingValidation:
 
 
 ROUTING_KEYS = {"target", "reason", "message"}
-COMPLETION_TARGETS = {"FINISH", "TASK COMPLETE"}
+COMPLETION_TARGETS = {"FINISH"}
 STATE_COMPACT_TAIL_CHARS = 4000
 
 
@@ -86,11 +86,11 @@ def build_agent_prompt(
         parts.append(f"CURRENT_STATE:\nNo prior state in this {config.role} run.")
     parts.append(
         "ROUTING CONTRACT:\n"
-        "If the whole issue is resolved, the goal is accomplished, reply with: TASK COMPLETE\n"
-        "- You may add concise evidence after TASK COMPLETE, but never put TASK COMPLETE in ordinary prose before completion.\n"
-        "- Otherwise end with exactly one fenced JSON object and nothing after it.\n"
+        "- Completion is valid only when the final routing JSON has target: FINISH.\n"
+        "- Do not use textual TASK COMPLETE, DONE, or status prose as a completion signal; runtime ignores it.\n"
+        "- End with exactly one fenced JSON object and nothing after it.\n"
         "- JSON keys must be exactly: target, reason, message.\n"
-        "- target must be one of ALLOWED_TARGETS. Do not invent roles.\n"
+        "- target must be one of ALLOWED_TARGETS, or FINISH only when the full goal is complete. Do not invent roles.\n"
         "- Non-MANAGER roles must choose exactly one target, never comma-separated targets.\n"
         "- Do not include other JSON objects in the response.\n"
         "- MANAGER parallel only: target may be comma-separated roles and reason must be parallel_dispatch."
@@ -223,13 +223,11 @@ def extract_balanced_json_objects(text: str) -> list[str]:
 
 
 def is_complete(text: str) -> bool:
-    if first_non_empty_line(text).upper().startswith("TASK COMPLETE"):
-        return True
     routing = parse_routing_safe(text)
     if not routing:
         return False
-    target = str(routing.get("target", "") or "").upper().strip()
-    return target in COMPLETION_TARGETS and validate_routing_contract(routing, [], "").ok
+    target = normalize_completion_target(routing.get("target", ""))
+    return target == "FINISH" and validate_routing_contract(routing, [], "").ok
 
 
 def compact_text(text: str, max_chars: int) -> str:
@@ -244,7 +242,7 @@ def update_state(previous_state: str, response: str, routing, turn: int, config:
     if routing:
         target = str(routing.get("target", "") or "").upper().strip()
         message = str(routing.get("message", "") or "").strip()
-        if target and target not in config.active_roles and target not in {"FINISH", "TASK COMPLETE"}:
+        if target and target not in config.active_roles and target != "FINISH":
             print(f"[warn] invalid target={target}; allowed={config.active_roles}")
         actionable = message or response
         route_line = f"Parsed routing target: {target or 'missing'}"
@@ -287,7 +285,7 @@ def load_format_repair_template(prompts_dir: str | Path = "prompts") -> str:
         "[FORMAT REPAIR]\n"
         "ALLOWED_TARGETS: {allowed_targets}\n"
         "CURRENT_ROLE: {current_role}\n"
-        "If complete: reply with TASK COMPLETE on the first line.\n"
+        "If complete: reply with exactly one fenced JSON object whose target is FINISH.\n"
         "Otherwise reply with exactly one fenced JSON object and nothing after it:\n"
         "```json\n"
         '{"target":"{default_target}","reason":"continue_required","message":"next concrete action"}\n'
@@ -322,10 +320,8 @@ def is_placeholder_value(value: str) -> bool:
 def normalize_completion_target(target: str) -> str:
     raw = str(target or "").strip().upper()
     compact = re.sub(r"[\s_\-]+", "", raw)
-    if compact in {"FINISH", "DONE"}:
+    if compact == "FINISH":
         return "FINISH"
-    if compact == "TASKCOMPLETE":
-        return "TASK COMPLETE"
     return raw
 
 
@@ -846,8 +842,8 @@ def load_role_prompt(role: str, *, core=None) -> str:
                 pass
     return (
         f"You are {role}. Work on the assigned task. "
-        "If complete, start with TASK COMPLETE. Otherwise end with one fenced JSON object "
-        "containing exactly target, reason, and message."
+        "If complete, end with one fenced JSON object whose target is FINISH. "
+        "Otherwise end with one fenced JSON object containing exactly target, reason, and message."
     )
 
 
@@ -991,7 +987,7 @@ def run_agent_loop(
         last_response_by_role[current_role] = response
 
         if is_complete(response):
-            print("\nTASK COMPLETE")
+            print("\nFINISH routing received")
             return {"status": "complete", "history": history, "last_response": response}
 
         routing = parse_routing_safe(response)
@@ -1064,7 +1060,7 @@ def run_agent_loop(
             raw_target = str(routing.get("target") or "")
             target = resolve_next_target(raw_target, active_roles, current_allowed_targets)
         if target:
-            if target not in active_roles and target not in {"FINISH", "TASK COMPLETE"}:
+            if target not in active_roles and target != "FINISH":
                 active_roles.append(target)
                 ask_counts.setdefault(target, 0)
             print(f"[routing] {current_role} -> {target}")

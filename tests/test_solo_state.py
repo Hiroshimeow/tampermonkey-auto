@@ -87,18 +87,19 @@ def test_empty_chat_allows_initial_goal_send():
     assert state["can_send_prompt"] is True
 
 
-def test_solo_completion_requires_task_complete_status_line():
+def test_solo_completion_requires_finish_routing_json():
     solo = load_solo_module()
 
     complete_cases = [
+        '{"target":"FINISH","reason":"done","message":"done"}',
+    ]
+    incomplete_cases = [
         "TASK COMPLETE",
         "TASK COMPLETE\nverified",
         "TASK COMPLETE: verified",
-        '{"target":"FINISH","reason":"done","message":"done"}',
-        '{"target":"TASK COMPLETE","reason":"done","message":"done"}',
-    ]
-    incomplete_cases = [
         f"prose before status phrase: {'TASK COMPLETE'}",
+        '{"target":"TASK COMPLETE","reason":"done","message":"done"}',
+        '{"target":"DONE","reason":"done","message":"done"}',
         '{"target":"FINISH","message":"done"}',
         "",
     ]
@@ -276,7 +277,7 @@ def test_solo_continue_send_allows_processed_current_response(monkeypatch):
             "stale_response": stale_response,
             "use_existing_response": use_existing_response,
         })
-        return "TASK COMPLETE\nverified"
+        return '```json\n{"target":"FINISH","reason":"done","message":"verified"}\n```'
 
     monkeypatch.setattr(solo, "run_agent", fake_run_agent)
 
@@ -336,8 +337,8 @@ def test_followup_prompt_includes_goal_reason_and_message():
     assert prompt.startswith("Previous response context:\n")
     assert "target: DEV\nreason: needs manual acceptance\nmessage: Check all emitted crops." in prompt
     assert "---\nGoal/context:\nParse all PDF pages\n---\ncontinue\n" in prompt
-    assert "make the first non-empty line exactly:" in prompt
-    assert prompt.endswith("TASK COMPLETE")
+    assert "target is FINISH" in prompt
+    assert "textual TASK COMPLETE" in prompt
 
 
 def test_followup_prompt_falls_back_for_target_only_json():

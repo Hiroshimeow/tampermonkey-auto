@@ -33,7 +33,7 @@ def test_role_config_builds_prompt_with_selected_role():
     assert "CURRENT_STATE:\nPrevious state" in prompt
     assert "ROUTING CONTRACT:" in prompt
     assert "JSON keys must be exactly: target, reason, message." in prompt
-    assert "target must be one of ALLOWED_TARGETS. Do not invent roles." in prompt
+    assert "target must be one of ALLOWED_TARGETS, or FINISH only when the full goal is complete." in prompt
     assert "Non-MANAGER roles must choose exactly one target" in prompt
 
 
@@ -198,12 +198,13 @@ def test_classify_chat_state_empty_dom_ignores_stale_cached_response():
     assert state["response_len"] == 0
 
 
-def test_is_complete_accepts_task_complete_and_finish_routing():
+def test_is_complete_accepts_only_finish_routing():
     agents = load_agents_module()
 
-    assert agents.is_complete("TASK COMPLETE\nok")
+    assert not agents.is_complete("TASK COMPLETE\nok")
     assert agents.is_complete('```json\n{"target":"FINISH","reason":"done","message":"done"}\n```')
-    assert agents.is_complete('```json\n{"target":"TASK COMPLETE","reason":"done","message":"done"}\n```')
+    assert not agents.is_complete('```json\n{"target":"TASK COMPLETE","reason":"done","message":"done"}\n```')
+    assert not agents.is_complete('```json\n{"target":"DONE","reason":"done","message":"done"}\n```')
     assert not agents.is_complete('```json\n{"target":"FINISH","message":"done"}\n```')
 
 

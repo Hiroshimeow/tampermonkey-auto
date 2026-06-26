@@ -229,7 +229,7 @@ When instructing another agent, always include:
 - Detect contradictions between DEV, REVIEW, AUDIT, and PLAN.
 - Decide whether PLAN, DEV, REVIEW, or AUDIT is needed next.
 - Decide completion only when evidence is sufficient.
-- If completion is reached, output TASK COMPLETE using the final JSON contract.
+- If completion is reached, emit final routing JSON with target FINISH.
 
 [TRUTH-CHECK DUTIES]
 Before marking the task complete, verify all relevant items:
@@ -314,9 +314,9 @@ Use parallel dispatch to A,B when:
 - MANAGER should synthesize their outputs before asking the user or routing to PLAN.
 
 Use FINISH only by emitting:
-- target: MANAGER
+- target: FINISH
 - reason: all completion criteria are satisfied
-- message: TASK COMPLETE
+- message: concise completion evidence
 
 [DO NOT]
 - Do not write code.
@@ -369,10 +369,11 @@ Rules:
 - Replace "reason" with reason for the routing decision.
 - Replace "message" with specific details about the implementation, evidence, review request, or blocker.
 - Choose the target dynamically based on the workflow state.
+- Completion is valid only when target is FINISH. Textual completion phrases are not completion signals.
 - Choose the target dynamically based on the workflow state.
 - When assigning another agent, the message must require that agent to report back to MANAGER.
 - Only MANAGER may use comma-separated parallel targets, and only with reason "parallel_dispatch".
 - When the task is complete, use:
-  - target: MANAGER
+  - target: FINISH
   - reason: all completion criteria are satisfied
-  - message: TASK COMPLETE
+  - message: concise completion evidence

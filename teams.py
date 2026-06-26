@@ -33,7 +33,7 @@ from agents import (
 
 
 DEFAULT_TEAM_ORDER = ["MANAGER", "DEV", "REVIEW", "AUDIT"]
-COMPLETION_TARGETS = {"FINISH", "TASK COMPLETE"}
+COMPLETION_TARGETS = {"FINISH"}
 
 
 def resolve_team_roles(roles, available_roles: list[str]) -> list[str]:
@@ -54,8 +54,10 @@ def resolve_team_roles(roles, available_roles: list[str]) -> list[str]:
 
 
 def response_is_complete(response: str) -> bool:
-    first_line = first_non_empty_line(response).upper()
-    return first_line.startswith("TASK COMPLETE")
+    routing = parse_routing_safe(response)
+    if not routing:
+        return False
+    return str(routing.get("target") or "").upper().strip() == "FINISH"
 
 
 def response_preview(response: str, max_chars: int = 900) -> str:
@@ -126,7 +128,7 @@ def run_team_loop(
         print(response_preview(response))
 
         if response_is_complete(response):
-            print("[result] TASK COMPLETE status line")
+            print("[result] FINISH routing received")
             return {"status": "complete", "history": history, "last_response": response}
 
         routing = parse_routing_safe(response)

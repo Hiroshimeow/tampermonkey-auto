@@ -2,8 +2,9 @@
 ALLOWED_TARGETS: {allowed_targets}
 CURRENT_ROLE: {current_role}
 
-If complete, reply with:
+If the whole issue is resolved, the goal is accomplished, reply with:
 TASK COMPLETE
+- You may add concise evidence after TASK COMPLETE, but never put TASK COMPLETE in ordinary prose before completion.
 <brief evidence>
 
 Otherwise reply with exactly one fenced JSON object and nothing after it:
@@ -12,11 +13,13 @@ Otherwise reply with exactly one fenced JSON object and nothing after it:
 {
   "target": "{default_target}",
   "reason": "continue_required",
-  "message": "Next concrete action, relevant state/evidence, blocker if any, and expected verification."
+  "message": "Include all issues being faced, specific next steps, relevant status/evidence, obstacles, etc., relevant to your current role. No length limit."
 }
 ```
 
 Rules:
+- message exactly: it must be appropriate for your current role.
+- The message content must be very clear, as the evaluator—in certain cases (such as when not sharing the same root as the MCP server)—will not have access to the developer's current source code context.
 - keys exactly: target, reason, message.
 - target must be in ALLOWED_TARGETS. Do not invent roles.
 - non-MANAGER roles must choose exactly one target, never comma-separated targets.

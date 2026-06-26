@@ -190,6 +190,7 @@ Use this JSON shape:
 
 Rules:
 - "xxx" is only a placeholder.
+- The message content must be very clear, as the evaluator—in certain cases (such as when not sharing the same root as the MCP server)—will not have access to the developer's current source code context.
 - Do not output "xxx" literally.
 - Replace "target" with one value from ALLOWED_TARGETS.
 - Replace "reason" with reason for the routing decision.

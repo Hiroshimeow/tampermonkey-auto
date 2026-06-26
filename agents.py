@@ -86,7 +86,8 @@ def build_agent_prompt(
         parts.append(f"CURRENT_STATE:\nNo prior state in this {config.role} run.")
     parts.append(
         "ROUTING CONTRACT:\n"
-        "- If complete, first line: TASK COMPLETE\n"
+        "If the whole issue is resolved, the goal is accomplished, reply with: TASK COMPLETE\n"
+        "- You may add concise evidence after TASK COMPLETE, but never put TASK COMPLETE in ordinary prose before completion.\n"
         "- Otherwise end with exactly one fenced JSON object and nothing after it.\n"
         "- JSON keys must be exactly: target, reason, message.\n"
         "- target must be one of ALLOWED_TARGETS. Do not invent roles.\n"

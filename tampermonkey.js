@@ -1070,6 +1070,66 @@
         });
     }
 
+    async function handleReloadPage(command, hard = false) {
+        const snapshot = domSnapshot();
+        await report('PAGE_RELOADING', command.command_id, {
+            result: {
+                hard,
+                href: window.location.href,
+                path: window.location.pathname || ''
+            },
+            dom_info: snapshot
+        });
+        setTimeout(() => {
+            if (hard) {
+                window.location.reload();
+                return;
+            }
+            window.location.reload();
+        }, config.reload_after_timeout_ms);
+    }
+
+    async function handleNavigateNewChat(command) {
+        const snapshot = domSnapshot();
+        await report('NEW_CHAT_NAVIGATING', command.command_id, {
+            result: {
+                href: window.location.href,
+                target_path: '/',
+                reason: 'navigate_current_tab_to_new_chat'
+            },
+            dom_info: snapshot
+        });
+        lastAcceptedTurnContext = null;
+        setTimeout(() => {
+            window.location.assign('/');
+        }, config.reload_after_timeout_ms);
+    }
+
+    async function handleCloseWindow(command) {
+        const snapshot = domSnapshot();
+        await report('WINDOW_CLOSE_REQUESTED', command.command_id, {
+            result: {
+                href: window.location.href,
+                note: 'Browsers may block window.close() unless this tab was script-opened.'
+            },
+            dom_info: snapshot
+        });
+        setTimeout(() => {
+            window.close();
+            setTimeout(async () => {
+                if (!document.hidden) {
+                    await report('WINDOW_CLOSE_BLOCKED', command.command_id, {
+                        result: {
+                            href: window.location.href,
+                            reason: 'tab_remained_visible_after_close_request'
+                        },
+                        dom_info: domSnapshot()
+                    });
+                }
+            }, config.reload_after_timeout_ms);
+        }, config.reload_after_timeout_ms);
+    }
+
     async function executeCommand(command) {
         const action = String(command.action || 'WAIT');
         activeCommandId = command.command_id || '';
@@ -1094,6 +1154,14 @@
             await handleWaitAssistantDone(command);
         } else if (action === 'SYNC_TRANSCRIPT') {
             await handleSyncTranscript(command);
+        } else if (action === 'NEW_CHAT' || action === 'NAVIGATE_NEW') {
+            await handleNavigateNewChat(command);
+        } else if (action === 'RESET_PAGE' || action === 'RELOAD_PAGE' || action === 'RELOAD') {
+            await handleReloadPage(command, false);
+        } else if (action === 'HARD_RELOAD') {
+            await handleReloadPage(command, true);
+        } else if (action === 'CLOSE_WINDOW' || action === 'CLOSE_TAB') {
+            await handleCloseWindow(command);
         } else {
             await report('UNKNOWN_COMMAND', command.command_id, {
                 result: {

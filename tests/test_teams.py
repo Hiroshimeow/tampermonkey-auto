@@ -8,8 +8,8 @@ def load_teams_module():
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    path = root / "teams.py"
-    spec = importlib.util.spec_from_file_location("teams_under_test", path)
+    path = root / "agents.py"
+    spec = importlib.util.spec_from_file_location("agents_team_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

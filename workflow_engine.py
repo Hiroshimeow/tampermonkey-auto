@@ -1,8 +1,8 @@
 """Pure workflow/routing helpers for browser-backed agent runners.
 
 This module intentionally has no browser, HTTP, CLI, or prompt-file side effects.
-agents.py, teams.py, and solo.py import these helpers to keep workflow behavior
-independent from the ChatGPT/Tampermonkey transport layer.
+agents.py and solo.py import these helpers to keep workflow behavior independent
+from the ChatGPT/Tampermonkey transport layer.
 """
 
 from dataclasses import dataclass

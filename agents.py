@@ -16,6 +16,10 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import workflow_engine
 from workflow_engine import (
@@ -66,6 +70,156 @@ class AgentConfig:
 
 
 PROMPT_TEMPLATE_FILES = {"FORMAT_REPAIR", "ROUTING_CONTRACT", "SOLO_CONTINUE", "SOLO_FOLLOWUP"}
+
+# Browser bridge defaults live here so there is one runner/helper module instead
+# of overlapping files.
+BASE_URL = "http://127.0.0.1:8500"
+PROMPTS_DIR = Path("prompts")
+PROBE_TIMEOUT_S = 600
+SET_PROMPT_TIMEOUT_S = 1200
+CLICK_TIMEOUT_S = 600
+ASSISTANT_TIMEOUT_S = 30000
+SYNC_TIMEOUT_S = 600
+SEND_MAX_RETRIES = 5
+ROLE_ASK_COUNTS: dict[str, int] = {}
+ACTIVE_ROLES: list[str] = []
+
+_HTTP_PROXY = os.environ.get("HTTP_PROXY", "")
+_HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "")
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_EXT_OPENER = (
+    urllib.request.build_opener(urllib.request.ProxyHandler({
+        "http": _HTTP_PROXY or _HTTPS_PROXY,
+        "https": _HTTPS_PROXY or _HTTP_PROXY,
+    })) if (_HTTP_PROXY or _HTTPS_PROXY) else _NO_PROXY
+)
+
+
+def _opener(url):
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return _NO_PROXY if host in {"127.0.0.1", "localhost", "::1"} else _EXT_OPENER
+
+
+def http_json(method, path, payload=None, timeout=300, retries=5, retry_wait_s=1.0):
+    url = f"{BASE_URL}{path}"
+    data, headers = None, {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            with _opener(url).open(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8")
+                return json.loads(text) if text else {}
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                body = ""
+            retryable = exc.code in (502, 503, 504)
+            last_exc = RuntimeError(f"HTTP {exc.code} {exc.reason} {method} {path} body={body}")
+            if retryable and attempt < retries:
+                time.sleep(retry_wait_s * (attempt + 1))
+                continue
+            raise last_exc from exc
+        except urllib.error.URLError as exc:
+            last_exc = RuntimeError(f"Cannot connect {url}: {exc.reason}")
+            if attempt < retries:
+                time.sleep(retry_wait_s * (attempt + 1))
+                continue
+            raise last_exc from exc
+    raise last_exc or RuntimeError(f"Unknown error {method} {path}")
+
+
+def send_command(role, action, payload=None):
+    return http_json("POST", "/api/admin/command", {
+        "role": role,
+        "action": action,
+        "payload": payload or {},
+    })["command"]
+
+
+def wait_command(command_id, timeout=300, print_every=2.0):
+    started, last_print = time.time(), 0.0
+    last_state = None
+    while True:
+        data = http_json("GET", f"/api/admin/command/{command_id}")
+        now = time.time()
+        state = (data.get("status"), data.get("done"))
+        if (now - last_print >= print_every) and (state != last_state or data.get("done")):
+            print(f"[{time.strftime('%H:%M:%S')}] cmd={command_id[:8]} status={data['status']} done={data['done']}")
+            last_print = now
+            last_state = state
+        if data["done"]:
+            return data["result"]
+        if timeout and (now - started) > timeout:
+            raise TimeoutError(f"Timeout waiting command_id={command_id}")
+        time.sleep(1.0)
+
+
+def run_command(role, action, payload=None, timeout=300, print_every=2.0):
+    cmd = send_command(role, action, payload)
+    print(f"{action} -> role={role}, command_id={cmd['command_id']}")
+    return wait_command(cmd["command_id"], timeout=timeout, print_every=print_every)
+
+
+def try_reset_page(role):
+    for action in ["RESET_PAGE", "RELOAD_PAGE", "HARD_RELOAD", "RELOAD"]:
+        try:
+            result = run_command(role, action, timeout=90, print_every=1.0)
+            print(f"Reset OK: {action}")
+            return {"ok": True, "action": action, "result": result}
+        except Exception as exc:
+            print(f"Reset skip: {action} -> {exc}")
+    return {"ok": False, "action": None, "result": None}
+
+
+def load_prompt(role):
+    return load_role_prompt(role, prompts_dir=PROMPTS_DIR)
+
+
+def log_roles_status(roles: list) -> None:
+    print("\n[roles status]")
+    for role in roles:
+        try:
+            snap = http_json("GET", f"/api/admin/role/{urllib.parse.quote(role)}")
+            status = snap.get("status", "?")
+            sessions = snap.get("sessions", 0)
+            last = (snap.get("last_response") or "")[:120].replace("\n", " ")
+            marker = "OK" if status not in ("OFFLINE", "ERROR") else "!!"
+            tail = f" | last: {last}..." if last else ""
+            print(f"  [{marker}] {role:10s} status={status} sessions={sessions}{tail}")
+        except Exception as exc:
+            print(f"  [??] {role:10s} error: {exc}")
+    print()
+
+
+def open_new_chat(role, wait_s=3.0):
+    for action in ["NEW_CHAT", "NAVIGATE_NEW"]:
+        try:
+            result = run_command(role, action, timeout=30, print_every=1.0)
+            if str(result.get("state") or result.get("status") or "").upper() == "UNKNOWN_COMMAND":
+                raise RuntimeError("command is not supported by browser controller")
+            print(f"[new_chat] {action} OK")
+            if wait_s > 0:
+                time.sleep(wait_s)
+            return {"ok": True, "action": action, "result": result}
+        except Exception as exc:
+            print(f"[new_chat] {action} skip: {exc}")
+    for action in ["RELOAD_PAGE", "HARD_RELOAD", "RELOAD"]:
+        try:
+            result = run_command(role, action, timeout=30, print_every=1.0)
+            if str(result.get("state") or result.get("status") or "").upper() == "UNKNOWN_COMMAND":
+                raise RuntimeError("command is not supported by browser controller")
+            print(f"[new_chat] fallback {action} OK")
+            if wait_s > 0:
+                time.sleep(wait_s)
+            return {"ok": True, "action": action, "result": result}
+        except Exception as exc:
+            print(f"[new_chat] fallback {action} skip: {exc}")
+    return {"ok": False, "action": None, "result": None}
 
 
 def safe_int(value, default: int = 0) -> int:
@@ -463,6 +617,41 @@ class BrowserAgent:
         return response
 
 
+def parse_routing(text: str) -> dict | None:
+    for candidate in iter_json_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and "target" in parsed:
+            return parsed
+    return None
+
+
+def normalize_routing_target(target: str) -> str:
+    return normalize_completion_target(target)
+
+
+def first_status_line(text: str) -> str:
+    return first_non_empty_line(text).upper()
+
+
+def is_task_complete(text: str) -> bool:
+    return is_complete(text)
+
+
+def is_changes_requested(text: str) -> bool:
+    return first_status_line(text).startswith("CHANGES REQUESTED")
+
+
+def is_need_info(text: str) -> bool:
+    return first_status_line(text).startswith("NEED INFO")
+
+
+def is_goal_complete(text: str) -> bool:
+    return first_status_line(text).startswith("GOAL COMPLETE")
+
+
 def prompt_role_candidates(role: str) -> list[str]:
     role = str(role or "").upper().strip()
     candidates = []
@@ -512,19 +701,9 @@ def resolve_role_selection(selection: str, available_roles: list[str], default=N
     return resolved
 
 
-def load_agent_core(core_path: str | Path = "agent_core.py") -> dict:
-    namespace = globals()
-    path = Path(core_path)
-    spec = importlib.util.spec_from_file_location("agent_core", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_core"] = module
-    spec.loader.exec_module(module)
-    namespace.update({
-        key: value
-        for key, value in vars(module).items()
-        if not key.startswith("__")
-    })
-    return namespace
+def load_agent_core(core_path: str | Path = "") -> dict:
+    workflow_engine.parse_routing = parse_routing
+    return globals()
 
 
 def make_browser_agent_from_core(role: str, active_roles: list[str], timeout_s: int, *, core=None, settings=None) -> BrowserAgent:
@@ -815,6 +994,8 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--prompts-dir", default="prompts")
     parser.add_argument("--config", default="config.toml")
+    parser.add_argument("--team", action="store_true", help="Start MANAGER-first team flow.")
+    parser.add_argument("--no-parallel", action="store_true", help="In team mode, repair comma targets instead of dispatching them.")
     return parser.parse_args(argv)
 
 
@@ -909,12 +1090,255 @@ def main(argv=None) -> int:
     core = globals()
     if "log_roles_status" in core:
         core["log_roles_status"](roles)
-    result = run_agent_loop(
+    if args.team:
+        roles = resolve_team_roles(roles, available_roles)
+        result = run_team_loop(
+            roles,
+            goal,
+            start_role=args.start_role,
+            max_turns=max_turns,
+            timeout_s=timeout_s,
+            no_parallel=args.no_parallel,
+            core=core,
+            settings=settings,
+        )
+    else:
+        result = run_agent_loop(
+            roles,
+            goal,
+            start_role=args.start_role,
+            max_turns=max_turns,
+            timeout_s=timeout_s,
+            core=core,
+            settings=settings,
+        )
+    print(f"\n[result] {result['status']} turns={len(result['history'])}")
+    return 0 if result["status"] == "complete" else 2
+
+
+# Manager-first team compatibility helpers
+
+DEFAULT_TEAM_ORDER = ["MANAGER", "DEV", "REVIEW", "AUDIT"]
+
+
+def resolve_team_roles(roles, available_roles: list[str]) -> list[str]:
+    available = normalize_role_list(available_roles)
+    requested = normalize_role_list(roles)
+
+    if requested:
+        if "MANAGER" not in requested and "MANAGER" in available:
+            requested.insert(0, "MANAGER")
+        return requested
+
+    default_team = [role for role in DEFAULT_TEAM_ORDER if role in available]
+    if default_team:
+        return default_team
+    if "MANAGER" in available:
+        return ["MANAGER"]
+    return available[:1]
+
+
+def response_is_complete(response: str) -> bool:
+    routing = parse_routing_safe(response)
+    if not routing:
+        return False
+    return str(routing.get("target") or "").upper().strip() == "FINISH"
+
+
+def response_preview(response: str, max_chars: int = 900) -> str:
+    response = (response or "").strip()
+    if len(response) <= max_chars:
+        return response
+    return f"{response[:max_chars].rstrip()}..."
+
+
+def run_team_loop(
+    roles: list[str],
+    goal: str,
+    *,
+    start_role: str = "",
+    max_turns: int = 50,
+    timeout_s: int = 3000,
+    no_parallel: bool = False,
+    core=None,
+    settings=None,
+) -> dict:
+    core = core or {}
+    settings = settings or {}
+    active_roles = normalize_role_list(roles)
+    if not active_roles:
+        raise ValueError("At least one role is required")
+
+    current_role = (start_role or "MANAGER").upper().strip()
+    if current_role not in active_roles:
+        active_roles.insert(0, current_role)
+
+    ask_counts = {role: 0 for role in active_roles}
+    last_response_by_role = {}
+    history = []
+    state = f"GOAL:\n{goal}"
+    repair_next_turn = False
+    loop_sleep_s = safe_int(settings.get("sleep_s"), 3)
+
+    for turn in range(1, max_turns + 1):
+        allowed_targets = normalize_role_list(active_roles)
+        if "FINISH" not in allowed_targets:
+            allowed_targets.append("FINISH")
+        ask_counts.setdefault(current_role, 0)
+        print(f"\n=== TEAM TURN {turn}: {current_role} ===")
+
+        extra_instruction = ""
+        if repair_next_turn:
+            extra_instruction = build_routing_repair_prompt(allowed_targets, current_role)
+            print(f"[repair] requesting valid routing from {current_role}")
+
+        response = ask_agent_once(
+            current_role,
+            goal,
+            state,
+            turn,
+            active_roles,
+            ask_counts,
+            timeout_s=timeout_s,
+            core=core,
+            settings=settings,
+            stale_response=last_response_by_role.get(current_role, ""),
+            force_system=False,
+            extra_instruction=extra_instruction,
+            use_existing_response=False,
+        )
+        repair_next_turn = False
+        history.append((current_role, response))
+        last_response_by_role[current_role] = response
+
+        print("[response]")
+        print(response_preview(response))
+
+        if response_is_complete(response):
+            print("[result] FINISH routing received")
+            return {"status": "complete", "history": history, "last_response": response}
+
+        routing = parse_routing_safe(response)
+        validation = validate_routing_contract(routing, allowed_targets, current_role)
+        if not validation.ok:
+            print(f"[routing] invalid: {validation.reason}")
+            state = append_routing_error_state(state, turn, validation.reason)
+            repair_next_turn = True
+            time.sleep(loop_sleep_s)
+            continue
+
+        target = str(routing.get("target") or "").upper().strip()
+        reason = str(routing.get("reason") or "").strip()
+        route_kind = "sequential"
+        parallel_targets = parse_parallel_targets(routing, allowed_targets, current_role)
+        if parallel_targets:
+            route_kind = "parallel"
+        print(f"[routing] kind={route_kind} target={target} reason={reason}")
+
+        if no_parallel and "," in target:
+            reason_text = "parallel dispatch is disabled by --no-parallel"
+            print(f"[routing] invalid: {reason_text}")
+            state = append_routing_error_state(state, turn, reason_text)
+            repair_next_turn = True
+            time.sleep(loop_sleep_s)
+            continue
+
+        state = update_state(state, response, routing, turn, AgentConfig(current_role, allowed_targets))
+
+        if parallel_targets:
+            manager_message = str(routing.get("message") or "").strip()
+            parallel_results = run_parallel_dispatch(
+                parallel_targets,
+                manager_message,
+                goal,
+                state,
+                turn,
+                active_roles,
+                ask_counts,
+                timeout_s=timeout_s,
+                core=core,
+                settings=settings,
+            )
+            for result in parallel_results:
+                role = result["role"]
+                if result.get("ok"):
+                    worker_response = result.get("response", "")
+                    history.append((role, worker_response))
+                    last_response_by_role[role] = worker_response
+                    print(f"[parallel:{role}] ok")
+                    print(response_preview(worker_response, 500))
+                else:
+                    error_text = result.get("error", "unknown error")
+                    history.append((role, f"PARALLEL ERROR\n{error_text}"))
+                    print(f"[parallel:{role}] error={error_text}")
+            state = f"{state}\n\n{format_parallel_results(parallel_results)}"
+            current_role = "MANAGER"
+            time.sleep(loop_sleep_s)
+            continue
+
+        next_target = resolve_next_target(target, active_roles, allowed_targets)
+        if next_target in COMPLETION_TARGETS:
+            print(f"[routing] completion target={next_target}")
+            return {"status": "complete", "history": history, "last_response": response}
+        if next_target:
+            current_role = next_target
+            time.sleep(loop_sleep_s)
+            continue
+
+        reason_text = f"target {target or 'missing'} is not routable"
+        print(f"[routing] invalid: {reason_text}")
+        state = append_routing_error_state(state, turn, reason_text)
+        repair_next_turn = True
+        time.sleep(loop_sleep_s)
+
+    return {"status": "max_turns", "history": history, "last_response": history[-1][1] if history else ""}
+
+
+def parse_team_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run an experimental manager-led agent team")
+    parser.add_argument("--roles", default="", help="Comma/space separated worker roles, e.g. DEV,REVIEW,AUDIT")
+    parser.add_argument("--goal", default="", help="Goal/task text. If omitted, asked interactively.")
+    parser.add_argument("--start-role", default="", help="Optional first role. Defaults to MANAGER.")
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--no-parallel", action="store_true", help="Request repair when MANAGER emits comma targets.")
+    parser.add_argument("--prompts-dir", default="prompts")
+    parser.add_argument("--config", default="config.toml")
+    parser.add_argument("--team", action="store_true", help="Start MANAGER-first team flow.")
+    parser.add_argument("--no-parallel", action="store_true", help="In team mode, repair comma targets instead of dispatching them.")
+    return parser.parse_args(argv)
+
+
+def team_main(argv=None) -> int:
+    args = parse_team_args(argv)
+    settings = load_simple_toml(args.config)
+    settings["prompts_dir"] = args.prompts_dir
+    available_roles = discover_prompt_roles(args.prompts_dir)
+    roles = resolve_team_roles(args.roles, available_roles)
+    goal = args.goal.strip() or input("Goal: ").strip()
+    if not goal:
+        print("[error] goal is required")
+        return 2
+    if not roles:
+        print(f"[error] no roles found in {Path(args.prompts_dir)}")
+        return 2
+
+    max_turns = args.max_turns if args.max_turns is not None else safe_int(settings.get("max_turns"), 50)
+    timeout_s = args.timeout if args.timeout is not None else safe_int(settings.get("timeout_s"), 3000)
+
+    load_agent_core()
+    core = globals()
+    core["ACTIVE_ROLES"] = roles
+    if "log_roles_status" in core:
+        core["log_roles_status"](roles)
+
+    result = run_team_loop(
         roles,
         goal,
         start_role=args.start_role,
         max_turns=max_turns,
         timeout_s=timeout_s,
+        no_parallel=args.no_parallel,
         core=core,
         settings=settings,
     )

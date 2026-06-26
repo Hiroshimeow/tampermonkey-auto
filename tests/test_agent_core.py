@@ -3,8 +3,8 @@ from pathlib import Path
 
 
 def load_agent_core_module():
-    path = Path(__file__).resolve().parents[1] / "agent_core.py"
-    spec = importlib.util.spec_from_file_location("agent_core_under_test", path)
+    path = Path(__file__).resolve().parents[1] / "agents.py"
+    spec = importlib.util.spec_from_file_location("agents_core_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

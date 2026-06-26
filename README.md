@@ -2,9 +2,10 @@
 
 Repo nay co 3 entrypoint chinh:
 
-- `solo.py`: chay 1 agent trong 1 browser/session, khong can JSON routing.
-- `agents.py`: multi-agent routing bang JSON, dung `ALLOWED_TARGETS`.
-- `teams.py`: ban thu nghiem manager-led, de dung hon khi co nhieu worker.
+- `server.py`: backend API cho Tampermonkey/browser bridge.
+- `agents.py`: runner chinh cho solo, multi-agent, va MANAGER-first team flow.
+- `solo.py`: wrapper gon cho single-agent loop.
+- `run.ipynb`: notebook chuan de chay va audit tung block.
 
 ## SOLO
 
@@ -83,7 +84,8 @@ Dung khi can multi-agent va routing qua JSON.
 uv run agents.py
 uv run agents.py --roles DEV,REVIEW --goal "implement feature X"
 uv run agents.py --roles DEV1,DEV2,REVIEW --start-role DEV1 --goal "chia viec refactor"
-uv run agents.py --roles MANAGER,DEV,REVIEW,AUDIT --goal "audit toan repo"
+uv run agents.py --roles MANAGER,DEV,REVIEW,AUDIT --start-role MANAGER --goal "audit toan repo"
+uv run agents.py --team --roles DEV,REVIEW,AUDIT --goal "manager-led audit"
 agents.bat --roles DEV,REVIEW --goal "fix tests"
 ```
 
@@ -137,24 +139,20 @@ Rule runtime quan trong:
 - `MANAGER` moi duoc dung `target` dang `T1,T2,T3` va chi khi `reason="parallel_dispatch"`.
 - Neu sai schema `target/reason/message`, script se repair toi da theo `max_format_repairs` trong `config.toml`.
 
-## TEAMS
+## MANAGER-first team mode
 
-`teams.py` la runner thu nghiem theo huong manager-led.
+Team runner da duoc merge vao `agents.py`. Dung `--team` khi muon mac dinh bat dau tu `MANAGER` va de manager dieu phoi worker.
 
 ```powershell
-python teams.py --roles DEV,REVIEW --goal "sua bug va review"
-python teams.py --roles DEV1,DEV2,REVIEW --goal "chia implementation cho 2 dev"
-python teams.py --roles DEV,REVIEW,AUDIT --start-role REVIEW --goal "review truoc roi route"
-python teams.py --roles DEV,REVIEW --goal "task X" --no-parallel
+uv run agents.py --team --roles DEV,REVIEW --goal "sua bug va review"
+uv run agents.py --team --roles DEV1,DEV2,REVIEW --goal "chia implementation cho 2 dev"
+uv run agents.py --team --roles DEV,REVIEW,AUDIT --start-role REVIEW --goal "review truoc roi route"
+uv run agents.py --team --roles DEV,REVIEW --goal "task X" --no-parallel
 ```
 
-### TEAMS flow
-
-- Mac dinh start bang `MANAGER`.
-- Worker lay tu `--roles`.
-- Manager co the route song song toi nhieu worker.
-- `--no-parallel` ep repair neu manager tra target nhieu role.
-- Van dung JSON routing, nhung model lam viec don gian hon: manager chia viec, worker lam, manager tong hop.
+- Mac dinh team mode prepend/start bang `MANAGER` neu prompt `MANAGER` ton tai.
+- `--no-parallel` ep format repair neu manager tra target nhieu role.
+- Core workflow van la `agents.py`; khong con runner team rieng.
 
 ## Role prompt fallback
 

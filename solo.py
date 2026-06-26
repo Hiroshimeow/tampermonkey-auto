@@ -19,7 +19,7 @@ Behavior:
 - Stops only when the response contains valid routing JSON with target FINISH.
 - If not complete, sends a short continue prompt in the same session.
 - System prompt is attached once on ask #1.
-- Uses agent_core.py for all shared HTTP/command/routing helpers.
+- Uses agents.py for all shared HTTP/command/routing helpers.
 """
 
 import argparse
@@ -40,10 +40,11 @@ def load_sibling_module(module_name: str):
     return module
 
 
-core = load_sibling_module("agent_core")
+agents_module = load_sibling_module("agents")
+core = agents_module
 
 # ============================================================
-# SOLO config (overrides / additions on top of agent_core)
+# SOLO config (overrides / additions on top of agents.py)
 # ============================================================
 ROLE = "SOLO"
 ACTIVE_ROLES = [ROLE]       # required by run_agent_prompt / build_role_prompt
@@ -59,7 +60,6 @@ SEND_MAX_RETRIES = 3        # More aggressive retry for solo mode
 MAX_STATE_CHARS = 12000
 SYSTEM_PROMPT_EVERY_N_ASKS = 0  # kept for compatibility; prompts attach once per process run
 
-agents_module = load_sibling_module("agents")
 AgentConfig = agents_module.AgentConfig
 BrowserAgent = agents_module.BrowserAgent
 _build_agent_prompt = agents_module.build_agent_prompt

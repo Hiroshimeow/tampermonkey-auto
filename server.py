@@ -315,7 +315,7 @@ class DiagnosticState:
 
 state = DiagnosticState()
 
-app = FastAPI(title="MAuto Diagnostic Controller")
+app = FastAPI(title="MAuto Browser Bridge Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -370,6 +370,37 @@ def api_admin_config_get():
 @app.post("/api/admin/config")
 def api_admin_config_update(req: AdminConfigRequest):
     return {"config": state.update_config(req.config)}
+
+
+def api_route_catalog(base_url: str = ""):
+    def item(group: str, method: str, path: str, purpose: str, sample_path: str = ""):
+        sample_path = sample_path or path
+        sample = f"{base_url}{sample_path}" if base_url else sample_path
+        return {
+            "group": group,
+            "method": method,
+            "path": path,
+            "sample": sample,
+            "purpose": purpose,
+        }
+
+    return [
+        item("client", "POST", "/api/status", "Browser role poll/status and command delivery."),
+        item("client", "POST", "/api/report", "Browser command result/report ingestion."),
+        item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
+        item("admin", "POST", "/api/admin/command", "Create a command for a role."),
+        item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
+        item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
+        item("admin", "GET", "/api/admin/events", "Read recent event log.", "/api/admin/events?role=A&limit=20"),
+        item("admin", "GET", "/api/admin/config", "Read runtime config."),
+        item("admin", "POST", "/api/admin/config", "Update runtime config."),
+        item("admin", "GET", "/api/admin/routes", "List available server endpoints."),
+    ]
+
+
+@app.get("/api/admin/routes")
+def api_admin_routes():
+    return {"routes": api_route_catalog()}
 
 
 @app.get("/api/admin/command/{command_id}")
@@ -465,11 +496,20 @@ def ensure_port_available(host: str, port: int, wait_s: float = 1.0) -> None:
         raise RuntimeError(f"Port {port} is still busy after stopping PID {pid}; current owner={remaining_pid}")
 
 
+def log_startup_routes(base_url: str) -> None:
+    print(f"[MAuto] server starting on {base_url}")
+    print("[MAuto] backend API:")
+    for route in api_route_catalog(base_url):
+        print(
+            f"  [{route['group']}] {route['method']:4s} {route['path']:<32s} "
+            f"sample: {route['sample']}"
+        )
+
+
 def run_server():
     ensure_port_available(SERVER_HOST, SERVER_PORT)
-    print(f"[MAuto] server starting on http://{SERVER_HOST}:{SERVER_PORT}")
-    print(f"[MAuto] admin command endpoint: http://{SERVER_HOST}:{SERVER_PORT}/api/admin/command")
-    print(f"[MAuto] role snapshot endpoint: http://{SERVER_HOST}:{SERVER_PORT}/api/admin/role/A")
+    base = f"http://{SERVER_HOST}:{SERVER_PORT}"
+    log_startup_routes(base)
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="error")
 
 

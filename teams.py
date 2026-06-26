@@ -13,27 +13,28 @@ import time
 
 from agents import (
     AgentConfig,
-    append_routing_error_state,
     ask_agent_once,
     build_routing_repair_prompt,
     discover_prompt_roles,
-    first_non_empty_line,
-    format_parallel_results,
     load_agent_core,
     load_simple_toml,
+    run_parallel_dispatch,
+    safe_int,
+)
+from workflow_engine import (
+    COMPLETION_TARGETS,
+    append_routing_error_state,
+    format_parallel_results,
     normalize_role_list,
     parse_parallel_targets,
     parse_routing_safe,
     resolve_next_target,
-    run_parallel_dispatch,
-    safe_int,
     update_state,
     validate_routing_contract,
 )
 
 
 DEFAULT_TEAM_ORDER = ["MANAGER", "DEV", "REVIEW", "AUDIT"]
-COMPLETION_TARGETS = {"FINISH"}
 
 
 def resolve_team_roles(roles, available_roles: list[str]) -> list[str]:

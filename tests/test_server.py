@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import diagnostic_controller as controller
+import server as controller
 
 
 class DiagnosticControllerTests(unittest.TestCase):
@@ -114,6 +114,25 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(events_response.status_code, 200)
         events_payload = events_response.json()
         self.assertGreaterEqual(len(events_payload["events"]), 1)
+
+    def test_admin_routes_lists_samples(self):
+        response = self.client.get("/api/admin/routes")
+        self.assertEqual(response.status_code, 200)
+        routes = response.json()["routes"]
+        samples = [route["sample"] for route in routes]
+
+        self.assertIn("/api/admin/role/A", samples)
+        self.assertIn("/api/admin/events?role=A&limit=20", samples)
+        self.assertEqual({"client", "admin"}, {route["group"] for route in routes})
+
+    def test_startup_log_lists_backend_api_samples(self):
+        with patch("builtins.print") as print_mock:
+            controller.log_startup_routes("http://127.0.0.1:8500")
+
+        output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn("backend API", output)
+        self.assertIn("http://127.0.0.1:8500/api/admin/role/A", output)
+        self.assertIn("http://127.0.0.1:8500/api/admin/routes", output)
 
     def test_admin_config_get_and_partial_update(self):
         get_response = self.client.get("/api/admin/config")
@@ -347,9 +366,9 @@ class DiagnosticControllerTests(unittest.TestCase):
             ],
         )
 
-    @patch("diagnostic_controller.time.sleep")
-    @patch("diagnostic_controller.os.kill")
-    @patch("diagnostic_controller.find_pid_on_port")
+    @patch("server.time.sleep")
+    @patch("server.os.kill")
+    @patch("server.find_pid_on_port")
     def test_ensure_port_available_kills_existing_owner(self, find_pid, os_kill, sleep_mock):
         find_pid.side_effect = [4321, None]
 
@@ -358,8 +377,8 @@ class DiagnosticControllerTests(unittest.TestCase):
         os_kill.assert_called_once_with(4321, controller.signal.SIGTERM)
         sleep_mock.assert_called_once()
 
-    @patch("diagnostic_controller.os.kill")
-    @patch("diagnostic_controller.find_pid_on_port", return_value=None)
+    @patch("server.os.kill")
+    @patch("server.find_pid_on_port", return_value=None)
     def test_ensure_port_available_noop_when_port_is_free(self, find_pid, os_kill):
         controller.ensure_port_available("127.0.0.1", 8500)
 

@@ -174,3 +174,160 @@ Mot so gia tri lay tu `config.toml` neu runner co dung config:
 - `timeout_s`: timeout doi assistant.
 - `sleep_s`: khoang nghi giua cac turn.
 - `busy_reload_after_s`: thoi gian wait truoc khi reload de tranh state sai.
+
+## Image + text upload bridge
+
+The browser bridge now supports multimodal turns: text plus optional image/file artifacts. The stable path is not OS clipboard simulation. All image sources are normalized on the Python side, then sent to Tampermonkey as one `UPLOAD_FILES` command.
+
+Supported source kinds:
+
+- local path
+- web URL
+- base64 or data URL
+- OS clipboard image or file list
+- raw bytes from Python
+
+Normalized upload item shape:
+
+```json
+{
+  "filename": "image.png",
+  "mime_type": "image/png",
+  "data_b64": "...",
+  "size": 12345,
+  "source_kind": "local",
+  "meta": {}
+}
+```
+
+Default upload method is `input`, not `auto`. ChatGPT currently exposes hidden file inputs such as `#upload-files` and `#upload-photos-input`; using the input path avoids duplicate overlay bugs caused by broadcasting the same file through multiple paste/drop targets. `auto`, `paste`, and `drop` are still available only when explicitly requested.
+
+Run a local image upload:
+
+```powershell
+cd E:\python_project\tampermonkey_auto
+py upload_once.py --role IMG --local "C:\path\to\image.png" --text "Describe this image."
+```
+
+Run without sending, useful for UI checks:
+
+```powershell
+py upload_once.py --role IMG --local "C:\path\to\image.png" --text "Describe this image." --no-send
+```
+
+Upload from other sources:
+
+```powershell
+py upload_once.py --role IMG --web "https://example.com/image.png" --text "Describe this image."
+py upload_once.py --role IMG --base64-file temps\image.b64 --filename image.png --mime image/png --text "Describe this image."
+py upload_once.py --role IMG --clipboard --text "Describe this clipboard image."
+```
+
+Python API:
+
+```python
+import agents
+
+agents.run_upload_files(
+    "IMG",
+    ["temps/example.png"],
+    text="Describe this image.",
+)
+
+agents.run_upload_sources(
+    "IMG",
+    [{"kind": "web", "url": "https://example.com/image.png"}],
+    text="Describe this image.",
+)
+```
+
+Safety/robustness rules:
+
+- Do not commit real API keys or bearer tokens. Use environment variables or local `.env` files that remain untracked.
+- Upload payloads are uniquified by default to avoid ChatGPT duplicate-file guards.
+- PNG uploads receive a harmless metadata chunk when uniquified; visible image content is unchanged.
+- Stale upload overlays are dismissed before upload attempts.
+- Test artifacts belong under `temps/`, which is ignored by git.
+
+Recommended workflow model:
+
+```text
+task
+-> build multimodal message envelope
+-> normalize artifacts
+-> upload artifacts if present
+-> set/send prompt text
+-> wait assistant response
+-> capture transcript and attachment evidence
+-> route next step
+```
+
+Use one turn envelope for both text-only and image+text messages. Do not maintain separate text-flow and image-flow paths.
+
+## OpenAI-compatible `/complete` API research
+
+Branch: `feat/openai-complete-api`.
+
+Goal: add a local OpenAI-compatible completion endpoint for tools that expect a simple text-in/text-out API, while keeping the existing ChatGPT browser bridge as a backend option.
+
+Preferred modern upstream shape is the OpenAI Responses API:
+
+- `POST /v1/responses` is the modern model-response endpoint.
+- It accepts text, image, and file inputs.
+- It supports tools, streaming, conversation state, structured output, and response metadata.
+- For new text generation work, prefer Responses over legacy Chat Completions unless a client specifically requires chat-completion compatibility.
+
+Compatibility target for this repo:
+
+```http
+POST /v1/complete
+Authorization: Bearer <local token>
+Content-Type: application/json
+```
+
+Minimal request:
+
+```json
+{
+  "model": "chatgpt-browser",
+  "prompt": "Say hello",
+  "role": "DEV",
+  "max_tokens": 1024,
+  "stream": false
+}
+```
+
+Candidate response:
+
+```json
+{
+  "id": "cmpl_local_...",
+  "object": "text_completion",
+  "created": 0,
+  "model": "chatgpt-browser",
+  "choices": [
+    {
+      "index": 0,
+      "text": "Hello.",
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+Implementation plan:
+
+1. Add token auth middleware for local API routes.
+2. Read token only from environment/config, never hard-code it in tracked files.
+3. Add `/v1/complete` as a thin adapter: prompt -> selected browser role -> `SET_PROMPT` or upload path -> `CLICK_SEND` -> `WAIT_ASSISTANT_DONE` -> OpenAI-like response.
+4. Add `/v1/chat/completions` compatibility only after `/v1/complete` is stable.
+5. Add optional streaming via server-sent events after non-streaming is verified.
+6. Add tests for auth, request validation, response mapping, timeout mapping, and busy-browser handling.
+
+Suggested local env:
+
+```powershell
+$env:MAUTO_API_TOKEN="<local-dev-token>"
+```
+
+Do not place token values in README, code, tests, commits, logs, or issue text.

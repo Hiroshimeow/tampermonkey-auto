@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,9 @@ class DiagnosticControllerTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(controller.app)
         controller.state = controller.DiagnosticState()
+        for role in ("DEV", "IMG", "REVIEW", "SOLO"):
+            controller.state.status[role] = "ONLINE"
+            controller.state.role_seen_at[role] = time.time()
 
     def test_status_report_and_sync_flow(self):
         command = controller.state.create_command("A", "PROBE", {"depth": 1})
@@ -169,7 +173,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(verified["send_delay_min_ms"], 2222)
 
     def test_status_ignores_sentinel_frame_for_command_delivery(self):
-        controller.state.create_command("A", "PROBE", {"depth": 1})
+        controller.state.create_command("PROBE", {"depth": 1})
 
         response = self.client.post(
             "/api/status",
@@ -399,7 +403,7 @@ class DiagnosticControllerTests(unittest.TestCase):
             with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
                 response = self.client.post(
                     "/v1/complete",
-                    json={"prompt": "hello", "role": "A"},
+                    json={"model": "DEV", "prompt": "hello"},
                 )
 
         self.assertEqual(response.status_code, 200)
@@ -410,7 +414,7 @@ class DiagnosticControllerTests(unittest.TestCase):
             response = self.client.post(
                 "/v1/complete",
                 headers={"Authorization": "Bearer wrong-token"},
-                json={"prompt": "hello", "role": "A"},
+                    json={"model": "DEV", "prompt": "hello"},
             )
 
         self.assertEqual(response.status_code, 401)
@@ -426,7 +430,7 @@ class DiagnosticControllerTests(unittest.TestCase):
                 response = self.client.post(
                     "/v1/complete",
                     headers={"Authorization": "Bearer expected-token"},
-                    json={"prompt": "hello", "role": "A", "model": "chatgpt-browser"},
+                    json={"prompt": "hello", "role": "DEV", "model": "chatgpt-browser"},
                 )
 
         self.assertEqual(response.status_code, 200)
@@ -470,7 +474,7 @@ class DiagnosticControllerTests(unittest.TestCase):
                 response = self.client.post(
                     "/v1/complete",
                     headers={"Authorization": "Bearer expected-token"},
-                    json={"prompt": "hello", "role": "A", "timeout_s": 0.1},
+                    json={"prompt": "hello", "role": "DEV", "timeout_s": 0.1},
                 )
 
         self.assertEqual(response.status_code, 504)
@@ -537,6 +541,33 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(create_mock.call_args_list[0].args[0], "DEV")
         self.assertEqual(response.json()["model"], "DEV")
+
+    def test_auto_open_missing_model_launches_role_url(self):
+        controller.state = controller.DiagnosticState()
+        controller.state.config["auto_open_wait_s"] = 0.01
+        controller.state.config["auto_close_after_s"] = 600
+        with patch.object(controller.webbrowser, "open") as open_mock:
+            with patch.object(controller, "schedule_auto_close_role") as schedule_mock:
+                with patch.object(controller.time, "sleep", return_value=None):
+                    with self.assertRaises(controller.HTTPException) as ctx:
+                        controller.ensure_browser_role_available("HERMES", 0.01)
+
+        self.assertEqual(ctx.exception.status_code, 504)
+        opened_url = open_mock.call_args.args[0]
+        self.assertIn("https://chatgpt.com/", opened_url)
+        self.assertIn("mauto_role=HERMES", opened_url)
+        self.assertIn("mauto_auto_close_s=600", opened_url)
+        schedule_mock.assert_called_once_with("HERMES")
+
+
+    def test_auto_open_missing_model_can_be_disabled(self):
+        controller.state = controller.DiagnosticState()
+        controller.state.config["auto_open_missing_model"] = False
+        with self.assertRaises(controller.HTTPException) as ctx:
+            controller.ensure_browser_role_available("HERMES", 1)
+
+        self.assertEqual(ctx.exception.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,7 +64,22 @@
         return Math.floor(Math.random() * (normalizedMax - normalizedMin + 1)) + normalizedMin;
     }
 
+    function roleFromUrl() {
+        try {
+            const params = new URLSearchParams(window.location.search || '');
+            const value = (params.get('mauto_role') || '').trim().toUpperCase();
+            return value || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
     function nextRole() {
+        const urlRole = roleFromUrl();
+        if (urlRole) {
+            setRole(urlRole);
+            return urlRole;
+        }
         return (sessionStorage.getItem('chatgpt_agent_role') || 'None').trim().toUpperCase() || 'None';
     }
 

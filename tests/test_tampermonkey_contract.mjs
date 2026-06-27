@@ -48,4 +48,6 @@ assert.match(source, /already uploaded this file/, 'upload overlay cleanup must 
 assert.match(source, /dismiss_overlay_before_upload/, 'UPLOAD_FILES must run overlay cleanup before injecting files');
 assert.match(source, /method === 'auto' \? \['input', 'paste', 'drop'\]/, 'UPLOAD_FILES auto mode must prefer input before paste/drop to avoid duplicate overlay');
 assert.match(source, /const checkAfterAttempt = async \(label\)/, 'UPLOAD_FILES must check success after each individual target attempt');
-assert.match(source, /if \(succeededMethod\) \{\s*break;\s*\}/, 'UPLOAD_FILES must stop trying more targets after first successful upload');
+assert.match(source, /if \(succeededMethod\) \{\s*break;\s*\}/, 'UPLOAD_FILES must stop trying more targets after first successful upload');assert.match(source, /function roleFromUrl\(\)/, 'bridge must read auto-open role from URL');
+assert.match(source, /mauto_role/, 'bridge must accept mauto_role URL parameter');
+assert.match(source, /setRole\(urlRole\)/, 'bridge must persist URL-provided role into sessionStorage');

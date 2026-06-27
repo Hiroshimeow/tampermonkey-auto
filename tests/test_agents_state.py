@@ -577,7 +577,7 @@ def test_wait_for_live_response_accepts_stable_soft_stuck_response(monkeypatch):
     ]
 
     agent = agents.BrowserAgent(
-        agents.AgentConfig("DEV", ["DEV"], soft_stuck_stable_samples=1, soft_stuck_sample_s=0),
+        agents.AgentConfig("DEV", ["DEV"], busy_reload_after_s=0, soft_stuck_stable_samples=1, soft_stuck_sample_s=0),
         run_command_fn=lambda *args, **_kwargs: {"state": "TRANSCRIPT_SAVED"},
         http_json_fn=lambda *_args, **_kwargs: snapshots.pop(0),
         try_reset_page_fn=lambda *_args: None,
@@ -589,7 +589,7 @@ def test_wait_for_live_response_accepts_stable_soft_stuck_response(monkeypatch):
     assert agents.ROLE_PROCESSED_RESPONSE_HASH["DEV"] == agents.response_fingerprint(response)
 
 
-def test_wait_for_sendable_chat_reloads_duplicate_soft_stuck_response(monkeypatch):
+def test_wait_for_sendable_chat_waits_on_duplicate_soft_stuck_response_before_recovery(monkeypatch):
     agents = load_agents_module()
     response = '{"target":"REVIEW","reason":"ready","message":"check"}'
     snapshots = [
@@ -607,7 +607,38 @@ def test_wait_for_sendable_chat_reloads_duplicate_soft_stuck_response(monkeypatc
     resets = []
 
     agent = agents.BrowserAgent(
-        agents.AgentConfig("DEV", ["DEV"], busy_reload_wait_s=0),
+        agents.AgentConfig("DEV", ["DEV"], busy_reload_after_s=999, busy_reload_wait_s=0),
+        run_command_fn=lambda *args, **_kwargs: {"state": "TRANSCRIPT_SAVED"},
+        http_json_fn=lambda *_args, **_kwargs: snapshots.pop(0),
+        try_reset_page_fn=lambda role: resets.append(role),
+    )
+    monkeypatch.setattr(agents.time, "sleep", lambda *_args: None)
+
+    state = agent.wait_for_sendable_chat(stale_response=response, allow_processed_response=True)
+
+    assert state["kind"] == "empty_chat"
+    assert resets == []
+
+
+def test_wait_for_sendable_chat_recovers_duplicate_soft_stuck_response_after_busy_timeout(monkeypatch):
+    agents = load_agents_module()
+    response = '{"target":"REVIEW","reason":"ready","message":"check"}'
+    snapshots = [
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": True, "messages": {"counts": {"user": 1, "assistant": 1}, "messages": []}},
+            "last_response": response,
+            "last_user": "prompt",
+        },
+        {
+            "dom_info": {"composer_text_len": 0, "stop_visible": False, "messages": {"counts": {"user": 0, "assistant": 0}, "messages": []}},
+            "last_response": "",
+            "last_user": "",
+        },
+    ]
+    resets = []
+
+    agent = agents.BrowserAgent(
+        agents.AgentConfig("DEV", ["DEV"], busy_reload_after_s=0, busy_reload_wait_s=0),
         run_command_fn=lambda *args, **_kwargs: {"state": "TRANSCRIPT_SAVED"},
         http_json_fn=lambda *_args, **_kwargs: snapshots.pop(0),
         try_reset_page_fn=lambda role: resets.append(role),

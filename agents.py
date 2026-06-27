@@ -864,20 +864,32 @@ class BrowserAgent:
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
             if state["kind"] == "assistant_soft_stuck" and state.get("response"):
-                if allow_processed_response and (
-                    allow_any_processed_response
-                    or response_fingerprint(state["response"]) != response_fingerprint(stale_response)
-                ):
-                    stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
-                    if stable_state:
+                if blocked_since is None:
+                    blocked_since = time.time()
+                blocked_for = time.time() - blocked_since
+                response_is_stale = response_fingerprint(state["response"]) == response_fingerprint(stale_response)
+
+                if blocked_for >= self.config.busy_reload_after_s:
+                    if allow_processed_response and (allow_any_processed_response or not response_is_stale):
+                        stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                        if stable_state:
+                            blocked_since = None
+                            return stable_state
+                    if response_is_stale:
+                        state = self.reload_wait_and_reclassify(
+                            f"soft-stuck UI kept an already processed response for {int(blocked_for)}s"
+                        )
+                        clear_role_ui_dirty(self.config.role)
                         blocked_since = None
-                        return stable_state
-                if response_fingerprint(state["response"]) == response_fingerprint(stale_response):
-                    state = self.reload_wait_and_reclassify("soft-stuck UI is showing an already processed response")
-                    clear_role_ui_dirty(self.config.role)
-                    blocked_since = None
-                    if state.get("can_send_prompt"):
-                        return state
+                        if state.get("can_send_prompt"):
+                            return state
+
+                print(
+                    f"[wait] {self.config.role}: stop button still visible with response text; "
+                    f"treating as active generation for {int(blocked_for)}s before recovery"
+                )
+                time.sleep(self.config.state_wait_s)
+                continue
 
             if (
                 allow_processed_response
@@ -919,6 +931,7 @@ class BrowserAgent:
     def wait_for_live_response(self, stale_response: str = "") -> str:
         time = __import__("time")
         consecutive_errors = 0
+        blocked_since = None
         while True:
             try:
                 state = classify_chat_state(self.get_role_snapshot(reason="agent_wait_response"))
@@ -940,11 +953,19 @@ class BrowserAgent:
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
             if state["kind"] == "assistant_ready" and state["response"]:
+                blocked_since = None
                 return self.record_processed_response(state["response"])
             if state["kind"] == "assistant_soft_stuck" and state.get("response"):
-                stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
-                if stable_state:
-                    return self.record_processed_response(stable_state["response"])
+                if blocked_since is None:
+                    blocked_since = time.time()
+                blocked_for = time.time() - blocked_since
+                if blocked_for >= self.config.busy_reload_after_s:
+                    stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                    if stable_state:
+                        blocked_since = None
+                        return self.record_processed_response(stable_state["response"])
+                else:
+                    print(f"[wait] {self.config.role}: generation still active; waiting before accepting response ({int(blocked_for)}s)")
             time.sleep(self.config.state_wait_s)
 
     def send_and_wait(

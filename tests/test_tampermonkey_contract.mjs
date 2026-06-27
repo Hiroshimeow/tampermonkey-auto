@@ -46,3 +46,6 @@ assert.match(source, /composer_attachments:/, 'domSnapshot must expose composer 
 assert.match(source, /function dismissUploadOverlays\(\)/, 'upload flow must detect and dismiss stale upload overlays');
 assert.match(source, /already uploaded this file/, 'upload overlay cleanup must handle duplicate-file modal');
 assert.match(source, /dismiss_overlay_before_upload/, 'UPLOAD_FILES must run overlay cleanup before injecting files');
+assert.match(source, /method === 'auto' \? \['input', 'paste', 'drop'\]/, 'UPLOAD_FILES auto mode must prefer input before paste/drop to avoid duplicate overlay');
+assert.match(source, /const checkAfterAttempt = async \(label\)/, 'UPLOAD_FILES must check success after each individual target attempt');
+assert.match(source, /if \(succeededMethod\) \{\s*break;\s*\}/, 'UPLOAD_FILES must stop trying more targets after first successful upload');

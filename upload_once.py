@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Upload one or more image sources to a ChatGPT role through the MAuto bridge."""
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ def parse_args(argv=None):
     parser.add_argument("--filename", default="upload.png", help="Default filename for base64/clipboard image sources.")
     parser.add_argument("--mime", default="", help="Optional MIME type for base64/clipboard image sources.")
     parser.add_argument("--no-uniquify", action="store_true", help="Do not alter filename/bytes to avoid duplicate-file modal.")
+    parser.add_argument("--method", default="input", help="Browser upload method. Default input avoids duplicate overlay.")
     parser.add_argument("--no-send", action="store_true", help="Upload into composer but do not click Send.")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--upload-wait-ms", type=int, default=20000)
@@ -58,6 +59,7 @@ def main(argv=None):
         args.role,
         sources,
         text=args.text,
+        method=args.method,
         timeout=args.timeout,
         print_every=1,
         upload_wait_ms=args.upload_wait_ms,
@@ -87,3 +89,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

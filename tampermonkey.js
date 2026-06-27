@@ -1007,7 +1007,7 @@
 
             before = domSnapshot();
             const beforeAttachments = before.composer_attachments || [];
-            const methods = method === 'auto' ? ['paste', 'drop', 'input'] : [method];
+            const methods = method === 'auto' ? ['input', 'paste', 'drop'] : [method];
             const targets = uniqueElements([
                 composer,
                 closestComposerRoot(),
@@ -1017,41 +1017,65 @@
                 document
             ]);
 
+            const checkAfterAttempt = async (label) => {
+                await sleep(pollMs);
+                dismissUploadOverlays();
+                after = domSnapshot();
+                if (uploadSucceeded(beforeAttachments, after)) {
+                    succeededMethod = label;
+                    return true;
+                }
+                return false;
+            };
+
             for (const currentMethod of methods) {
-                if (currentMethod === 'paste') {
-                    const dt = buildFileDataTransfer(files, text);
+                if (currentMethod === 'input') {
+                    const assigned = tryAssignFilesToInput(files);
+                    tried.push({ method: currentMethod, ok: assigned.ok, input: assigned.input });
+                    if (await checkAfterAttempt(currentMethod)) {
+                        break;
+                    }
+                } else if (currentMethod === 'paste') {
                     for (const target of targets) {
+                        const dt = buildFileDataTransfer(files, text);
                         try {
                             dispatchClipboardLikeEvent(target, 'paste', dt);
                             tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: true });
                         } catch (error) {
                             tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
                         }
+                        if (await checkAfterAttempt(`${currentMethod}:${domPath(target) || target.nodeName || 'document'}`)) {
+                            break;
+                        }
+                    }
+                    if (succeededMethod) {
+                        break;
                     }
                 } else if (currentMethod === 'drop') {
-                    const dt = buildFileDataTransfer(files, text);
                     for (const target of targets) {
+                        const dt = buildFileDataTransfer(files, text);
+                        let targetAttempted = false;
                         for (const eventName of ['dragenter', 'dragover', 'drop']) {
                             try {
                                 dispatchClipboardLikeEvent(target, eventName, dt);
+                                targetAttempted = true;
                                 tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: true });
                             } catch (error) {
                                 tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
                             }
                         }
+                        if (targetAttempted && await checkAfterAttempt(`${currentMethod}:${domPath(target) || target.nodeName || 'document'}`)) {
+                            break;
+                        }
                     }
-                } else if (currentMethod === 'input') {
-                    const assigned = tryAssignFilesToInput(files);
-                    tried.push({ method: currentMethod, ok: assigned.ok, input: assigned.input });
+                    if (succeededMethod) {
+                        break;
+                    }
                 } else {
                     tried.push({ method: currentMethod, ok: false, error: 'unsupported_upload_method' });
-                }
-
-                await sleep(pollMs);
-                after = domSnapshot();
-                if (uploadSucceeded(beforeAttachments, after)) {
-                    succeededMethod = currentMethod;
-                    break;
+                    if (await checkAfterAttempt(currentMethod)) {
+                        break;
+                    }
                 }
             }
 

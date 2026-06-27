@@ -33,3 +33,16 @@ assert.match(source, /action === 'RESET_PAGE' \|\| action === 'RELOAD_PAGE' \|\|
 assert.match(source, /action === 'HARD_RELOAD'/, 'hard reload command must be supported');
 assert.match(source, /function handleCloseWindow\(command\)/, 'tampermonkey.js must implement close-window command with browser-block reporting');
 assert.match(source, /WINDOW_CLOSE_BLOCKED/, 'close-window command must report when the browser blocks tab closing');
+assert.match(source, /function handleUploadFiles\(command\)/, 'tampermonkey.js must implement browser file upload command');
+assert.match(source, /function uploadPayloadFiles\(payload\)/, 'file upload must rebuild File objects from payload');
+assert.match(source, /base64ToBytes\(data\)/, 'file upload must decode local file bytes in browser');
+assert.match(source, /new File\(\[bytes\], name, \{ type \}\)/, 'file upload must create real File objects');
+assert.match(source, /new ClipboardEvent\('paste'/, 'file upload must support clipboard-style paste');
+assert.match(source, /new DragEvent\(eventName/, 'file upload must support drag/drop fallback');
+assert.match(source, /querySelectorAll\('input\[type="file"\]'\)/, 'file upload must support file-input fallback');
+assert.match(source, /action === 'UPLOAD_FILE' \|\| action === 'UPLOAD_FILES' \|\| action === 'PASTE_IMAGE' \|\| action === 'PASTE_FILES'/, 'upload command aliases must be routed');
+assert.match(source, /composer_attachments:/, 'domSnapshot must expose composer attachment metadata');
+
+assert.match(source, /function dismissUploadOverlays\(\)/, 'upload flow must detect and dismiss stale upload overlays');
+assert.match(source, /already uploaded this file/, 'upload overlay cleanup must handle duplicate-file modal');
+assert.match(source, /dismiss_overlay_before_upload/, 'UPLOAD_FILES must run overlay cleanup before injecting files');

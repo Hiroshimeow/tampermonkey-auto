@@ -268,6 +268,177 @@
         return false;
     }
 
+
+    function normalizeBase64(data) {
+        return String(data || '')
+            .replace(/^data:[^;]+;base64,/i, '')
+            .replace(/\s+/g, '');
+    }
+
+    function base64ToBytes(data) {
+        const normalized = normalizeBase64(data);
+        if (!normalized) {
+            throw new Error('missing_base64_data');
+        }
+        const binary = atob(normalized);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    }
+
+    function uploadPayloadFiles(payload) {
+        const entries = Array.isArray(payload.files) && payload.files.length ? payload.files : [payload];
+        return entries.map((entry, index) => {
+            const item = entry || {};
+            const name = String(item.filename || item.name || `upload-${index + 1}.png`);
+            const type = String(item.mime_type || item.type || item.mime || 'image/png');
+            const data = item.data_b64 || item.file_b64 || item.b64 || item.base64 || item.data || '';
+            const bytes = base64ToBytes(data);
+            return new File([bytes], name, { type });
+        });
+    }
+
+    function buildFileDataTransfer(files, text = '') {
+        const dt = new DataTransfer();
+        for (const file of files) {
+            dt.items.add(file);
+        }
+        if (text) {
+            dt.setData('text/plain', text);
+        }
+        return dt;
+    }
+
+    function dispatchClipboardLikeEvent(target, eventName, dataTransfer) {
+        const init = {
+            bubbles: true,
+            cancelable: true,
+            composed: true
+        };
+        let event;
+        if (eventName === 'paste') {
+            event = new ClipboardEvent('paste', { ...init, clipboardData: dataTransfer });
+            if (!event.clipboardData) {
+                Object.defineProperty(event, 'clipboardData', { value: dataTransfer });
+            }
+        } else {
+            event = new DragEvent(eventName, { ...init, dataTransfer });
+            if (!event.dataTransfer) {
+                Object.defineProperty(event, 'dataTransfer', { value: dataTransfer });
+            }
+        }
+        return target.dispatchEvent(event);
+    }
+
+    function visibleFileInputs() {
+        return Array.from(document.querySelectorAll('input[type="file"]')).map((input) => {
+            const accept = input.getAttribute ? input.getAttribute('accept') : '';
+            return {
+                element: input,
+                accept: accept || '',
+                multiple: !!input.multiple,
+                disabled: isDisabled(input),
+                visible: isVisible(input),
+                path: domPath(input)
+            };
+        });
+    }
+
+    function tryAssignFilesToInput(files) {
+        const inputs = visibleFileInputs()
+            .filter((item) => !item.disabled)
+            .sort((a, b) => {
+                const aImage = a.accept.toLowerCase().includes('image') ? 1 : 0;
+                const bImage = b.accept.toLowerCase().includes('image') ? 1 : 0;
+                if (aImage !== bImage) {
+                    return bImage - aImage;
+                }
+                return Number(b.visible) - Number(a.visible);
+            });
+
+        for (const item of inputs) {
+            try {
+                const dt = buildFileDataTransfer(files);
+                Object.defineProperty(item.element, 'files', {
+                    value: dt.files,
+                    configurable: true
+                });
+                item.element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                item.element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                return { ok: true, input: { accept: item.accept, path: item.path, visible: item.visible } };
+            } catch (error) {
+                console.warn('[MAuto Bridge] file input assignment failed', error);
+            }
+        }
+        return { ok: false, input: null };
+    }
+
+    function composerAttachmentSummary() {
+        const root = closestComposerRoot() || document;
+        const buttons = root && root.querySelectorAll
+            ? Array.from(root.querySelectorAll('button,[role="button"]'))
+            : [];
+        return buttons.map((button) => buttonMeta(button)).filter((meta) => {
+            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.toLowerCase();
+            return label.includes('open image')
+                || label.includes('remove file')
+                || label.includes('attached')
+                || label.includes('upload')
+                || label.includes('file');
+        });
+    }
+
+    function dismissUploadOverlays() {
+        const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || '').toLowerCase();
+        const matched = bodyText.includes("already uploaded this file")
+            || (bodyText.includes('add anything') && bodyText.includes('drop any file here'));
+        const clicked = [];
+        if (!matched) {
+            return { matched: false, clicked, escaped: false };
+        }
+
+        const candidates = Array.from(document.querySelectorAll('button,[role="button"]'));
+        for (const button of candidates) {
+            const meta = buttonMeta(button);
+            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.trim().toLowerCase();
+            if (!label) {
+                continue;
+            }
+            if (label === 'ok' || label.includes('close') || label.includes('dismiss') || label.includes('cancel')) {
+                try {
+                    button.click();
+                    clicked.push(meta);
+                    break;
+                } catch (error) {
+                    console.warn('[MAuto Bridge] overlay button click failed', error);
+                }
+            }
+        }
+
+        const eventInit = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true, composed: true };
+        for (const target of uniqueElements([document.activeElement, document.body, document])) {
+            try {
+                target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+                target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+            } catch (error) {
+                console.warn('[MAuto Bridge] overlay escape dispatch failed', error);
+            }
+        }
+        return { matched: true, clicked, escaped: true };
+    }
+    function uploadSucceeded(beforeAttachments, snapshot) {
+        const afterAttachments = snapshot.composer_attachments || [];
+        if (afterAttachments.length > beforeAttachments.length) {
+            return true;
+        }
+        return afterAttachments.some((meta) => {
+            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.toLowerCase();
+            return label.includes('remove file') || label.includes('open image');
+        });
+    }
+
     function buttonMeta(button) {
         return {
             label: textOf(button),
@@ -533,6 +704,14 @@
             composer_path: composer ? domPath(composer) : '',
             composer_root_path: composerRoot ? domPath(composerRoot) : '',
             composer_buttons: composerButtons,
+            composer_attachments: composerAttachmentSummary(),
+            file_inputs: visibleFileInputs().map((item) => ({
+                accept: item.accept,
+                multiple: item.multiple,
+                disabled: item.disabled,
+                visible: item.visible,
+                path: item.path
+            })),
             send_enabled: sendButton ? !sendButton.disabled : null,
             selected_button: sendButton ? buttonMeta(sendButton) : null,
             selection_strategy: sendButtonRef ? sendButtonRef.strategy : null,
@@ -608,6 +787,18 @@
 
     function request(method, url, body) {
         return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                fetch(url, {
+                    method,
+                    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+                    body: body ? JSON.stringify(body) : undefined,
+                    credentials: 'omit'
+                }).then(async (res) => {
+                    const text = await res.text();
+                    resolve(text ? JSON.parse(text) : null);
+                }).catch(reject);
+                return;
+            }
             GM_xmlhttpRequest({
                 method,
                 url,
@@ -778,6 +969,133 @@
             },
             dom_info: snapshotAfter
         });
+    }
+
+    async function handleUploadFiles(command) {
+        const payload = command.payload || {};
+        let files = [];
+        let preparedText = '';
+        let before = domSnapshot();
+        let after = before;
+        const tried = [];
+        let succeededMethod = '';
+        const waitMs = Math.max(0, Number(payload.upload_wait_ms || 15000));
+        const pollMs = Math.max(100, Number(payload.upload_poll_ms || 500));
+        const method = String(payload.method || 'auto');
+        const text = String(payload.text || '');
+        const textMethod = String(payload.text_method || 'auto');
+
+        try {
+            const overlay_before = dismissUploadOverlays();
+            if (overlay_before.matched) {
+                tried.push({ method: 'dismiss_overlay_before_upload', ok: true, overlay: overlay_before });
+                await sleep(800);
+            }
+            files = uploadPayloadFiles(payload);
+            const composer = composerElement();
+            if (!composer) {
+                throw new Error('composer_not_found');
+            }
+
+            await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
+            if (text) {
+                setComposerText(composer, text, textMethod);
+                preparedText = textOf(composer);
+            } else {
+                composer.focus();
+            }
+
+            before = domSnapshot();
+            const beforeAttachments = before.composer_attachments || [];
+            const methods = method === 'auto' ? ['paste', 'drop', 'input'] : [method];
+            const targets = uniqueElements([
+                composer,
+                closestComposerRoot(),
+                composer.closest ? composer.closest('form') : null,
+                document.activeElement,
+                document.body,
+                document
+            ]);
+
+            for (const currentMethod of methods) {
+                if (currentMethod === 'paste') {
+                    const dt = buildFileDataTransfer(files, text);
+                    for (const target of targets) {
+                        try {
+                            dispatchClipboardLikeEvent(target, 'paste', dt);
+                            tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: true });
+                        } catch (error) {
+                            tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
+                        }
+                    }
+                } else if (currentMethod === 'drop') {
+                    const dt = buildFileDataTransfer(files, text);
+                    for (const target of targets) {
+                        for (const eventName of ['dragenter', 'dragover', 'drop']) {
+                            try {
+                                dispatchClipboardLikeEvent(target, eventName, dt);
+                                tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: true });
+                            } catch (error) {
+                                tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
+                            }
+                        }
+                    }
+                } else if (currentMethod === 'input') {
+                    const assigned = tryAssignFilesToInput(files);
+                    tried.push({ method: currentMethod, ok: assigned.ok, input: assigned.input });
+                } else {
+                    tried.push({ method: currentMethod, ok: false, error: 'unsupported_upload_method' });
+                }
+
+                await sleep(pollMs);
+                after = domSnapshot();
+                if (uploadSucceeded(beforeAttachments, after)) {
+                    succeededMethod = currentMethod;
+                    break;
+                }
+            }
+
+            const deadline = Date.now() + waitMs;
+            while (!succeededMethod && Date.now() < deadline && !stopped) {
+                await sleep(pollMs);
+                after = domSnapshot();
+                if (uploadSucceeded(beforeAttachments, after)) {
+                    succeededMethod = 'async';
+                    break;
+                }
+            }
+
+            const ok = !!succeededMethod;
+            await report(ok ? 'UPLOAD_FILES_DONE' : 'UPLOAD_FILES_FAILED', command.command_id, {
+                text: after.composer_text,
+                result: {
+                    method,
+                    succeeded_method: succeededMethod,
+                    file_count: files.length,
+                    files: files.map((file) => ({ name: file.name, type: file.type, size: file.size })),
+                    text_len: preparedText.length,
+                    before_attachment_count: beforeAttachments.length,
+                    after_attachment_count: (after.composer_attachments || []).length,
+                    attachments: after.composer_attachments || [],
+                    file_inputs: after.file_inputs || [],
+                    overlay_after: dismissUploadOverlays(),
+                    tried
+                },
+                dom_info: after
+            });
+        } catch (error) {
+            after = domSnapshot();
+            await report('UPLOAD_FILES_FAILED', command.command_id, {
+                text: after.composer_text,
+                result: {
+                    reason: String(error && error.message || error),
+                    file_count: files.length,
+                    overlay_after: dismissUploadOverlays(),
+                    tried
+                },
+                dom_info: after
+            });
+        }
     }
 
     async function handleFindSend(command) {
@@ -1146,6 +1464,8 @@
             await handleWaitComposerStable(command);
         } else if (action === 'SET_PROMPT') {
             await handleSetPrompt(command);
+        } else if (action === 'UPLOAD_FILE' || action === 'UPLOAD_FILES' || action === 'PASTE_IMAGE' || action === 'PASTE_FILES') {
+            await handleUploadFiles(command);
         } else if (action === 'FIND_SEND') {
             await handleFindSend(command);
         } else if (action === 'CLICK_SEND') {

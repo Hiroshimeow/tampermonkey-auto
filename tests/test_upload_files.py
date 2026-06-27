@@ -126,3 +126,31 @@ def test_run_upload_sources_sends_unified_upload_command(monkeypatch, tmp_path):
     assert print_every == 0.2
     assert payload["text"] == "hello image"
     assert payload["files"][0]["source_kind"] == "local"
+
+def test_build_upload_files_payload_defaults_to_input_method(tmp_path):
+    local = tmp_path / "local.png"
+    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-input")
+
+    payload = agents.build_upload_files_payload(
+        [{"kind": "local", "path": local}],
+        text="default method",
+        uniquify=False,
+    )
+
+    assert payload["method"] == "input"
+
+
+def test_run_upload_files_defaults_to_input_method(monkeypatch, tmp_path):
+    local = tmp_path / "local.png"
+    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-input")
+    calls = []
+
+    def fake_run_command(role, action, payload=None, timeout=300, print_every=2.0):
+        calls.append((role, action, payload, timeout, print_every))
+        return {"state": "UPLOAD_FILES_DONE"}
+
+    monkeypatch.setattr(agents, "run_command", fake_run_command)
+
+    agents.run_upload_files("IMG", [local], text="hello", uniquify=False)
+
+    assert calls[0][2]["method"] == "input"

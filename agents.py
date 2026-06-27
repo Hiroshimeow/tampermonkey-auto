@@ -391,7 +391,7 @@ def upload_payload_from_source(source, *, uniquify=True) -> list[dict]:
     raise ValueError(f"unsupported upload source descriptor: {source!r}")
 
 
-def build_upload_files_payload(sources, *, text="", method="auto", upload_wait_ms=15000, uniquify=True) -> dict:
+def build_upload_files_payload(sources, *, text="", method="input", upload_wait_ms=15000, uniquify=True) -> dict:
     entries = []
     for source in sources:
         entries.extend(upload_payload_from_source(source, uniquify=uniquify))
@@ -405,7 +405,7 @@ def build_upload_files_payload(sources, *, text="", method="auto", upload_wait_m
     }
 
 
-def run_upload_sources(role, sources, *, text="", method="auto", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+def run_upload_sources(role, sources, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
     """Upload local/web/base64/clipboard sources through the browser bridge."""
     payload = build_upload_files_payload(
         sources,
@@ -417,7 +417,7 @@ def run_upload_sources(role, sources, *, text="", method="auto", timeout=180, pr
     return run_command(role, "UPLOAD_FILES", payload, timeout=timeout, print_every=print_every)
 
 
-def run_upload_files(role, files, *, text="", method="auto", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+def run_upload_files(role, files, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
     """Upload local files to the ChatGPT composer through the browser bridge."""
     return run_upload_sources(
         role,

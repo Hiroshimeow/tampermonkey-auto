@@ -481,8 +481,8 @@ class DiagnosticControllerTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["object"], "list")
         ids = {item["id"] for item in payload["data"]}
-        self.assertIn("chatgpt-browser", ids)
-        self.assertIn("chatgpt-browser-vision", ids)
+        self.assertIn("DEV", ids)
+        self.assertIn("IMG", ids)
 
     def test_v1_chat_completions_maps_messages(self):
         wait_results = [
@@ -519,6 +519,24 @@ class DiagnosticControllerTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["object"], "response")
         self.assertEqual(payload["output_text"], "response answer")
+
+    def test_v1_complete_uses_model_as_browser_role(self):
+        wait_results = [
+            {"state": "PASTE_CONFIRMED", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "model role answer"},
+        ]
+        with patch.dict(controller.os.environ, {}, clear=True):
+            with patch.object(controller.state, "create_command", wraps=controller.state.create_command) as create_mock:
+                with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
+                    response = self.client.post(
+                        "/v1/complete",
+                        json={"model": "DEV", "prompt": "hello"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(create_mock.call_args_list[0].args[0], "DEV")
+        self.assertEqual(response.json()["model"], "DEV")
 
 if __name__ == "__main__":
     unittest.main()

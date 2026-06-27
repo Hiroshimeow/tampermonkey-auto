@@ -460,8 +460,19 @@ def responses_response(model: str, text: str) -> Dict[str, Any]:
         "output_text": text or "",
     }
 
+def browser_role_from_model(model: str, fallback_role: str = "DEV") -> str:
+    model_id = (model or "").strip()
+    legacy_aliases = {
+        "": fallback_role or "DEV",
+        "chatgpt-browser": fallback_role or "DEV",
+        "chatgpt-browser-vision": fallback_role or "IMG",
+    }
+    if model_id in legacy_aliases:
+        return legacy_aliases[model_id]
+    return model_id
+
 def dispatch_complete(req: CompleteRequest) -> Dict[str, Any]:
-    role = (req.role or "DEV").strip() or "DEV"
+    role = browser_role_from_model(req.model, req.role)
     if req.stream:
         raise HTTPException(status_code=501, detail="streaming is not implemented for /v1/complete yet")
 
@@ -532,23 +543,24 @@ def api_v1_responses(req: ResponsesRequest, auth_header: Optional[str] = Header(
 
 def model_catalog() -> Dict[str, Any]:
     now = int(time.time())
+    known_roles = ["DEV", "IMG", "REVIEW", "SOLO"]
     return {
         "object": "list",
         "data": [
             {
-                "id": "chatgpt-browser",
+                "id": role,
                 "object": "model",
                 "created": now,
                 "owned_by": "mauto",
-                "capabilities": {"text": True, "image_input": False, "image_output": False, "streaming": False},
-            },
-            {
-                "id": "chatgpt-browser-vision",
-                "object": "model",
-                "created": now,
-                "owned_by": "mauto",
-                "capabilities": {"text": True, "image_input": True, "image_output": False, "streaming": False},
-            },
+                "capabilities": {
+                    "text": True,
+                    "image_input": role in {"IMG", "REVIEW", "SOLO"},
+                    "image_output": False,
+                    "streaming": False,
+                    "browser_role": role,
+                },
+            }
+            for role in known_roles
         ],
     }
 

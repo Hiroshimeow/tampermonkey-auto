@@ -289,7 +289,7 @@ Minimal request:
 
 ```json
 {
-  "model": "chatgpt-browser",
+  "model": "DEV",
   "prompt": "Say hello",
   "role": "DEV",
   "max_tokens": 1024,
@@ -304,7 +304,7 @@ Candidate response:
   "id": "cmpl_local_...",
   "object": "text_completion",
   "created": 0,
-  "model": "chatgpt-browser",
+  "model": "DEV",
   "choices": [
     {
       "index": 0,
@@ -386,18 +386,19 @@ The correct next design is `BrowserRoleProvider` plus OpenAI-compatible endpoint
 
 Current endpoint compatibility status:
 
-- `GET /v1/models` is implemented for model discovery.
+- `GET /v1/models` is implemented for model discovery; returned model ids are browser roles such as `DEV`, `IMG`, `REVIEW`, and `SOLO`.
 - `POST /v1/complete` is implemented for simple prompt completion.
 - `POST /v1/chat/completions` is implemented as a non-streaming compatibility adapter over browser roles.
 - `POST /v1/responses` is implemented as a non-streaming Responses-style adapter over browser roles.
 - `stream=true` is still intentionally unsupported until bridge-level incremental transcript diffing is stable.
 - Chat and Responses endpoints reuse the same Tampermonkey dispatch pipeline as `/v1/complete`.
+- OpenAI-standard clients should select the browser role through `model`; the separate `role` field is deprecated and kept only as a legacy fallback.
 
 Minimal chat-completions request:
 
 ```json
 {
-  "model": "chatgpt-browser",
+  "model": "DEV",
   "messages": [
     {"role": "user", "content": "Say hello"}
   ]
@@ -408,7 +409,22 @@ Minimal responses request:
 
 ```json
 {
-  "model": "chatgpt-browser",
+  "model": "DEV",
   "input": "Say hello"
 }
 ```
+
+Model-as-role usage
+
+OpenAI-compatible clients should not send a custom `role` field. Use the `model` field as the browser role name:
+
+```json
+{
+  "model": "DEV",
+  "messages": [
+    {"role": "user", "content": "Say hello"}
+  ]
+}
+```
+
+For image-capable workflows, use a role/model such as `IMG` and send normalized `files` payloads or use `upload_once.py` for local file paths. Legacy aliases `chatgpt-browser` and `chatgpt-browser-vision` remain accepted for older tests/scripts, but new clients should use role models directly.

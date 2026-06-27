@@ -89,6 +89,28 @@ class CompleteRequest(BaseModel):
     files: list[Dict[str, Any]] = Field(default_factory=list)
 
 
+class ChatCompletionRequest(BaseModel):
+    model: str = "chatgpt-browser"
+    messages: list[Dict[str, Any]] = Field(default_factory=list)
+    role: str = "DEV"
+    max_tokens: int = Field(default=1024, ge=1, le=200000)
+    stream: bool = False
+    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
+    method: str = "input"
+    files: list[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ResponsesRequest(BaseModel):
+    model: str = "chatgpt-browser"
+    input: Any = Field(default="")
+    role: str = "DEV"
+    max_output_tokens: int = Field(default=1024, ge=1, le=200000)
+    stream: bool = False
+    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
+    method: str = "input"
+    files: list[Dict[str, Any]] = Field(default_factory=list)
+
+
 class DiagnosticState:
     def __init__(self):
         self.lock = threading.RLock()
@@ -383,6 +405,61 @@ def completion_response(model: str, text: str, finish_reason: str = "stop") -> D
     }
 
 
+def content_part_to_text(part):
+    return part if isinstance(part, str) else str((part or {}).get("text") or "[non-text input]") if isinstance(part, dict) else ""
+
+
+def chat_messages_to_prompt(messages: list[Dict[str, Any]]) -> str:
+    lines = []
+    for message in messages or []:
+        role = str(message.get("role") or "user") if isinstance(message, dict) else "user"
+        content = message.get("content") if isinstance(message, dict) else message
+        if isinstance(content, list):
+            text = "\n".join(content_part_to_text(part) for part in content).strip()
+        else:
+            text = content_part_to_text(content).strip()
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n".join(lines).strip()
+
+def response_input_to_prompt(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, dict) and item.get("role"):
+                items.append(item)
+            elif isinstance(item, dict):
+                items.append({"role": "user", "content": [item]})
+            else:
+                items.append({"role": "user", "content": str(item)})
+        return chat_messages_to_prompt(items)
+    if isinstance(value, dict):
+        return chat_messages_to_prompt([value])
+    return str(value or "")
+
+def chat_completion_response(model: str, text: str) -> Dict[str, Any]:
+    now = int(time.time())
+    return {
+        "id": f"chatcmpl_local_{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text or ""}, "finish_reason": "stop"}],
+    }
+
+def responses_response(model: str, text: str) -> Dict[str, Any]:
+    return {
+        "id": f"resp_local_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text or ""}]}],
+        "output_text": text or "",
+    }
+
 def dispatch_complete(req: CompleteRequest) -> Dict[str, Any]:
     role = (req.role or "DEV").strip() or "DEV"
     if req.stream:
@@ -432,6 +509,26 @@ def api_v1_complete(req: CompleteRequest, auth_header: Optional[str] = Header(de
     require_api_auth(auth_header)
     return dispatch_complete(req)
 
+
+
+@app.post("/v1/chat/completions")
+def api_v1_chat_completions(req: ChatCompletionRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
+    require_api_auth(auth_header)
+    prompt = chat_messages_to_prompt(req.messages)
+    complete = CompleteRequest(model=req.model, prompt=prompt or " ", role=req.role, max_tokens=req.max_tokens, stream=req.stream, timeout_s=req.timeout_s, method=req.method, files=req.files)
+    result = dispatch_complete(complete)
+    text = result["choices"][0]["text"]
+    return chat_completion_response(req.model, text)
+
+
+@app.post("/v1/responses")
+def api_v1_responses(req: ResponsesRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
+    require_api_auth(auth_header)
+    prompt = response_input_to_prompt(req.input)
+    complete = CompleteRequest(model=req.model, prompt=prompt or " ", role=req.role, max_tokens=req.max_output_tokens, stream=req.stream, timeout_s=req.timeout_s, method=req.method, files=req.files)
+    result = dispatch_complete(complete)
+    text = result["choices"][0]["text"]
+    return responses_response(req.model, text)
 
 def model_catalog() -> Dict[str, Any]:
     now = int(time.time())
@@ -526,6 +623,8 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
         item("openai", "GET", "/v1/models", "List local OpenAI-compatible browser models."),
         item("openai", "POST", "/v1/complete", "OpenAI-like text completion endpoint backed by a browser role."),
+        item("openai", "POST", "/v1/chat/completions", "OpenAI-compatible chat completion endpoint backed by a browser role."),
+        item("openai", "POST", "/v1/responses", "OpenAI Responses-style endpoint backed by a browser role."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
@@ -653,3 +752,10 @@ def run_server():
 
 if __name__ == "__main__":
     run_server()
+
+
+
+
+
+
+

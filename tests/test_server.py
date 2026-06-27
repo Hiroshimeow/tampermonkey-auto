@@ -124,6 +124,8 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
         self.assertIn("/v1/models", samples)
+        self.assertIn("/v1/chat/completions", samples)
+        self.assertIn("/v1/responses", samples)
         self.assertEqual({"client", "admin", "openai"}, {route["group"] for route in routes})
 
     def test_startup_log_lists_backend_api_samples(self):
@@ -481,6 +483,42 @@ class DiagnosticControllerTests(unittest.TestCase):
         ids = {item["id"] for item in payload["data"]}
         self.assertIn("chatgpt-browser", ids)
         self.assertIn("chatgpt-browser-vision", ids)
+
+    def test_v1_chat_completions_maps_messages(self):
+        wait_results = [
+            {"state": "PASTE_CONFIRMED", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "chat answer"},
+        ]
+        with patch.dict(controller.os.environ, {}, clear=True):
+            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    json={"model": "chatgpt-browser", "messages": [{"role": "user", "content": "hello"}]},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "chat.completion")
+        self.assertEqual(payload["choices"][0]["message"]["content"], "chat answer")
+
+    def test_v1_responses_maps_input(self):
+        wait_results = [
+            {"state": "PASTE_CONFIRMED", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "response answer"},
+        ]
+        with patch.dict(controller.os.environ, {}, clear=True):
+            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
+                response = self.client.post(
+                    "/v1/responses",
+                    json={"model": "chatgpt-browser", "input": "hello"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "response")
+        self.assertEqual(payload["output_text"], "response answer")
 
 if __name__ == "__main__":
     unittest.main()

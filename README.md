@@ -383,3 +383,32 @@ What not to adopt:
 - No background account refresh/relogin machinery.
 
 The correct next design is `BrowserRoleProvider` plus OpenAI-compatible endpoint adapters, not a reverse-protocol provider pool.
+
+Current endpoint compatibility status:
+
+- `GET /v1/models` is implemented for model discovery.
+- `POST /v1/complete` is implemented for simple prompt completion.
+- `POST /v1/chat/completions` is implemented as a non-streaming compatibility adapter over browser roles.
+- `POST /v1/responses` is implemented as a non-streaming Responses-style adapter over browser roles.
+- `stream=true` is still intentionally unsupported until bridge-level incremental transcript diffing is stable.
+- Chat and Responses endpoints reuse the same Tampermonkey dispatch pipeline as `/v1/complete`.
+
+Minimal chat-completions request:
+
+```json
+{
+  "model": "chatgpt-browser",
+  "messages": [
+    {"role": "user", "content": "Say hello"}
+  ]
+}
+```
+
+Minimal responses request:
+
+```json
+{
+  "model": "chatgpt-browser",
+  "input": "Say hello"
+}
+```

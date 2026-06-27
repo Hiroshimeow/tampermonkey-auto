@@ -357,7 +357,7 @@ def configured_api_secret() -> str:
 def require_api_auth(auth_header: Optional[str]) -> None:
     expected = configured_api_secret()
     if not expected:
-        raise HTTPException(status_code=503, detail="MAUTO_API_TOKEN is not configured")
+        return
     prefix = "Bearer "
     if not auth_header or not auth_header.startswith(prefix):
         raise HTTPException(status_code=401, detail="missing bearer credential")
@@ -433,6 +433,35 @@ def api_v1_complete(req: CompleteRequest, auth_header: Optional[str] = Header(de
     return dispatch_complete(req)
 
 
+def model_catalog() -> Dict[str, Any]:
+    now = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "chatgpt-browser",
+                "object": "model",
+                "created": now,
+                "owned_by": "mauto",
+                "capabilities": {"text": True, "image_input": False, "image_output": False, "streaming": False},
+            },
+            {
+                "id": "chatgpt-browser-vision",
+                "object": "model",
+                "created": now,
+                "owned_by": "mauto",
+                "capabilities": {"text": True, "image_input": True, "image_output": False, "streaming": False},
+            },
+        ],
+    }
+
+
+@app.get("/v1/models")
+def api_v1_models():
+    return model_catalog()
+
+
+
 @app.post("/api/status")
 def api_status(req: StatusRequest):
     role = req.role
@@ -495,6 +524,7 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/status", "Browser role poll/status and command delivery."),
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
+        item("openai", "GET", "/v1/models", "List local OpenAI-compatible browser models."),
         item("openai", "POST", "/v1/complete", "OpenAI-like text completion endpoint backed by a browser role."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),

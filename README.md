@@ -336,11 +336,50 @@ Current `/v1/complete` implementation status on this branch:
 
 - Auth is enforced with `Authorization: Bearer <token>`.
 - Expected token is read only from `MAUTO_API_TOKEN`.
-- If `MAUTO_API_TOKEN` is unset, the endpoint returns `503`.
-- Wrong or missing bearer token returns `401`.
+- If `MAUTO_API_TOKEN` is unset, the endpoint runs in no-key local mode.
+- If `MAUTO_API_TOKEN` is set, wrong or missing bearer credential returns `401`.
 - Non-streaming text completion is implemented.
 - `stream=true` currently returns `501`.
 - Text-only requests dispatch `SET_PROMPT -> CLICK_SEND -> WAIT_ASSISTANT_DONE`.
 - Requests with normalized `files` dispatch `UPLOAD_FILES -> CLICK_SEND -> WAIT_ASSISTANT_DONE`.
 - Returned payload is OpenAI-like `text_completion` JSON with `choices[0].text`.
 - The endpoint intentionally does not read arbitrary local file paths. Convert local files to normalized upload payloads before calling the API.
+
+## Direction lock: Tampermonkey-first, no token scraping
+
+This project does not use browser DevTools/F12 token scraping, ChatGPT access-token harvesting, Codex OAuth cache reuse, or account-pool rotation. The backend is the Tampermonkey/browser bridge. OpenAI-compatible routes are only adapters over controlled browser roles.
+
+API auth policy:
+
+- Default local mode is no API key, so multiple local agents/tools can call the server without per-agent key wiring.
+- If `MAUTO_API_TOKEN` is set, `/v1/complete` enforces `Authorization: Bearer <value>`.
+- If `MAUTO_API_TOKEN` is unset, `/v1/complete` accepts local requests without API key.
+- `/v1/models` is intentionally no-key for client discovery.
+
+Endpoint compatibility focus:
+
+1. Keep `/v1/complete` stable for simple prompt-to-text clients.
+2. Add `/v1/models` for OpenAI-compatible client discovery.
+3. Add `/v1/chat/completions` next, because most clients target it first.
+4. Add `/v1/responses` after chat compatibility, because it is the modern OpenAI shape for text/image/file inputs.
+5. Add SSE streaming from bridge progress events later; do not fake streaming before transcript diffing is stable.
+
+Image workflow lessons to adopt from image-focused gateways such as chatgpt2api:
+
+- Keep image workflow API-compatible: `/v1/images/generations`, `/v1/images/edits`, `/v1/chat/completions`, and `/v1/responses` are the useful compatibility targets.
+- Support `n` as a request field, but cap it conservatively and serialize work unless browser concurrency is proven safe.
+- Support both multipart file uploads and JSON image URL references at API boundary.
+- Internally normalize every image to the existing upload payload shape before dispatching to Tampermonkey.
+- Keep per-image task state: request id, prompt, source image refs, browser role, status, result refs, error, created_at, updated_at.
+- Cache generated/downloaded images under an explicit artifact directory instead of embedding large blobs in logs.
+- Preserve prompt + input image provenance so image edit/debug sessions are replayable.
+
+What not to adopt:
+
+- No Codex-only image quota paths.
+- No OAuth account import.
+- No access-token pool.
+- No Cloudflare/clearance bypass stack.
+- No background account refresh/relogin machinery.
+
+The correct next design is `BrowserRoleProvider` plus OpenAI-compatible endpoint adapters, not a reverse-protocol provider pool.

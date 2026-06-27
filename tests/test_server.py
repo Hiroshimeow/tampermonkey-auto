@@ -123,6 +123,7 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
+        self.assertIn("/v1/models", samples)
         self.assertEqual({"client", "admin", "openai"}, {route["group"] for route in routes})
 
     def test_startup_log_lists_backend_api_samples(self):
@@ -386,14 +387,21 @@ class DiagnosticControllerTests(unittest.TestCase):
         os_kill.assert_not_called()
 
 
-    def test_v1_complete_requires_configured_token(self):
+    def test_v1_complete_allows_no_api_key_when_env_is_unset(self):
+        wait_results = [
+            {"state": "PASTE_CONFIRMED", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "no-key answer"},
+        ]
         with patch.dict(controller.os.environ, {}, clear=True):
-            response = self.client.post(
-                "/v1/complete",
-                json={"prompt": "hello", "role": "A"},
-            )
+            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
+                response = self.client.post(
+                    "/v1/complete",
+                    json={"prompt": "hello", "role": "A"},
+                )
 
-        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["text"], "no-key answer")
 
     def test_v1_complete_rejects_invalid_bearer_token(self):
         with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
@@ -464,5 +472,15 @@ class DiagnosticControllerTests(unittest.TestCase):
                 )
 
         self.assertEqual(response.status_code, 504)
+    def test_v1_models_lists_browser_models(self):
+        response = self.client.get("/v1/models")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "list")
+        ids = {item["id"] for item in payload["data"]}
+        self.assertIn("chatgpt-browser", ids)
+        self.assertIn("chatgpt-browser-vision", ids)
+
 if __name__ == "__main__":
     unittest.main()

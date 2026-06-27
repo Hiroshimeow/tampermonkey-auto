@@ -331,3 +331,16 @@ $env:MAUTO_API_TOKEN="<local-dev-token>"
 ```
 
 Do not place token values in README, code, tests, commits, logs, or issue text.
+
+Current `/v1/complete` implementation status on this branch:
+
+- Auth is enforced with `Authorization: Bearer <token>`.
+- Expected token is read only from `MAUTO_API_TOKEN`.
+- If `MAUTO_API_TOKEN` is unset, the endpoint returns `503`.
+- Wrong or missing bearer token returns `401`.
+- Non-streaming text completion is implemented.
+- `stream=true` currently returns `501`.
+- Text-only requests dispatch `SET_PROMPT -> CLICK_SEND -> WAIT_ASSISTANT_DONE`.
+- Requests with normalized `files` dispatch `UPLOAD_FILES -> CLICK_SEND -> WAIT_ASSISTANT_DONE`.
+- Returned payload is OpenAI-like `text_completion` JSON with `choices[0].text`.
+- The endpoint intentionally does not read arbitrary local file paths. Convert local files to normalized upload payloads before calling the API.

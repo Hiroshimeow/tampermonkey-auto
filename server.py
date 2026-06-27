@@ -1,5 +1,6 @@
 import os
 import signal
+import secrets
 import subprocess
 import threading
 import time
@@ -8,7 +9,7 @@ from collections import defaultdict, deque
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -75,6 +76,17 @@ class AdminCommandRequest(BaseModel):
 
 class AdminConfigRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CompleteRequest(BaseModel):
+    model: str = "chatgpt-browser"
+    prompt: str = Field(min_length=1)
+    role: str = "DEV"
+    max_tokens: int = Field(default=1024, ge=1, le=200000)
+    stream: bool = False
+    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
+    method: str = "input"
+    files: list[Dict[str, Any]] = Field(default_factory=list)
 
 
 class DiagnosticState:
@@ -204,6 +216,16 @@ class DiagnosticState:
             self.log(role, "COMMAND_CREATED", command_id=command_id, action=action, payload=payload or {})
         return cmd
 
+    def wait_for_command_result(self, command_id: str, timeout_s: float, poll_s: float = 0.2) -> Optional[Dict[str, Any]]:
+        deadline = time.time() + max(0.1, timeout_s)
+        while time.time() < deadline:
+            with self.lock:
+                result = self.command_results.get(command_id)
+                if result is not None:
+                    return dict(result)
+            time.sleep(max(0.05, poll_s))
+        return None
+
     def get_command_for_role(self, role: str):
         with self.lock:
             cmd = self.commands.get(role)
@@ -328,6 +350,89 @@ app.add_middleware(
 )
 
 
+def configured_api_secret() -> str:
+    return (os.environ.get("MAUTO_API_TOKEN") or "").strip()
+
+
+def require_api_auth(auth_header: Optional[str]) -> None:
+    expected = configured_api_secret()
+    if not expected:
+        raise HTTPException(status_code=503, detail="MAUTO_API_TOKEN is not configured")
+    prefix = "Bearer "
+    if not auth_header or not auth_header.startswith(prefix):
+        raise HTTPException(status_code=401, detail="missing bearer credential")
+    provided = auth_header[len(prefix):].strip()
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid bearer credential")
+
+
+def completion_response(model: str, text: str, finish_reason: str = "stop") -> Dict[str, Any]:
+    now = int(time.time())
+    return {
+        "id": f"cmpl_local_{uuid.uuid4().hex}",
+        "object": "text_completion",
+        "created": now,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text or "",
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
+def dispatch_complete(req: CompleteRequest) -> Dict[str, Any]:
+    role = (req.role or "DEV").strip() or "DEV"
+    if req.stream:
+        raise HTTPException(status_code=501, detail="streaming is not implemented for /v1/complete yet")
+
+    if req.files:
+        upload_payload = {
+            "files": req.files,
+            "text": req.prompt,
+            "method": req.method or "input",
+            "upload_wait_ms": int(min(max(req.timeout_s, 1.0), 60.0) * 1000),
+        }
+        upload_cmd = state.create_command(role, "UPLOAD_FILES", upload_payload)
+        upload_result = state.wait_for_command_result(upload_cmd["command_id"], req.timeout_s)
+        if not upload_result:
+            raise HTTPException(status_code=504, detail="UPLOAD_FILES timed out")
+        if upload_result.get("state") != "UPLOAD_FILES_DONE":
+            raise HTTPException(status_code=502, detail={"stage": "UPLOAD_FILES", "result": upload_result})
+    else:
+        prompt_cmd = state.create_command(role, "SET_PROMPT", {"text": req.prompt, "method": "auto"})
+        prompt_result = state.wait_for_command_result(prompt_cmd["command_id"], req.timeout_s)
+        if not prompt_result:
+            raise HTTPException(status_code=504, detail="SET_PROMPT timed out")
+        if prompt_result.get("state") != "PASTE_CONFIRMED":
+            raise HTTPException(status_code=502, detail={"stage": "SET_PROMPT", "result": prompt_result})
+
+    send_cmd = state.create_command(role, "CLICK_SEND", {})
+    send_result = state.wait_for_command_result(send_cmd["command_id"], req.timeout_s)
+    if not send_result:
+        raise HTTPException(status_code=504, detail="CLICK_SEND timed out")
+    if send_result.get("state") != "SEND_ACCEPTED":
+        raise HTTPException(status_code=502, detail={"stage": "CLICK_SEND", "result": send_result})
+
+    wait_cmd = state.create_command(role, "WAIT_ASSISTANT_DONE", {})
+    final_result = state.wait_for_command_result(wait_cmd["command_id"], req.timeout_s)
+    if not final_result:
+        raise HTTPException(status_code=504, detail="WAIT_ASSISTANT_DONE timed out")
+    if final_result.get("state") != "ASSISTANT_DONE":
+        raise HTTPException(status_code=502, detail={"stage": "WAIT_ASSISTANT_DONE", "result": final_result})
+
+    text = final_result.get("text") or state.last_response.get(role, "")
+    return completion_response(req.model, text, "stop")
+
+
+@app.post("/v1/complete")
+def api_v1_complete(req: CompleteRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
+    require_api_auth(auth_header)
+    return dispatch_complete(req)
+
+
 @app.post("/api/status")
 def api_status(req: StatusRequest):
     role = req.role
@@ -390,6 +495,7 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/status", "Browser role poll/status and command delivery."),
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
+        item("openai", "POST", "/v1/complete", "OpenAI-like text completion endpoint backed by a browser role."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),

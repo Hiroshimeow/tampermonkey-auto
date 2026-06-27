@@ -123,7 +123,7 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
-        self.assertEqual({"client", "admin"}, {route["group"] for route in routes})
+        self.assertEqual({"client", "admin", "openai"}, {route["group"] for route in routes})
 
     def test_startup_log_lists_backend_api_samples(self):
         with patch("builtins.print") as print_mock:
@@ -386,5 +386,83 @@ class DiagnosticControllerTests(unittest.TestCase):
         os_kill.assert_not_called()
 
 
+    def test_v1_complete_requires_configured_token(self):
+        with patch.dict(controller.os.environ, {}, clear=True):
+            response = self.client.post(
+                "/v1/complete",
+                json={"prompt": "hello", "role": "A"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_v1_complete_rejects_invalid_bearer_token(self):
+        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
+            response = self.client.post(
+                "/v1/complete",
+                headers={"Authorization": "Bearer wrong-token"},
+                json={"prompt": "hello", "role": "A"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_v1_complete_dispatches_prompt_and_maps_response(self):
+        wait_results = [
+            {"state": "PASTE_CONFIRMED", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "browser answer"},
+        ]
+        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
+            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results) as wait_mock:
+                response = self.client.post(
+                    "/v1/complete",
+                    headers={"Authorization": "Bearer expected-token"},
+                    json={"prompt": "hello", "role": "A", "model": "chatgpt-browser"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["object"], "text_completion")
+        self.assertEqual(payload["model"], "chatgpt-browser")
+        self.assertEqual(payload["choices"][0]["text"], "browser answer")
+        self.assertEqual(wait_mock.call_count, 3)
+
+    def test_v1_complete_dispatches_upload_when_files_are_supplied(self):
+        wait_results = [
+            {"state": "UPLOAD_FILES_DONE", "text": ""},
+            {"state": "SEND_ACCEPTED", "text": ""},
+            {"state": "ASSISTANT_DONE", "text": "image answer"},
+        ]
+        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
+            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
+                response = self.client.post(
+                    "/v1/complete",
+                    headers={"Authorization": "Bearer expected-token"},
+                    json={
+                        "prompt": "describe",
+                        "role": "IMG",
+                        "files": [
+                            {
+                                "filename": "image.png",
+                                "mime_type": "image/png",
+                                "data_b64": "ZmFrZQ==",
+                                "size": 4,
+                            }
+                        ],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["text"], "image answer")
+
+    def test_v1_complete_returns_gateway_timeout_when_browser_does_not_finish(self):
+        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
+            with patch.object(controller.state, "wait_for_command_result", return_value=None):
+                response = self.client.post(
+                    "/v1/complete",
+                    headers={"Authorization": "Bearer expected-token"},
+                    json={"prompt": "hello", "role": "A", "timeout_s": 0.1},
+                )
+
+        self.assertEqual(response.status_code, 504)
 if __name__ == "__main__":
     unittest.main()

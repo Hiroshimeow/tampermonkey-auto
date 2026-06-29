@@ -127,10 +127,7 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
-        self.assertIn("/v1/models", samples)
-        self.assertIn("/v1/chat/completions", samples)
-        self.assertIn("/v1/responses", samples)
-        self.assertEqual({"client", "admin", "openai"}, {route["group"] for route in routes})
+        self.assertEqual({"client", "admin"}, {route["group"] for route in routes})
 
     def test_startup_log_lists_backend_api_samples(self):
         with patch("builtins.print") as print_mock:
@@ -392,181 +389,18 @@ class DiagnosticControllerTests(unittest.TestCase):
         find_pid.assert_called_once_with("127.0.0.1", 8500)
         os_kill.assert_not_called()
 
+    def test_claim_role_assigns_queued_role_once(self):
+        controller.state.queue_auto_open_role("HERMES", "https://chatgpt.com/")
 
-    def test_v1_complete_allows_no_api_key_when_env_is_unset(self):
-        wait_results = [
-            {"state": "PASTE_CONFIRMED", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "no-key answer"},
-        ]
-        with patch.dict(controller.os.environ, {}, clear=True):
-            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
-                response = self.client.post(
-                    "/v1/complete",
-                    json={"model": "DEV", "prompt": "hello"},
-                )
+        first = self.client.post("/api/claim-role", json={"session_id": "/"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["role"], "HERMES")
+        self.assertGreater(controller.state.auto_open_roles["HERMES"]["claimed_at"], 0)
+        self.assertEqual(controller.state.auto_open_roles["HERMES"]["claimed_session_id"], "/")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["choices"][0]["text"], "no-key answer")
-
-    def test_v1_complete_rejects_invalid_bearer_token(self):
-        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
-            response = self.client.post(
-                "/v1/complete",
-                headers={"Authorization": "Bearer wrong-token"},
-                    json={"model": "DEV", "prompt": "hello"},
-            )
-
-        self.assertEqual(response.status_code, 401)
-
-    def test_v1_complete_dispatches_prompt_and_maps_response(self):
-        wait_results = [
-            {"state": "PASTE_CONFIRMED", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "browser answer"},
-        ]
-        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
-            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results) as wait_mock:
-                response = self.client.post(
-                    "/v1/complete",
-                    headers={"Authorization": "Bearer expected-token"},
-                    json={"prompt": "hello", "role": "DEV", "model": "chatgpt-browser"},
-                )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["object"], "text_completion")
-        self.assertEqual(payload["model"], "chatgpt-browser")
-        self.assertEqual(payload["choices"][0]["text"], "browser answer")
-        self.assertEqual(wait_mock.call_count, 3)
-
-    def test_v1_complete_dispatches_upload_when_files_are_supplied(self):
-        wait_results = [
-            {"state": "UPLOAD_FILES_DONE", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "image answer"},
-        ]
-        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
-            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
-                response = self.client.post(
-                    "/v1/complete",
-                    headers={"Authorization": "Bearer expected-token"},
-                    json={
-                        "prompt": "describe",
-                        "role": "IMG",
-                        "files": [
-                            {
-                                "filename": "image.png",
-                                "mime_type": "image/png",
-                                "data_b64": "ZmFrZQ==",
-                                "size": 4,
-                            }
-                        ],
-                    },
-                )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["choices"][0]["text"], "image answer")
-
-    def test_v1_complete_returns_gateway_timeout_when_browser_does_not_finish(self):
-        with patch.dict(controller.os.environ, {"MAUTO_API_TOKEN": "expected-token"}, clear=False):
-            with patch.object(controller.state, "wait_for_command_result", return_value=None):
-                response = self.client.post(
-                    "/v1/complete",
-                    headers={"Authorization": "Bearer expected-token"},
-                    json={"prompt": "hello", "role": "DEV", "timeout_s": 0.1},
-                )
-
-        self.assertEqual(response.status_code, 504)
-    def test_v1_models_lists_browser_models(self):
-        response = self.client.get("/v1/models")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["object"], "list")
-        ids = {item["id"] for item in payload["data"]}
-        self.assertIn("DEV", ids)
-        self.assertIn("IMG", ids)
-
-    def test_v1_chat_completions_maps_messages(self):
-        wait_results = [
-            {"state": "PASTE_CONFIRMED", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "chat answer"},
-        ]
-        with patch.dict(controller.os.environ, {}, clear=True):
-            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
-                response = self.client.post(
-                    "/v1/chat/completions",
-                    json={"model": "chatgpt-browser", "messages": [{"role": "user", "content": "hello"}]},
-                )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["object"], "chat.completion")
-        self.assertEqual(payload["choices"][0]["message"]["content"], "chat answer")
-
-    def test_v1_responses_maps_input(self):
-        wait_results = [
-            {"state": "PASTE_CONFIRMED", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "response answer"},
-        ]
-        with patch.dict(controller.os.environ, {}, clear=True):
-            with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
-                response = self.client.post(
-                    "/v1/responses",
-                    json={"model": "chatgpt-browser", "input": "hello"},
-                )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["object"], "response")
-        self.assertEqual(payload["output_text"], "response answer")
-
-    def test_v1_complete_uses_model_as_browser_role(self):
-        wait_results = [
-            {"state": "PASTE_CONFIRMED", "text": ""},
-            {"state": "SEND_ACCEPTED", "text": ""},
-            {"state": "ASSISTANT_DONE", "text": "model role answer"},
-        ]
-        with patch.dict(controller.os.environ, {}, clear=True):
-            with patch.object(controller.state, "create_command", wraps=controller.state.create_command) as create_mock:
-                with patch.object(controller.state, "wait_for_command_result", side_effect=wait_results):
-                    response = self.client.post(
-                        "/v1/complete",
-                        json={"model": "DEV", "prompt": "hello"},
-                    )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(create_mock.call_args_list[0].args[0], "DEV")
-        self.assertEqual(response.json()["model"], "DEV")
-
-    def test_auto_open_missing_model_launches_role_url(self):
-        controller.state = controller.DiagnosticState()
-        controller.state.config["auto_open_wait_s"] = 0.01
-        controller.state.config["auto_close_after_s"] = 600
-        with patch.object(controller.webbrowser, "open") as open_mock:
-            with patch.object(controller, "schedule_auto_close_role") as schedule_mock:
-                with patch.object(controller.time, "sleep", return_value=None):
-                    with self.assertRaises(controller.HTTPException) as ctx:
-                        controller.ensure_browser_role_available("HERMES", 0.01)
-
-        self.assertEqual(ctx.exception.status_code, 504)
-        opened_url = open_mock.call_args.args[0]
-        self.assertIn("https://chatgpt.com/", opened_url)
-        self.assertIn("mauto_role=HERMES", opened_url)
-        self.assertIn("mauto_auto_close_s=600", opened_url)
-        schedule_mock.assert_called_once_with("HERMES")
-
-
-    def test_auto_open_missing_model_can_be_disabled(self):
-        controller.state = controller.DiagnosticState()
-        controller.state.config["auto_open_missing_model"] = False
-        with self.assertRaises(controller.HTTPException) as ctx:
-            controller.ensure_browser_role_available("HERMES", 1)
-
-        self.assertEqual(ctx.exception.status_code, 404)
+        second = self.client.post("/api/claim-role", json={"session_id": "/c/next"})
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["role"], "")
 
 
 if __name__ == "__main__":

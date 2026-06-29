@@ -64,28 +64,79 @@
         return Math.floor(Math.random() * (normalizedMax - normalizedMin + 1)) + normalizedMin;
     }
 
-    function roleFromUrl() {
-        try {
-            const params = new URLSearchParams(window.location.search || '');
-            const value = (params.get('mauto_role') || '').trim().toUpperCase();
-            return value || '';
-        } catch (_) {
-            return '';
+    function nextRole() {
+        const sessionRole = (sessionStorage.getItem('chatgpt_agent_role') || '').trim().toUpperCase();
+        if (sessionRole) {
+            return sessionRole;
         }
+        return 'NONE';
     }
 
-    function nextRole() {
-        const urlRole = roleFromUrl();
-        if (urlRole) {
-            setRole(urlRole);
-            return urlRole;
-        }
-        return (sessionStorage.getItem('chatgpt_agent_role') || 'None').trim().toUpperCase() || 'None';
+    function clearRole() {
+        sessionStorage.removeItem('chatgpt_agent_role');
+        localStorage.removeItem('chatgpt_agent_role');
+        return '';
     }
 
     function setRole(role) {
-        sessionStorage.setItem('chatgpt_agent_role', role);
+        const normalized = String(role || '').trim().toUpperCase();
+        if (!normalized || normalized === 'NONE') {
+            return clearRole();
+        }
+        sessionStorage.setItem('chatgpt_agent_role', normalized);
+        localStorage.removeItem('chatgpt_agent_role');
+        return normalized;
     }
+
+    function cleanNavigationUrl(targetPath = '') {
+        try {
+            const base = targetPath
+                ? new URL(targetPath, window.location.origin)
+                : new URL(window.location.href);
+            base.searchParams.delete('mauto_role');
+            base.searchParams.delete('mauto_auto_close_s');
+            return base.toString();
+        } catch (_) {
+            return targetPath || '/';
+        }
+    }
+
+    function sendRoleToOpenedWindow(opened, role) {
+        if (!opened || typeof opened.postMessage !== 'function') {
+            return;
+        }
+        const normalized = String(role || '').trim().toUpperCase();
+        if (!normalized || normalized === 'NONE') {
+            return;
+        }
+        let attempts = 0;
+        const timer = setInterval(() => {
+            attempts += 1;
+            try {
+                opened.postMessage({ type: 'MAUTO_SET_ROLE', role: normalized }, window.location.origin);
+            } catch (_) {
+                // Best-effort only. Server-side claim-role handles auto-open tabs.
+            }
+            if (attempts >= 20) {
+                clearInterval(timer);
+            }
+        }, 500);
+    }
+
+    window.addEventListener('message', (event) => {
+        if (event.origin !== window.location.origin) {
+            return;
+        }
+        const data = event.data || {};
+        if (!data || data.type !== 'MAUTO_SET_ROLE') {
+            return;
+        }
+        const assignedRole = setRole(data.role);
+        if (assignedRole) {
+            updateUI();
+            schedulePoll();
+        }
+    });
 
     function isVisible(el) {
         if (!el) {
@@ -832,6 +883,15 @@
         });
     }
 
+    async function claimQueuedRole() {
+        const response = await request('POST', SERVER_URL + '/api/claim-role', {
+            session_id: window.location.pathname || ''
+        });
+        updateConfig(response);
+        const claimedRole = String((response && response.role) || '').trim().toUpperCase();
+        return claimedRole ? setRole(claimedRole) : 'NONE';
+    }
+
     async function report(state, commandId, extra = {}) {
         if (stopped) {
             return null;
@@ -1462,6 +1522,86 @@
         }, config.reload_after_timeout_ms);
     }
 
+    function roleFromPayload(payload) {
+        return String(payload.role || payload.target_role || payload.model || '').trim().toUpperCase();
+    }
+
+    async function handleSetOrTakeoverRole(command, shouldReload = false) {
+        const payload = command.payload || {};
+        const targetRole = roleFromPayload(payload);
+        const snapshot = domSnapshot();
+        if (!targetRole) {
+            await report('ROLE_TAKEOVER_FAILED', command.command_id, {
+                result: { reason: 'missing_target_role' },
+                dom_info: snapshot
+            });
+            return;
+        }
+
+        const previousRole = nextRole();
+        const assignedRole = setRole(targetRole);
+        const targetPath = payload.new_chat ? '/' : String(payload.path || window.location.href || '/');
+        const targetUrl = cleanNavigationUrl(targetPath);
+        const reload = shouldReload || payload.reload === true || payload.navigate === true || payload.new_chat === true;
+
+        await report(reload ? 'ROLE_TAKEOVER_RELOADING' : 'ROLE_SET', command.command_id, {
+            result: {
+                previous_role: previousRole,
+                role: assignedRole,
+                reload,
+                target_url: targetUrl,
+                new_chat: payload.new_chat === true
+            },
+            dom_info: snapshot
+        });
+
+        if (reload) {
+            setTimeout(() => {
+                window.location.assign(targetUrl);
+            }, config.reload_after_timeout_ms);
+        }
+    }
+
+    async function handleOpenRoleWindow(command) {
+        const payload = command.payload || {};
+        const targetRole = roleFromPayload(payload);
+        const snapshot = domSnapshot();
+        if (!targetRole) {
+            await report('ROLE_WINDOW_OPEN_FAILED', command.command_id, {
+                result: { reason: 'missing_target_role' },
+                dom_info: snapshot
+            });
+            return;
+        }
+
+        const targetPath = payload.new_chat === false ? String(payload.path || window.location.href || '/') : String(payload.path || '/');
+        const targetUrl = cleanNavigationUrl(targetPath);
+        let opened = null;
+        try {
+            opened = window.open(targetUrl, '_blank');
+            sendRoleToOpenedWindow(opened, targetRole);
+        } catch (error) {
+            await report('ROLE_WINDOW_OPEN_FAILED', command.command_id, {
+                result: {
+                    role: targetRole,
+                    target_url: targetUrl,
+                    reason: String(error && error.message || error)
+                },
+                dom_info: snapshot
+            });
+            return;
+        }
+
+        await report(opened ? 'ROLE_WINDOW_OPENED' : 'ROLE_WINDOW_OPEN_BLOCKED', command.command_id, {
+            result: {
+                role: targetRole,
+                target_url: targetUrl,
+                opened: !!opened,
+                new_chat: payload.new_chat !== false
+            },
+            dom_info: snapshot
+        });
+    }
     async function handleCloseWindow(command) {
         const snapshot = domSnapshot();
         await report('WINDOW_CLOSE_REQUESTED', command.command_id, {
@@ -1513,6 +1653,12 @@
             await handleWaitAssistantDone(command);
         } else if (action === 'SYNC_TRANSCRIPT') {
             await handleSyncTranscript(command);
+        } else if (action === 'SET_ROLE') {
+            await handleSetOrTakeoverRole(command, false);
+        } else if (action === 'TAKEOVER_ROLE' || action === 'PHYSICAL_TAKEOVER_ROLE') {
+            await handleSetOrTakeoverRole(command, true);
+        } else if (action === 'OPEN_ROLE_WINDOW' || action === 'WAKE_ROLE' || action === 'PHYSICAL_OPEN_ROLE') {
+            await handleOpenRoleWindow(command);
         } else if (action === 'NEW_CHAT' || action === 'NAVIGATE_NEW') {
             await handleNavigateNewChat(command);
         } else if (action === 'RESET_PAGE' || action === 'RELOAD_PAGE' || action === 'RELOAD') {
@@ -1535,8 +1681,16 @@
             return;
         }
         ensureUIAttached();
-        const role = nextRole();
+        let role = nextRole();
         updateUI();
+        if (role === 'NONE') {
+            try {
+                role = await claimQueuedRole();
+                updateUI();
+            } catch (error) {
+                console.warn('[MAuto Bridge] role claim failed', error);
+            }
+        }
         if (role === 'NONE') {
             schedulePoll();
             return;
@@ -1703,3 +1857,4 @@
     stop();
     start();
 })();
+

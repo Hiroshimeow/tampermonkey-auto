@@ -1,16 +1,16 @@
 import os
 import signal
-import secrets
+
 import subprocess
 import threading
 import time
 import uuid
-import webbrowser
+
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -79,37 +79,8 @@ class AdminConfigRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
 
-class CompleteRequest(BaseModel):
-    model: str = "chatgpt-browser"
-    prompt: str = Field(min_length=1)
-    role: str = "DEV"
-    max_tokens: int = Field(default=1024, ge=1, le=200000)
-    stream: bool = False
-    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
-    method: str = "input"
-    files: list[Dict[str, Any]] = Field(default_factory=list)
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = "chatgpt-browser"
-    messages: list[Dict[str, Any]] = Field(default_factory=list)
-    role: str = "DEV"
-    max_tokens: int = Field(default=1024, ge=1, le=200000)
-    stream: bool = False
-    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
-    method: str = "input"
-    files: list[Dict[str, Any]] = Field(default_factory=list)
-
-
-class ResponsesRequest(BaseModel):
-    model: str = "chatgpt-browser"
-    input: Any = Field(default="")
-    role: str = "DEV"
-    max_output_tokens: int = Field(default=1024, ge=1, le=200000)
-    stream: bool = False
-    timeout_s: float = Field(default=180.0, ge=0.1, le=600.0)
-    method: str = "input"
-    files: list[Dict[str, Any]] = Field(default_factory=list)
+class RoleClaimRequest(BaseModel):
+    session_id: str = ""
 
 
 class DiagnosticState:
@@ -159,6 +130,29 @@ class DiagnosticState:
         with self.lock:
             self.config.update(updates)
             return dict(self.config)
+
+    def queue_auto_open_role(self, role: str, url: str = "") -> None:
+        normalized = str(role or "").strip().upper()
+        if not normalized:
+            return
+        with self.lock:
+            self.auto_open_roles[normalized] = {
+                "opened_at": time.time(),
+                "url": url or str(self.config.get("auto_open_url") or "https://chatgpt.com/"),
+                "claimed_at": 0.0,
+                "claimed_session_id": "",
+            }
+
+    def claim_auto_open_role(self, session_id: str = "") -> str:
+        with self.lock:
+            for role, info in list(self.auto_open_roles.items()):
+                if info.get("claimed_at"):
+                    continue
+                info["claimed_at"] = time.time()
+                info["claimed_session_id"] = session_id or ""
+                self.log(role, "ROLE_CLAIMED", session_id=session_id or "")
+                return role
+        return ""
 
     @staticmethod
     def is_ignored_session(session_id: str) -> bool:
@@ -380,281 +374,6 @@ app.add_middleware(
 )
 
 
-def configured_api_secret() -> str:
-    return (os.environ.get("MAUTO_API_TOKEN") or "").strip()
-
-
-def require_api_auth(auth_header: Optional[str]) -> None:
-    expected = configured_api_secret()
-    if not expected:
-        return
-    prefix = "Bearer "
-    if not auth_header or not auth_header.startswith(prefix):
-        raise HTTPException(status_code=401, detail="missing bearer credential")
-    provided = auth_header[len(prefix):].strip()
-    if not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="invalid bearer credential")
-
-
-def completion_response(model: str, text: str, finish_reason: str = "stop") -> Dict[str, Any]:
-    now = int(time.time())
-    return {
-        "id": f"cmpl_local_{uuid.uuid4().hex}",
-        "object": "text_completion",
-        "created": now,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "text": text or "",
-                "finish_reason": finish_reason,
-            }
-        ],
-    }
-
-
-def content_part_to_text(part):
-    return part if isinstance(part, str) else str((part or {}).get("text") or "[non-text input]") if isinstance(part, dict) else ""
-
-
-def chat_messages_to_prompt(messages: list[Dict[str, Any]]) -> str:
-    lines = []
-    for message in messages or []:
-        role = str(message.get("role") or "user") if isinstance(message, dict) else "user"
-        content = message.get("content") if isinstance(message, dict) else message
-        if isinstance(content, list):
-            text = "\n".join(content_part_to_text(part) for part in content).strip()
-        else:
-            text = content_part_to_text(content).strip()
-        if text:
-            lines.append(f"{role}: {text}")
-    return "\n".join(lines).strip()
-
-def response_input_to_prompt(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            if isinstance(item, dict) and item.get("role"):
-                items.append(item)
-            elif isinstance(item, dict):
-                items.append({"role": "user", "content": [item]})
-            else:
-                items.append({"role": "user", "content": str(item)})
-        return chat_messages_to_prompt(items)
-    if isinstance(value, dict):
-        return chat_messages_to_prompt([value])
-    return str(value or "")
-
-def chat_completion_response(model: str, text: str) -> Dict[str, Any]:
-    now = int(time.time())
-    return {
-        "id": f"chatcmpl_local_{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": now,
-        "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text or ""}, "finish_reason": "stop"}],
-    }
-
-def responses_response(model: str, text: str) -> Dict[str, Any]:
-    return {
-        "id": f"resp_local_{uuid.uuid4().hex}",
-        "object": "response",
-        "created_at": int(time.time()),
-        "model": model,
-        "status": "completed",
-        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text or ""}]}],
-        "output_text": text or "",
-    }
-
-
-def role_is_online(role: str, max_age_s: float = 10.0) -> bool:
-    now = time.time()
-    with state.lock:
-        return state.status.get(role) == "ONLINE" and now - state.role_seen_at.get(role, 0.0) <= max_age_s
-
-
-def open_browser_role(role: str) -> str:
-    base_url = str(state.config.get("auto_open_url") or "https://chatgpt.com/")
-    separator = "&" if "?" in base_url else "?"
-    url = f"{base_url}{separator}mauto_role={role}&mauto_auto_close_s={int(state.config.get('auto_close_after_s', 600))}"
-    webbrowser.open(url, new=1, autoraise=True)
-    with state.lock:
-        state.auto_open_roles[role] = {"opened_at": time.time(), "close_at": time.time() + float(state.config.get("auto_close_after_s", 600)), "url": url}
-    return url
-
-
-def schedule_auto_close_role(role: str) -> None:
-    def close_if_due():
-        with state.lock:
-            info = state.auto_open_roles.get(role)
-            if not info:
-                return
-            close_at = float(info.get("close_at") or 0.0)
-            inflight = int(state.auto_role_inflight.get(role, 0))
-            remaining = close_at - time.time()
-        if remaining > 1:
-            timer = threading.Timer(min(remaining, 60.0), close_if_due)
-            timer.daemon = True
-            timer.start()
-            return
-        if inflight > 0:
-            with state.lock:
-                state.auto_open_roles[role]["close_at"] = time.time() + 30.0
-            timer = threading.Timer(30.0, close_if_due)
-            timer.daemon = True
-            timer.start()
-            return
-        state.create_command(role, "CLOSE_TAB", {"reason": "auto_open_ttl_expired", "role": role})
-        with state.lock:
-            state.auto_open_roles.pop(role, None)
-
-    delay = float(state.config.get("auto_close_after_s", 600))
-    timer = threading.Timer(delay, close_if_due)
-    timer.daemon = True
-    timer.start()
-
-
-def ensure_browser_role_available(role: str, timeout_s: float) -> None:
-    if role_is_online(role):
-        return
-    if not state.config.get("auto_open_missing_model", True):
-        raise HTTPException(status_code=404, detail=f"model role is not online: {role}")
-    url = open_browser_role(role)
-    schedule_auto_close_role(role)
-    deadline = time.time() + min(float(timeout_s), float(state.config.get("auto_open_wait_s", 45)))
-    while time.time() < deadline:
-        if role_is_online(role):
-            return
-        time.sleep(0.5)
-    raise HTTPException(status_code=504, detail={"stage": "AUTO_OPEN_ROLE", "role": role, "url": url, "message": "role did not become online before timeout"})
-
-
-def mark_role_request_start(role: str) -> None:
-    with state.lock:
-        state.auto_role_inflight[role] += 1
-
-
-def mark_role_request_done(role: str) -> None:
-    with state.lock:
-        state.auto_role_inflight[role] = max(0, int(state.auto_role_inflight.get(role, 0)) - 1)
-        if role in state.auto_open_roles:
-            state.auto_open_roles[role]["close_at"] = time.time() + float(state.config.get("auto_close_after_s", 600))
-def browser_role_from_model(model: str, fallback_role: str = "DEV") -> str:
-    model_id = (model or "").strip()
-    legacy_aliases = {
-        "": fallback_role or "DEV",
-        "chatgpt-browser": fallback_role or "DEV",
-        "chatgpt-browser-vision": fallback_role or "IMG",
-    }
-    if model_id in legacy_aliases:
-        return legacy_aliases[model_id]
-    return model_id
-
-def dispatch_complete(req: CompleteRequest) -> Dict[str, Any]:
-    role = browser_role_from_model(req.model, req.role)
-    if req.stream:
-        raise HTTPException(status_code=501, detail="streaming is not implemented for /v1/complete yet")
-
-    ensure_browser_role_available(role, req.timeout_s)
-    mark_role_request_start(role)
-    try:
-        if req.files:
-            upload_payload = {
-                "files": req.files,
-                "text": req.prompt,
-                "method": req.method or "input",
-                "upload_wait_ms": int(min(max(req.timeout_s, 1.0), 60.0) * 1000),
-            }
-            upload_cmd = state.create_command(role, "UPLOAD_FILES", upload_payload)
-            upload_result = state.wait_for_command_result(upload_cmd["command_id"], req.timeout_s)
-            if not upload_result:
-                raise HTTPException(status_code=504, detail="UPLOAD_FILES timed out")
-            if upload_result.get("state") != "UPLOAD_FILES_DONE":
-                raise HTTPException(status_code=502, detail={"stage": "UPLOAD_FILES", "result": upload_result})
-        else:
-            prompt_cmd = state.create_command(role, "SET_PROMPT", {"text": req.prompt, "method": "auto"})
-            prompt_result = state.wait_for_command_result(prompt_cmd["command_id"], req.timeout_s)
-            if not prompt_result:
-                raise HTTPException(status_code=504, detail="SET_PROMPT timed out")
-            if prompt_result.get("state") != "PASTE_CONFIRMED":
-                raise HTTPException(status_code=502, detail={"stage": "SET_PROMPT", "result": prompt_result})
-
-        send_cmd = state.create_command(role, "CLICK_SEND", {})
-        send_result = state.wait_for_command_result(send_cmd["command_id"], req.timeout_s)
-        if not send_result:
-            raise HTTPException(status_code=504, detail="CLICK_SEND timed out")
-        if send_result.get("state") != "SEND_ACCEPTED":
-            raise HTTPException(status_code=502, detail={"stage": "CLICK_SEND", "result": send_result})
-
-        wait_cmd = state.create_command(role, "WAIT_ASSISTANT_DONE", {})
-        final_result = state.wait_for_command_result(wait_cmd["command_id"], req.timeout_s)
-        if not final_result:
-            raise HTTPException(status_code=504, detail="WAIT_ASSISTANT_DONE timed out")
-        if final_result.get("state") != "ASSISTANT_DONE":
-            raise HTTPException(status_code=502, detail={"stage": "WAIT_ASSISTANT_DONE", "result": final_result})
-
-        text = final_result.get("text") or state.last_response.get(role, "")
-        return completion_response(req.model, text, "stop")
-    finally:
-        mark_role_request_done(role)
-
-
-@app.post("/v1/complete")
-def api_v1_complete(req: CompleteRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
-    require_api_auth(auth_header)
-    return dispatch_complete(req)
-
-
-
-@app.post("/v1/chat/completions")
-def api_v1_chat_completions(req: ChatCompletionRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
-    require_api_auth(auth_header)
-    prompt = chat_messages_to_prompt(req.messages)
-    complete = CompleteRequest(model=req.model, prompt=prompt or " ", role=req.role, max_tokens=req.max_tokens, stream=req.stream, timeout_s=req.timeout_s, method=req.method, files=req.files)
-    result = dispatch_complete(complete)
-    text = result["choices"][0]["text"]
-    return chat_completion_response(req.model, text)
-
-
-@app.post("/v1/responses")
-def api_v1_responses(req: ResponsesRequest, auth_header: Optional[str] = Header(default=None, alias="Authorization")):
-    require_api_auth(auth_header)
-    prompt = response_input_to_prompt(req.input)
-    complete = CompleteRequest(model=req.model, prompt=prompt or " ", role=req.role, max_tokens=req.max_output_tokens, stream=req.stream, timeout_s=req.timeout_s, method=req.method, files=req.files)
-    result = dispatch_complete(complete)
-    text = result["choices"][0]["text"]
-    return responses_response(req.model, text)
-
-def model_catalog() -> Dict[str, Any]:
-    now = int(time.time())
-    known_roles = ["DEV", "IMG", "REVIEW", "SOLO"]
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": role,
-                "object": "model",
-                "created": now,
-                "owned_by": "mauto",
-                "capabilities": {
-                    "text": True,
-                    "image_input": role in {"IMG", "REVIEW", "SOLO"},
-                    "image_output": False,
-                    "streaming": False,
-                    "browser_role": role,
-                },
-            }
-            for role in known_roles
-        ],
-    }
-
-
-@app.get("/v1/models")
-def api_v1_models():
-    return model_catalog()
-
 
 
 @app.post("/api/status")
@@ -675,6 +394,12 @@ def api_status(req: StatusRequest):
 
     cmd = state.get_command_for_role(role)
     return {"command": cmd, "config": state.config}
+
+
+@app.post("/api/claim-role")
+def api_claim_role(req: RoleClaimRequest):
+    role = state.claim_auto_open_role(req.session_id)
+    return {"role": role, "config": state.config}
 
 
 @app.post("/api/report")
@@ -718,12 +443,9 @@ def api_route_catalog(base_url: str = ""):
 
     return [
         item("client", "POST", "/api/status", "Browser role poll/status and command delivery."),
+        item("client", "POST", "/api/claim-role", "Claim a queued browser role without URL role params."),
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
-        item("openai", "GET", "/v1/models", "List local OpenAI-compatible browser models."),
-        item("openai", "POST", "/v1/complete", "OpenAI-like text completion endpoint backed by a browser role."),
-        item("openai", "POST", "/v1/chat/completions", "OpenAI-compatible chat completion endpoint backed by a browser role."),
-        item("openai", "POST", "/v1/responses", "OpenAI Responses-style endpoint backed by a browser role."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),

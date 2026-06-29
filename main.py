@@ -32,6 +32,9 @@ DEFAULT_FINISH_ROLES = "MANAGER"
 DEFAULT_MAX_STATE_CHARS = 30000
 DEFAULT_HANDOFF_STATE_CHARS = 24000
 DEFAULT_HANDOFF_RESPONSE_CHARS = 12000
+DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S = 5.0
+DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S = 10.0
+DEFAULT_RESPONSE_RECOVERY_POLL_S = 2.0
 ROUTE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_-]*$")
 ALLOWED_COMMANDS = {"", "none", "handoff"}
 
@@ -124,19 +127,27 @@ class BridgeClient:
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
         self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
         self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
-        final = self._run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s, "ASSISTANT_DONE")
+        final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
+        status = str(final.get("status") or "")
+        if status != "ASSISTANT_DONE":
+            if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
+                return self.recover_response_after_reload(browser_role, timeout_s)
+            raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
         result = final.get("result") or {}
         return str(result.get("text") or "").strip()
 
     def _run_command(self, role: str, action: str, payload: dict[str, Any], timeout_s: float, expected_status: str) -> dict[str, Any]:
-        command_id = self.create_command(role, action, payload)
-        if not command_id:
-            raise RuntimeError(f"{role} {action} returned no command id")
-        result = self.wait_command(command_id, timeout_s)
+        result = self.run_command(role, action, payload, timeout_s)
         status = str(result.get("status") or "")
         if status != expected_status:
             raise RuntimeError(f"{role} {action} failed: expected {expected_status}, got {status or 'timeout'}")
         return result
+
+    def run_command(self, role: str, action: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        command_id = self.create_command(role, action, payload)
+        if not command_id:
+            raise RuntimeError(f"{role} {action} returned no command id")
+        return self.wait_command(command_id, timeout_s)
 
     def create_command(self, role: str, action: str, payload: dict[str, Any] | None = None) -> str:
         data = self.json_request("POST", "/api/admin/command", {"role": role, "action": action, "payload": payload or {}})
@@ -159,6 +170,40 @@ class BridgeClient:
             return {"ok": False, "status": "NO_COMMAND_ID", "done": False}
         result = self.wait_command(command_id, timeout_s)
         return {"ok": bool(result.get("done")), "command_id": command_id, **result}
+
+    def role_snapshot(self, role: str) -> dict[str, Any]:
+        return self.json_request("GET", f"/api/admin/role/{urllib.parse.quote(role)}")
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def recover_response_after_reload(
+        self,
+        role: str,
+        timeout_s: float,
+        reload_delay_s: float = DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
+        page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
+        poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+    ) -> str:
+        print(f"[response-recovery] role={role} wait={reload_delay_s:.1f}s then reload", flush=True)
+        self.sleep(max(0.0, reload_delay_s))
+        self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
+        self.sleep(max(0.0, page_wait_s))
+
+        deadline = time.time() + max(1.0, timeout_s)
+        last_response = ""
+        while time.time() < deadline:
+            self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+            snapshot = self.role_snapshot(role)
+            dom_info = snapshot.get("dom_info") or {}
+            last_response = str(snapshot.get("last_response") or "").strip()
+            if not dom_info.get("stop_visible") and last_response:
+                return last_response
+            if dom_info.get("stop_visible"):
+                print(f"[response-recovery] role={role} still responding; waiting", flush=True)
+            self.sleep(max(0.1, poll_s))
+
+        raise RuntimeError(f"{role} response recovery timed out; last_response_len={len(last_response)}")
 
     def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
         return self.command_roundtrip(role, "NEW_CHAT", timeout_s)
@@ -183,6 +228,7 @@ class Coordinator:
         self.finished: dict[str, Any] | None = None
         self.dry_run = bool(args.dry_run)
         self.lock = threading.Lock()
+        self.background_tasks: list[threading.Thread] = []
 
     def run(self, goal: str) -> dict[str, Any]:
         state = FlowState(goal=goal)
@@ -190,6 +236,7 @@ class Coordinator:
             self.preflight()
         first_instruction = "Start from the user goal. Decide the first phase and route work to the right role(s)."
         self.dispatch_role(self.start_role, first_instruction, state, caller_role="USER", depth=0)
+        self.wait_background_tasks()
         if self.finished:
             return self.finished
         return {
@@ -216,7 +263,7 @@ class Coordinator:
         prompt = self.build_prompt(prompt_role, instruction, state, caller_role, include_system)
         print(f"\n=== TURN {turn} prompt_role={prompt_role} browser_role={browser_role} caller={caller_role} ===", flush=True)
         started = time.time()
-        response = self.call_or_synthetic(prompt_role, browser_role, prompt, instruction)
+        response = self.resume_existing_response(prompt_role, browser_role, turn) or self.call_or_synthetic(prompt_role, browser_role, prompt, instruction)
         elapsed = time.time() - started
         route = self.validate_route(prompt_role, parse_route(response))
         repaired = False
@@ -275,6 +322,7 @@ class Coordinator:
         if not targets:
             return result
 
+        self.schedule_previous_role_reload_after_route(result, targets)
         execute_handoff = self.should_execute_handoff_command(route, result, state, targets)
         execute_handoff = execute_handoff or self.should_force_plan_dev_handoff(prompt_role, state, targets)
         if len(targets) > 1:
@@ -348,6 +396,40 @@ class Coordinator:
             return True
         return False
 
+    def should_reload_previous_role_after_route(self, result: TurnResult, targets: dict[str, str]) -> bool:
+        if self.args.reload_after <= 0:
+            return False
+        current_role = normalize_role(result.prompt_role)
+        return any(normalize_role(role) != current_role for role in targets)
+
+    def schedule_previous_role_reload_after_route(self, result: TurnResult, targets: dict[str, str]) -> None:
+        if not self.should_reload_previous_role_after_route(result, targets):
+            return
+        browser_role = result.browser_role
+        delay_s = max(0.0, float(self.args.reload_after))
+        if self.dry_run:
+            print(f"[route-reload] dry-run browser_role={browser_role} delay={delay_s:.1f}s", flush=True)
+            return
+        thread = threading.Thread(
+            target=self.reload_browser_after_delay,
+            args=(browser_role, delay_s),
+            name=f"reload-after-route-{browser_role}",
+        )
+        thread.start()
+        self.background_tasks.append(thread)
+
+    def reload_browser_after_delay(self, browser_role: str, delay_s: float) -> None:
+        time.sleep(delay_s)
+        try:
+            result = self.client.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=self.args.preflight_timeout)
+            print(f"[route-reload] browser_role={browser_role} status={result.get('status')} done={result.get('done')}", flush=True)
+        except Exception as exc:
+            print(f"[route-reload] failed browser_role={browser_role}: {exc}", flush=True)
+
+    def wait_background_tasks(self) -> None:
+        for thread in self.background_tasks:
+            thread.join()
+
     def reset_roles_for_handoff(self, roles: Iterable[str], state: FlowState) -> None:
         did_reset = False
         for role in roles:
@@ -405,6 +487,24 @@ class Coordinator:
         if self.dry_run:
             return synthetic_response(prompt_role, instruction, repair)
         return self.client.call_browser_role(browser_role, prompt, timeout_s=self.args.timeout)
+
+    def resume_existing_response(self, prompt_role: str, browser_role: str, turn: int) -> str:
+        if not self.args.resume or self.dry_run or turn != 1:
+            return ""
+        try:
+            snapshot = self.client.role_snapshot(browser_role)
+        except Exception as exc:
+            print(f"[resume] could not read current response for {prompt_role}/{browser_role}: {exc}", flush=True)
+            return ""
+        response = str(snapshot.get("last_response") or "").strip()
+        if not response:
+            return ""
+        route = self.validate_route(prompt_role, parse_route(response))
+        if not route.ok:
+            print(f"[resume] existing response ignored: {route.error or 'missing route'}", flush=True)
+            return ""
+        print(f"[resume] using existing response for prompt_role={prompt_role} browser_role={browser_role}", flush=True)
+        return response
 
     def build_prompt(self, prompt_role: str, instruction: str, state: FlowState, caller_role: str, include_system: bool) -> str:
         parts = []
@@ -720,6 +820,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--handoff-response-chars", type=int, default=DEFAULT_HANDOFF_RESPONSE_CHARS)
     parser.add_argument("--handoff-every-turns", type=int, default=0)
     parser.add_argument("--plan-dev-handoff-every", type=int, default=0, help="Reset DEV before routing from PLAN to DEV every N PLAN executions")
+    parser.add_argument("--reload-after", nargs="?", const=5.0, default=0.0, type=float, help="After routing to a different role, reload the previous role's browser tab after N seconds; defaults to 5 when enabled")
     parser.add_argument("--preflight", action="store_true", help="Test PROBE, RELOAD_PAGE, NEW_CHAT for physical browser roles before running")
     parser.add_argument("--preflight-timeout", type=float, default=20.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -765,6 +866,65 @@ def run_self_test() -> int:
     assert forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"DEV": "x"})
     assert not forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"REVIEW": "x"})
 
+    reload_off_args = parse_args(["--dry-run", "--goal", "reload off"])
+    reload_off_coord = Coordinator(reload_off_args)
+    reload_result = TurnResult(1, "PLAN", "PLAN", "USER", "i", "r", Route(targets={"DEV": "x"}), 0.0)
+    assert not reload_off_coord.should_reload_previous_role_after_route(reload_result, {"DEV": "x"})
+
+    reload_on_args = parse_args(["--dry-run", "--reload-after", "--goal", "reload on"])
+    reload_on_coord = Coordinator(reload_on_args)
+    assert reload_on_args.reload_after == 5.0
+    assert reload_on_coord.should_reload_previous_role_after_route(reload_result, {"DEV": "x"})
+    assert not reload_on_coord.should_reload_previous_role_after_route(reload_result, {"PLAN": "x"})
+    reload_after_2_args = parse_args(["--dry-run", "--reload-after", "2", "--goal", "reload after 2"])
+    assert reload_after_2_args.reload_after == 2.0
+
+    class RecoveryClient(BridgeClient):
+        def __init__(self):
+            self.actions = []
+            self.sleeps = []
+            self.snapshots = [
+                {"dom_info": {"stop_visible": True}, "last_response": ""},
+                {"dom_info": {"stop_visible": False}, "last_response": "final response"},
+            ]
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            self.actions.append((role, action, timeout_s))
+            return {"ok": True, "status": "TRANSCRIPT_SAVED" if action == "SYNC_TRANSCRIPT" else "PAGE_RELOADING", "done": True}
+
+        def role_snapshot(self, role: str) -> dict[str, Any]:
+            return self.snapshots.pop(0)
+
+    recovery_client = RecoveryClient()
+    recovered = recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
+    assert recovered == "final response"
+    assert recovery_client.sleeps[:2] == [5.0, 10.0]
+    assert recovery_client.actions[0][1] == "RELOAD_PAGE"
+    assert recovery_client.actions[1][1] == "SYNC_TRANSCRIPT"
+
+    class ResumeClient(BridgeClient):
+        def __init__(self):
+            self.called_browser = False
+
+        def role_snapshot(self, role: str) -> dict[str, Any]:
+            return {"last_response": '```json\n{"REVIEW":"review existing DEV output"}\n```'}
+
+        def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
+            self.called_browser = True
+            return '```json\n{"PLAN":"should not be used"}\n```'
+
+    resume_args = parse_args(["--resume", "--goal", "resume existing response"])
+    resume_coord = Coordinator(resume_args)
+    resume_client = ResumeClient()
+    resume_coord.client = resume_client
+    resume_state = FlowState("resume existing response")
+    resume_result = resume_coord.dispatch_role("DEV", "resume", resume_state, "USER", 0, follow_routes=False)
+    assert resume_result and resume_result.route.targets == {"REVIEW": "review existing DEV output"}
+    assert not resume_client.called_browser
+
     print("self-test ok")
     return 0
 
@@ -786,8 +946,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-

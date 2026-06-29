@@ -3,9 +3,56 @@
 Repo nay co 3 entrypoint chinh:
 
 - `server.py`: backend API cho Tampermonkey/browser bridge.
-- `agents.py`: runner chinh cho solo, multi-agent, va MANAGER-first team flow.
-- `solo.py`: wrapper gon cho single-agent loop.
+- `main.py`: runtime chinh hien tai cho workflow role-map JSON nhe.
+- `agents.py`: legacy runner cho solo, multi-agent, va MANAGER-first team flow.
+- `solo.py`: legacy wrapper gon cho single-agent loop.
 - `run.ipynb`: notebook chuan de chay va audit tung block.
+
+## MAIN 3-agent workflow
+
+Quy trinh mac dinh cho 3 logical agent:
+
+```text
+DEV -> REVIEW -> PLAN -> DEV
+```
+
+- `DEV`: implement va dua evidence.
+- `REVIEW`: review evidence; blocker thi tra DEV; pass nhung chua xong thi route PLAN; xong han thi FINISH.
+- `PLAN`: tao next step nho nhat cho DEV.
+- Cu moi 4 lan `PLAN` chay, runtime reset/new-chat cho `DEV` mot lan truoc khi giao viec tiep theo.
+
+Chay voi 3 browser role/tab `DEV`, `REVIEW`, `PLAN`:
+
+```powershell
+uv run python main.py --prompt-roles DEV,REVIEW,PLAN --browser-roles DEV,REVIEW,PLAN --start-role DEV --finish-roles REVIEW --plan-dev-handoff-every 4 --goal "noi dung task"
+```
+
+Neu chi mo 2 browser role/tab `DEV`, `REVIEW`, map logical `PLAN` len tab `REVIEW`:
+
+```powershell
+uv run python main.py --prompt-roles DEV,REVIEW,PLAN --browser-roles DEV,REVIEW --role-map PLAN=REVIEW DEV=DEV REVIEW=REVIEW --start-role DEV --finish-roles REVIEW --plan-dev-handoff-every 4 --goal "noi dung task"
+```
+
+Mot so flag hay dung:
+
+```powershell
+uv run python main.py --resume --goal "noi dung task"
+uv run python main.py --reload-after --goal "noi dung task"
+uv run python main.py --reload-after 2 --goal "noi dung task"
+```
+
+- `--resume`: doc `last_response` hien co cua role dang chay ngay turn dau neu response do co route JSON hop le, thay vi paste prompt moi.
+- `--reload-after`: sau khi route sang role khac, F5 browser role truoc do sau 5s.
+- `--reload-after N`: cung behavior tren, nhung doi `N` giay truoc khi reload.
+- `--plan-dev-handoff-every 4`: cu moi 4 lan `PLAN` route sang `DEV` thi reset/new-chat `DEV` mot lan.
+
+Route JSON dung format moi:
+
+```json
+{"REVIEW":"Review implementation and evidence."}
+```
+
+Khong dung format cu `target/reason/message`.
 
 ## SOLO
 
@@ -263,4 +310,3 @@ task
 ```
 
 Use one turn envelope for both text-only and image+text messages. Do not maintain separate text-flow and image-flow paths.
-

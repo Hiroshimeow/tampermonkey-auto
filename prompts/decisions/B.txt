@@ -1,0 +1,4 @@
+[DECISION: B]
+Use B when assumptions, options, risks, or tradeoffs need adversarial critique.
+Use B when A's framing should be challenged before PLAN.
+Do not route to B for implementation, code review, or final audit.

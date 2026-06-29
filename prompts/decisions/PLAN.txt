@@ -1,0 +1,4 @@
+[DECISION: PLAN]
+Use PLAN when the task is vague, broad, conflicting, multi-step, strategically unclear, or needs decomposition.
+Use PLAN when the workflow is looping or needs reframing before implementation.
+Do not route to PLAN for straightforward implementation fixes.

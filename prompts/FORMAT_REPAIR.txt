@@ -1,0 +1,13 @@
+# FORMAT REPAIR
+
+Your previous response did not end with a valid route-map JSON object.
+
+Return a short correction and end with exactly one fenced JSON object.
+
+Valid shape example:
+{"DEV":"message to DEV"}
+
+Optional handoff request:
+{"DEV":"message to DEV","command":"handoff"}
+
+Do not use target, reason, or message wrapper keys.

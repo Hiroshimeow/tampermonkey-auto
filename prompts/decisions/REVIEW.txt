@@ -1,0 +1,4 @@
+[DECISION: REVIEW]
+Use REVIEW when implementation is complete enough for engineering judgment.
+Use REVIEW for quality, architecture, maintainability, correctness, UX, security, edge cases, or product-fit assessment.
+Do not route to REVIEW when concrete implementation work is still missing.

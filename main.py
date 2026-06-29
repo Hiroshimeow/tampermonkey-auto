@@ -276,6 +276,7 @@ class Coordinator:
             return result
 
         execute_handoff = self.should_execute_handoff_command(route, result, state, targets)
+        execute_handoff = execute_handoff or self.should_force_plan_dev_handoff(prompt_role, state, targets)
         if len(targets) > 1:
             if execute_handoff:
                 self.reset_roles_for_handoff(targets, state)
@@ -331,6 +332,20 @@ class Coordinator:
             print(f"[handoff-command] accepted auto reasons={', '.join(reasons)} roles={', '.join(targets)}", flush=True)
             return True
         print("[handoff-command] deferred: below reset thresholds", flush=True)
+        return False
+
+    def should_force_plan_dev_handoff(self, prompt_role: str, state: FlowState, targets: dict[str, str]) -> bool:
+        every = int(getattr(self.args, "plan_dev_handoff_every", 0) or 0)
+        if every <= 0:
+            return False
+        if normalize_role(prompt_role) != "PLAN":
+            return False
+        if set(targets.keys()) != {"DEV"}:
+            return False
+        plan_count = sum(1 for item in state.results if normalize_role(item.prompt_role) == "PLAN")
+        if plan_count > 0 and plan_count % every == 0:
+            print(f"[plan-dev-handoff] accepted plan_count={plan_count} every={every} role=DEV", flush=True)
+            return True
         return False
 
     def reset_roles_for_handoff(self, roles: Iterable[str], state: FlowState) -> None:
@@ -704,6 +719,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--handoff-state-chars", type=int, default=DEFAULT_HANDOFF_STATE_CHARS)
     parser.add_argument("--handoff-response-chars", type=int, default=DEFAULT_HANDOFF_RESPONSE_CHARS)
     parser.add_argument("--handoff-every-turns", type=int, default=0)
+    parser.add_argument("--plan-dev-handoff-every", type=int, default=0, help="Reset DEV before routing from PLAN to DEV every N PLAN executions")
     parser.add_argument("--preflight", action="store_true", help="Test PROBE, RELOAD_PAGE, NEW_CHAT for physical browser roles before running")
     parser.add_argument("--preflight-timeout", type=float, default=20.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -737,6 +753,17 @@ def run_self_test() -> int:
     handoff_state = FlowState("handoff self test")
     handoff_coord.dispatch_role("MANAGER", "handoff dry run", handoff_state, "USER", 0)
     assert handoff_state.phase == 2, handoff_state.phase
+
+    forced_args = parse_args(["--dry-run", "--plan-dev-handoff-every", "2", "--goal", "forced plan handoff"])
+    forced_coord = Coordinator(forced_args)
+    forced_state = FlowState("forced plan handoff")
+    dummy_route = Route(targets={"DEV": "x"})
+    forced_state.results = [
+        TurnResult(1, "PLAN", "PLAN", "USER", "i", "r", dummy_route, 0.0),
+        TurnResult(2, "PLAN", "PLAN", "REVIEW", "i", "r", dummy_route, 0.0),
+    ]
+    assert forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"DEV": "x"})
+    assert not forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"REVIEW": "x"})
 
     print("self-test ok")
     return 0

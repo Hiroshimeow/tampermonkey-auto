@@ -9,9 +9,12 @@ other prompt roles.
 
 from dataclasses import dataclass, field
 import argparse
+import base64
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -21,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 import workflow_engine
 from workflow_engine import (
@@ -150,19 +154,27 @@ def send_command(role, action, payload=None):
     })["command"]
 
 
+CLIENT_TERMINAL_STATUSES = {
+    "UPLOAD_FILES_DONE",
+    "UPLOAD_FILES_FAILED",
+}
+
+
 def wait_command(command_id, timeout=300, print_every=2.0):
     started, last_print = time.time(), 0.0
     last_state = None
     while True:
         data = http_json("GET", f"/api/admin/command/{command_id}")
         now = time.time()
-        state = (data.get("status"), data.get("done"))
-        if (now - last_print >= print_every) and (state != last_state or data.get("done")):
-            print(f"[{time.strftime('%H:%M:%S')}] cmd={command_id[:8]} status={data['status']} done={data['done']}")
+        status = data.get("status")
+        done = bool(data.get("done")) or status in CLIENT_TERMINAL_STATUSES
+        state = (status, done)
+        if (now - last_print >= print_every) and (state != last_state or done):
+            print(f"[{time.strftime('%H:%M:%S')}] cmd={command_id[:8]} status={status} done={done}")
             last_print = now
             last_state = state
-        if data["done"]:
-            return data["result"]
+        if done:
+            return data.get("result") or {"state": status, "text": "", "result": {}, "dom_info": {}}
         if timeout and (now - started) > timeout:
             raise TimeoutError(f"Timeout waiting command_id={command_id}")
         time.sleep(1.0)
@@ -173,6 +185,250 @@ def run_command(role, action, payload=None, timeout=300, print_every=2.0):
     print(f"{action} -> role={role}, command_id={cmd['command_id']}")
     return wait_command(cmd["command_id"], timeout=timeout, print_every=print_every)
 
+
+UPLOAD_TEMP_DIR = Path("temps") / "upload_dedup"
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "big") + kind + payload + zlib.crc32(kind + payload).to_bytes(4, "big")
+
+
+def _dedupe_upload_bytes(data: bytes, token: str, suffix: str) -> bytes:
+    """Return visually equivalent bytes with a different file hash.
+
+    ChatGPT rejects repeated uploads of the same file in a conversation. For PNG
+    images, insert a harmless tEXt chunk before IEND. For other formats, append a
+    small trailing comment; common image decoders ignore trailing bytes.
+    """
+    marker = f"mauto-upload-id={token}".encode("utf-8")
+    if suffix.lower() == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        iend = data.rfind(b"\x00\x00\x00\x00IEND")
+        if iend > 0:
+            text_payload = b"mauto-upload-id\x00" + marker
+            return data[:iend] + _png_chunk(b"tEXt", text_payload) + data[iend:]
+    return data + b"\n" + marker + b"\n"
+
+
+def _guess_mime(filename: str = "", fallback: str = "application/octet-stream") -> str:
+    return mimetypes.guess_type(filename or "")[0] or fallback
+
+
+def _clean_b64(data_b64: str) -> str:
+    text = str(data_b64 or "").strip()
+    if text.lower().startswith("data:") and ";base64," in text:
+        text = text.split(",", 1)[1]
+    return re.sub(r"\s+", "", text)
+
+
+def _make_upload_payload_from_bytes(
+    data: bytes,
+    *,
+    filename: str,
+    mime_type: str | None = None,
+    source_kind: str = "bytes",
+    uniquify: bool = True,
+    meta: dict | None = None,
+) -> dict:
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("upload data must be bytes")
+    raw = bytes(data)
+    final_name = filename or "upload.bin"
+    final_mime = mime_type or _guess_mime(final_name)
+    if uniquify:
+        digest = hashlib.sha256(raw).hexdigest()[:8]
+        nonce = f"{time.time_ns()}-{os.getpid()}-{digest}"
+        suffix = Path(final_name).suffix
+        stem = Path(final_name).stem or "upload"
+        final_name = f"{stem}_{nonce}{suffix}"
+        raw = _dedupe_upload_bytes(raw, nonce, suffix)
+    return {
+        "filename": final_name,
+        "mime_type": final_mime,
+        "data_b64": base64.b64encode(raw).decode("ascii"),
+        "size": len(raw),
+        "source_kind": source_kind,
+        "meta": meta or {},
+    }
+
+
+def file_upload_payload(path, *, filename=None, mime_type=None, uniquify=True) -> dict:
+    """Build an UPLOAD_FILES payload entry from a local path."""
+    file_path = Path(path).expanduser().resolve()
+    data = file_path.read_bytes()
+    return _make_upload_payload_from_bytes(
+        data,
+        filename=filename or file_path.name,
+        mime_type=mime_type or _guess_mime(str(file_path)),
+        source_kind="local",
+        uniquify=uniquify,
+        meta={"path": str(file_path)},
+    )
+
+
+def base64_upload_payload(data_b64, *, filename="upload.png", mime_type=None, uniquify=True) -> dict:
+    """Build an UPLOAD_FILES payload entry from base64 or data URL text."""
+    clean = _clean_b64(data_b64)
+    data = base64.b64decode(clean, validate=True)
+    if mime_type is None and str(data_b64 or "").lower().startswith("data:"):
+        prefix = str(data_b64).split(",", 1)[0]
+        mime_type = prefix[5:].split(";", 1)[0] or None
+    return _make_upload_payload_from_bytes(
+        data,
+        filename=filename,
+        mime_type=mime_type or _guess_mime(filename),
+        source_kind="base64",
+        uniquify=uniquify,
+    )
+
+
+def web_upload_payload(url, *, filename=None, mime_type=None, timeout=30, uniquify=True) -> dict:
+    """Download an image URL in Python and normalize it for UPLOAD_FILES."""
+    request = urllib.request.Request(str(url), headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read()
+        headers = response.headers
+        content_type = headers.get_content_type() if headers else None
+        resolved_url = response.geturl()
+    parsed = urllib.parse.urlparse(resolved_url or str(url))
+    url_name = Path(urllib.parse.unquote(parsed.path or "")).name or "web_upload"
+    final_mime = mime_type or content_type or _guess_mime(url_name)
+    final_name = filename or url_name
+    if not Path(final_name).suffix:
+        ext = mimetypes.guess_extension(final_mime or "") or ".bin"
+        final_name = f"{final_name}{ext}"
+    return _make_upload_payload_from_bytes(
+        data,
+        filename=final_name,
+        mime_type=final_mime,
+        source_kind="web",
+        uniquify=uniquify,
+        meta={"url": str(url)},
+    )
+
+
+def clipboard_upload_payloads(*, filename="clipboard.png", mime_type="image/png", uniquify=True) -> list[dict]:
+    """Read Windows clipboard files or image via Pillow, then normalize.
+
+    If clipboard contains file paths, returns payloads for those files. If it
+    contains a bitmap image, saves it to PNG bytes. Raises a clear error when the
+    clipboard has no supported image/file content.
+    """
+    try:
+        from PIL import ImageGrab
+    except Exception as exc:
+        raise RuntimeError("clipboard upload requires Pillow/ImageGrab") from exc
+    data = ImageGrab.grabclipboard()
+    if data is None:
+        raise RuntimeError("clipboard does not contain an image or file list")
+    if isinstance(data, list):
+        return [file_upload_payload(item, uniquify=uniquify) for item in data]
+    if hasattr(data, "save"):
+        buffer = io.BytesIO()
+        data.save(buffer, format="PNG")
+        return [_make_upload_payload_from_bytes(
+            buffer.getvalue(),
+            filename=filename,
+            mime_type=mime_type,
+            source_kind="clipboard",
+            uniquify=uniquify,
+        )]
+    raise RuntimeError(f"unsupported clipboard payload: {type(data)!r}")
+
+
+def upload_payload_from_source(source, *, uniquify=True) -> list[dict]:
+    """Normalize one source descriptor into one or more UPLOAD_FILES entries.
+
+    Supported forms:
+    - string/path: local file path
+    - {"kind":"local", "path":"..."}
+    - {"kind":"web", "url":"https://..."}
+    - {"kind":"base64", "data_b64":"...", "filename":"x.png"}
+    - {"kind":"clipboard"}
+    - {"bytes": b"...", "filename":"x.png"}
+    """
+    if isinstance(source, (str, Path)):
+        return [file_upload_payload(source, uniquify=uniquify)]
+    if not isinstance(source, dict):
+        raise TypeError(f"unsupported upload source: {type(source)!r}")
+    kind = str(source.get("kind") or source.get("source_kind") or "").lower().strip()
+    if kind in {"", "local", "file", "path"} and source.get("path"):
+        return [file_upload_payload(
+            source["path"],
+            filename=source.get("filename"),
+            mime_type=source.get("mime_type") or source.get("mime"),
+            uniquify=source.get("uniquify", uniquify),
+        )]
+    if kind in {"web", "url", "http", "https"} or source.get("url"):
+        return [web_upload_payload(
+            source.get("url"),
+            filename=source.get("filename"),
+            mime_type=source.get("mime_type") or source.get("mime"),
+            timeout=int(source.get("timeout") or 30),
+            uniquify=source.get("uniquify", uniquify),
+        )]
+    if kind in {"base64", "b64", "data_url"} or source.get("data_b64"):
+        return [base64_upload_payload(
+            source.get("data_b64") or source.get("base64") or source.get("data"),
+            filename=source.get("filename") or "upload.png",
+            mime_type=source.get("mime_type") or source.get("mime"),
+            uniquify=source.get("uniquify", uniquify),
+        )]
+    if kind in {"clipboard", "clip"}:
+        return clipboard_upload_payloads(
+            filename=source.get("filename") or "clipboard.png",
+            mime_type=source.get("mime_type") or source.get("mime") or "image/png",
+            uniquify=source.get("uniquify", uniquify),
+        )
+    if source.get("bytes") is not None:
+        return [_make_upload_payload_from_bytes(
+            source["bytes"],
+            filename=source.get("filename") or "upload.bin",
+            mime_type=source.get("mime_type") or source.get("mime"),
+            source_kind=kind or "bytes",
+            uniquify=source.get("uniquify", uniquify),
+            meta=source.get("meta") or {},
+        )]
+    raise ValueError(f"unsupported upload source descriptor: {source!r}")
+
+
+def build_upload_files_payload(sources, *, text="", method="input", upload_wait_ms=15000, uniquify=True) -> dict:
+    entries = []
+    for source in sources:
+        entries.extend(upload_payload_from_source(source, uniquify=uniquify))
+    if not entries:
+        raise ValueError("no upload files were produced")
+    return {
+        "files": entries,
+        "text": text,
+        "method": method,
+        "upload_wait_ms": upload_wait_ms,
+    }
+
+
+def run_upload_sources(role, sources, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+    """Upload local/web/base64/clipboard sources through the browser bridge."""
+    payload = build_upload_files_payload(
+        sources,
+        text=text,
+        method=method,
+        upload_wait_ms=upload_wait_ms,
+        uniquify=uniquify,
+    )
+    return run_command(role, "UPLOAD_FILES", payload, timeout=timeout, print_every=print_every)
+
+
+def run_upload_files(role, files, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+    """Upload local files to the ChatGPT composer through the browser bridge."""
+    return run_upload_sources(
+        role,
+        list(files),
+        text=text,
+        method=method,
+        timeout=timeout,
+        print_every=print_every,
+        upload_wait_ms=upload_wait_ms,
+        uniquify=uniquify,
+    )
 
 def try_reset_page(role):
     for action in ["RESET_PAGE", "RELOAD_PAGE", "HARD_RELOAD", "RELOAD"]:
@@ -608,20 +864,32 @@ class BrowserAgent:
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
             if state["kind"] == "assistant_soft_stuck" and state.get("response"):
-                if allow_processed_response and (
-                    allow_any_processed_response
-                    or response_fingerprint(state["response"]) != response_fingerprint(stale_response)
-                ):
-                    stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
-                    if stable_state:
+                if blocked_since is None:
+                    blocked_since = time.time()
+                blocked_for = time.time() - blocked_since
+                response_is_stale = response_fingerprint(state["response"]) == response_fingerprint(stale_response)
+
+                if blocked_for >= self.config.busy_reload_after_s:
+                    if allow_processed_response and (allow_any_processed_response or not response_is_stale):
+                        stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                        if stable_state:
+                            blocked_since = None
+                            return stable_state
+                    if response_is_stale:
+                        state = self.reload_wait_and_reclassify(
+                            f"soft-stuck UI kept an already processed response for {int(blocked_for)}s"
+                        )
+                        clear_role_ui_dirty(self.config.role)
                         blocked_since = None
-                        return stable_state
-                if response_fingerprint(state["response"]) == response_fingerprint(stale_response):
-                    state = self.reload_wait_and_reclassify("soft-stuck UI is showing an already processed response")
-                    clear_role_ui_dirty(self.config.role)
-                    blocked_since = None
-                    if state.get("can_send_prompt"):
-                        return state
+                        if state.get("can_send_prompt"):
+                            return state
+
+                print(
+                    f"[wait] {self.config.role}: stop button still visible with response text; "
+                    f"treating as active generation for {int(blocked_for)}s before recovery"
+                )
+                time.sleep(self.config.state_wait_s)
+                continue
 
             if (
                 allow_processed_response
@@ -663,6 +931,7 @@ class BrowserAgent:
     def wait_for_live_response(self, stale_response: str = "") -> str:
         time = __import__("time")
         consecutive_errors = 0
+        blocked_since = None
         while True:
             try:
                 state = classify_chat_state(self.get_role_snapshot(reason="agent_wait_response"))
@@ -684,11 +953,19 @@ class BrowserAgent:
                 f"last_user_len={state['last_user_len']} response_len={state['response_len']}"
             )
             if state["kind"] == "assistant_ready" and state["response"]:
+                blocked_since = None
                 return self.record_processed_response(state["response"])
             if state["kind"] == "assistant_soft_stuck" and state.get("response"):
-                stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
-                if stable_state:
-                    return self.record_processed_response(stable_state["response"])
+                if blocked_since is None:
+                    blocked_since = time.time()
+                blocked_for = time.time() - blocked_since
+                if blocked_for >= self.config.busy_reload_after_s:
+                    stable_state = self.stabilize_soft_stuck_response(state, stale_response=stale_response)
+                    if stable_state:
+                        blocked_since = None
+                        return self.record_processed_response(stable_state["response"])
+                else:
+                    print(f"[wait] {self.config.role}: generation still active; waiting before accepting response ({int(blocked_for)}s)")
             time.sleep(self.config.state_wait_s)
 
     def send_and_wait(

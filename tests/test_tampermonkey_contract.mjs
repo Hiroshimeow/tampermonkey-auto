@@ -33,3 +33,27 @@ assert.match(source, /action === 'RESET_PAGE' \|\| action === 'RELOAD_PAGE' \|\|
 assert.match(source, /action === 'HARD_RELOAD'/, 'hard reload command must be supported');
 assert.match(source, /function handleCloseWindow\(command\)/, 'tampermonkey.js must implement close-window command with browser-block reporting');
 assert.match(source, /WINDOW_CLOSE_BLOCKED/, 'close-window command must report when the browser blocks tab closing');
+assert.match(source, /function handleUploadFiles\(command\)/, 'tampermonkey.js must implement browser file upload command');
+assert.match(source, /function uploadPayloadFiles\(payload\)/, 'file upload must rebuild File objects from payload');
+assert.match(source, /base64ToBytes\(data\)/, 'file upload must decode local file bytes in browser');
+assert.match(source, /new File\(\[bytes\], name, \{ type \}\)/, 'file upload must create real File objects');
+assert.match(source, /new ClipboardEvent\('paste'/, 'file upload must support clipboard-style paste');
+assert.match(source, /new DragEvent\(eventName/, 'file upload must support drag/drop fallback');
+assert.match(source, /querySelectorAll\('input\[type="file"\]'\)/, 'file upload must support file-input fallback');
+assert.match(source, /action === 'UPLOAD_FILE' \|\| action === 'UPLOAD_FILES' \|\| action === 'PASTE_IMAGE' \|\| action === 'PASTE_FILES'/, 'upload command aliases must be routed');
+assert.match(source, /composer_attachments:/, 'domSnapshot must expose composer attachment metadata');
+
+assert.match(source, /function dismissUploadOverlays\(\)/, 'upload flow must detect and dismiss stale upload overlays');
+assert.match(source, /already uploaded this file/, 'upload overlay cleanup must handle duplicate-file modal');
+assert.match(source, /dismiss_overlay_before_upload/, 'UPLOAD_FILES must run overlay cleanup before injecting files');
+assert.match(source, /method === 'auto' \? \['input', 'paste', 'drop'\]/, 'UPLOAD_FILES auto mode must prefer input before paste/drop to avoid duplicate overlay');
+assert.match(source, /const checkAfterAttempt = async \(label\)/, 'UPLOAD_FILES must check success after each individual target attempt');
+assert.match(source, /if \(succeededMethod\) \{\s*break;\s*\}/, 'UPLOAD_FILES must stop trying more targets after first successful upload');
+assert.doesNotMatch(source, /function roleFromUrl\(\)/, 'bridge must not read role from URL');
+assert.doesNotMatch(source, /setRole\(urlRole\)/, 'bridge must not persist URL-provided role');
+assert.doesNotMatch(source, /searchParams\.set\('mauto_role'/, 'bridge must not write role into URL');
+assert.match(source, /api\/claim-role/, 'bridge must claim queued roles through the local server');
+assert.match(source, /function clearRole\(\)/, 'bridge must define an explicit role clear path');
+assert.match(source, /sessionStorage\.removeItem\('chatgpt_agent_role'\)/, 'clearing role must remove per-tab session role');
+assert.match(source, /localStorage\.removeItem\('chatgpt_agent_role'\)/, 'clearing role must remove legacy persisted localStorage role');
+assert.doesNotMatch(source, /localStorage\.setItem\('chatgpt_agent_role'/, 'role must not be shared across tabs through localStorage');

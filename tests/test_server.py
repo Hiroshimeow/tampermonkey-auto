@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,9 @@ class DiagnosticControllerTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(controller.app)
         controller.state = controller.DiagnosticState()
+        for role in ("DEV", "IMG", "REVIEW", "SOLO"):
+            controller.state.status[role] = "ONLINE"
+            controller.state.role_seen_at[role] = time.time()
 
     def test_status_report_and_sync_flow(self):
         command = controller.state.create_command("A", "PROBE", {"depth": 1})
@@ -166,7 +170,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(verified["send_delay_min_ms"], 2222)
 
     def test_status_ignores_sentinel_frame_for_command_delivery(self):
-        controller.state.create_command("A", "PROBE", {"depth": 1})
+        controller.state.create_command("PROBE", {"depth": 1})
 
         response = self.client.post(
             "/api/status",
@@ -384,6 +388,19 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         find_pid.assert_called_once_with("127.0.0.1", 8500)
         os_kill.assert_not_called()
+
+    def test_claim_role_assigns_queued_role_once(self):
+        controller.state.queue_auto_open_role("HERMES", "https://chatgpt.com/")
+
+        first = self.client.post("/api/claim-role", json={"session_id": "/"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["role"], "HERMES")
+        self.assertGreater(controller.state.auto_open_roles["HERMES"]["claimed_at"], 0)
+        self.assertEqual(controller.state.auto_open_roles["HERMES"]["claimed_session_id"], "/")
+
+        second = self.client.post("/api/claim-role", json={"session_id": "/c/next"})
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["role"], "")
 
 
 if __name__ == "__main__":

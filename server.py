@@ -1,9 +1,11 @@
 import os
 import signal
+
 import subprocess
 import threading
 import time
 import uuid
+
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional
 
@@ -36,6 +38,8 @@ TERMINAL_STATES = {
     "NEW_CHAT_NAVIGATING",
     "WINDOW_CLOSE_REQUESTED",
     "WINDOW_CLOSE_BLOCKED",
+    "UPLOAD_FILES_DONE",
+    "UPLOAD_FILES_FAILED",
     "UNKNOWN_COMMAND",
     "ERROR_COMMAND",
 }
@@ -75,6 +79,10 @@ class AdminConfigRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
 
+class RoleClaimRequest(BaseModel):
+    session_id: str = ""
+
+
 class DiagnosticState:
     def __init__(self):
         self.lock = threading.RLock()
@@ -88,6 +96,9 @@ class DiagnosticState:
         self.last_user_message = defaultdict(str)
         self.last_response = defaultdict(str)
         self.events = deque(maxlen=10000)
+        self.role_seen_at = defaultdict(float)
+        self.auto_open_roles = {}
+        self.auto_role_inflight = defaultdict(int)
         self.config = {
             "poll_ms": 800,
             "sync_debounce_ms": 1200,
@@ -109,12 +120,39 @@ class DiagnosticState:
             "max_button_dump": 80,
             "auto_reload_on_assistant_timeout": True,
             "reload_after_timeout_ms": 1500,
+            "auto_open_missing_model": True,
+            "auto_open_url": "https://chatgpt.com/",
+            "auto_open_wait_s": 45,
+            "auto_close_after_s": 600,
         }
 
     def update_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
             self.config.update(updates)
             return dict(self.config)
+
+    def queue_auto_open_role(self, role: str, url: str = "") -> None:
+        normalized = str(role or "").strip().upper()
+        if not normalized:
+            return
+        with self.lock:
+            self.auto_open_roles[normalized] = {
+                "opened_at": time.time(),
+                "url": url or str(self.config.get("auto_open_url") or "https://chatgpt.com/"),
+                "claimed_at": 0.0,
+                "claimed_session_id": "",
+            }
+
+    def claim_auto_open_role(self, session_id: str = "") -> str:
+        with self.lock:
+            for role, info in list(self.auto_open_roles.items()):
+                if info.get("claimed_at"):
+                    continue
+                info["claimed_at"] = time.time()
+                info["claimed_session_id"] = session_id or ""
+                self.log(role, "ROLE_CLAIMED", session_id=session_id or "")
+                return role
+        return ""
 
     @staticmethod
     def is_ignored_session(session_id: str) -> bool:
@@ -201,6 +239,16 @@ class DiagnosticState:
             self.command_status[command_id] = "PENDING"
             self.log(role, "COMMAND_CREATED", command_id=command_id, action=action, payload=payload or {})
         return cmd
+
+    def wait_for_command_result(self, command_id: str, timeout_s: float, poll_s: float = 0.2) -> Optional[Dict[str, Any]]:
+        deadline = time.time() + max(0.1, timeout_s)
+        while time.time() < deadline:
+            with self.lock:
+                result = self.command_results.get(command_id)
+                if result is not None:
+                    return dict(result)
+            time.sleep(max(0.05, poll_s))
+        return None
 
     def get_command_for_role(self, role: str):
         with self.lock:
@@ -326,6 +374,8 @@ app.add_middleware(
 )
 
 
+
+
 @app.post("/api/status")
 def api_status(req: StatusRequest):
     role = req.role
@@ -337,12 +387,19 @@ def api_status(req: StatusRequest):
             state.apply_dom_transcript_cache(role, req.dom_info)
         if not state.is_ignored_session(req.session_id):
             state.status[role] = "ONLINE"
+            state.role_seen_at[role] = time.time()
 
     if state.is_ignored_session(req.session_id):
         return {"command": {"action": "WAIT"}, "config": state.config}
 
     cmd = state.get_command_for_role(role)
     return {"command": cmd, "config": state.config}
+
+
+@app.post("/api/claim-role")
+def api_claim_role(req: RoleClaimRequest):
+    role = state.claim_auto_open_role(req.session_id)
+    return {"role": role, "config": state.config}
 
 
 @app.post("/api/report")
@@ -386,6 +443,7 @@ def api_route_catalog(base_url: str = ""):
 
     return [
         item("client", "POST", "/api/status", "Browser role poll/status and command delivery."),
+        item("client", "POST", "/api/claim-role", "Claim a queued browser role without URL role params."),
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
@@ -515,3 +573,10 @@ def run_server():
 
 if __name__ == "__main__":
     run_server()
+
+
+
+
+
+
+

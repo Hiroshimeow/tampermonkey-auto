@@ -32,10 +32,9 @@ def test_role_config_builds_prompt_with_selected_role():
     assert "GOAL:\nFix bug" in prompt
     assert "CURRENT_STATE:\nPrevious state" in prompt
     assert "ROUTING CONTRACT:" in prompt
-    assert "JSON keys must be exactly: target, reason, message." in prompt
-    assert "target must be one of ALLOWED_TARGETS" in prompt
-    assert "Use FINISH only when the full goal is complete and verified." in prompt
-    assert "Non-MANAGER roles must choose exactly one target" in prompt
+    assert 'Valid shape example:\n{"ROLE":"message to ROLE"}' in prompt
+    assert "Reserved metadata key: command." in prompt
+    assert "Do not use target, reason, or message wrapper keys." in prompt
 
 
 def test_prompt_without_system_keeps_runtime_context_only():
@@ -325,13 +324,10 @@ def test_build_repair_prompt_requests_valid_short_routing():
 
     prompt = agents.build_routing_repair_prompt(["B", "PLAN", "MANAGER"], "B")
 
-    assert "ALLOWED_TARGETS: B, PLAN, MANAGER" in prompt
-    assert "CURRENT_ROLE: B" in prompt
-    assert '"target"' in prompt
-    assert '"reason"' in prompt
-    assert "target must be in ALLOWED_TARGETS" in prompt
-    assert "non-MANAGER roles must choose exactly one target" in prompt
-    assert "no other JSON objects" in prompt
+    assert "valid route-map JSON object" in prompt
+    assert '{"DEV":"message to DEV"}' in prompt
+    assert '{"DEV":"message to DEV","command":"handoff"}' in prompt
+    assert "Do not use target, reason, or message wrapper keys." in prompt
 
 
 def test_append_routing_error_state_keeps_only_latest_error():
@@ -466,7 +462,7 @@ def test_allowed_targets_follow_selected_active_roles():
 def test_role_prompts_do_not_duplicate_routing_contract():
     root = Path(__file__).resolve().parents[1]
     template_files = {"ROUTING_CONTRACT.txt", "FORMAT_REPAIR.txt", "SOLO_CONTINUE.txt", "SOLO_FOLLOWUP.txt"}
-    forbidden = ["ALLOWED_TARGETS", "FINISH", "routing JSON", "FINAL JSON", "STATUS LINE", "\"target\""]
+    forbidden = ["ALLOWED_TARGETS", "routing JSON", "FINAL JSON", "STATUS LINE", "\"target\""]
 
     offenders = []
     for prompt_file in (root / "prompts").glob("*.txt"):

@@ -185,13 +185,22 @@ class BridgeClient:
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
     ) -> str:
-        print(f"[response-recovery] role={role} wait={reload_delay_s:.1f}s then reload", flush=True)
+        print(f"[response-recovery] role={role} wait={reload_delay_s:.1f}s before deciding reload", flush=True)
         self.sleep(max(0.0, reload_delay_s))
+        self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+        pre_reload_snapshot = self.role_snapshot(role)
+        pre_reload_dom = pre_reload_snapshot.get("dom_info") or {}
+        pre_reload_response = str(pre_reload_snapshot.get("last_response") or "").strip()
+        if not pre_reload_dom.get("stop_visible"):
+            return pre_reload_response
+        print(f"[response-recovery] role={role} still responding after initial wait; reloading", flush=True)
         self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
         self.sleep(max(0.0, page_wait_s))
 
         deadline = time.time() + max(1.0, timeout_s)
         last_response = ""
+        stable_response = ""
+        stable_count = 0
         while time.time() < deadline:
             self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
             snapshot = self.role_snapshot(role)
@@ -201,6 +210,14 @@ class BridgeClient:
                 return last_response
             if dom_info.get("stop_visible"):
                 print(f"[response-recovery] role={role} still responding; waiting", flush=True)
+                if last_response and last_response == stable_response:
+                    stable_count += 1
+                else:
+                    stable_response = last_response
+                    stable_count = 1 if last_response else 0
+                if stable_count >= 2 and stable_response:
+                    print(f"[response-recovery] role={role} accepting stable response while stop is still visible", flush=True)
+                    return stable_response
             self.sleep(max(0.1, poll_s))
 
         raise RuntimeError(f"{role} response recovery timed out; last_response_len={len(last_response)}")
@@ -229,6 +246,7 @@ class Coordinator:
         self.dry_run = bool(args.dry_run)
         self.lock = threading.Lock()
         self.background_tasks: list[threading.Thread] = []
+        self.reload_generation: dict[str, int] = {}
 
     def run(self, goal: str) -> dict[str, Any]:
         state = FlowState(goal=goal)
@@ -259,6 +277,7 @@ class Coordinator:
         if prompt_role not in self.prompt_roles:
             prompt_role = self.manager_role
         browser_role = self.pick_browser_role(prompt_role)
+        self.cancel_pending_reload(browser_role)
         include_system = self.should_include_system(prompt_role)
         prompt = self.build_prompt(prompt_role, instruction, state, caller_role, include_system)
         print(f"\n=== TURN {turn} prompt_role={prompt_role} browser_role={browser_role} caller={caller_role} ===", flush=True)
@@ -407,19 +426,40 @@ class Coordinator:
             return
         browser_role = result.browser_role
         delay_s = max(0.0, float(self.args.reload_after))
+        token = self.mark_reload_scheduled(browser_role)
         if self.dry_run:
             print(f"[route-reload] dry-run browser_role={browser_role} delay={delay_s:.1f}s", flush=True)
             return
         thread = threading.Thread(
             target=self.reload_browser_after_delay,
-            args=(browser_role, delay_s),
+            args=(browser_role, delay_s, token),
             name=f"reload-after-route-{browser_role}",
         )
         thread.start()
         self.background_tasks.append(thread)
 
-    def reload_browser_after_delay(self, browser_role: str, delay_s: float) -> None:
+    def mark_reload_scheduled(self, browser_role: str) -> int:
+        browser_role = normalize_role(browser_role)
+        with self.lock:
+            token = self.reload_generation.get(browser_role, 0) + 1
+            self.reload_generation[browser_role] = token
+            return token
+
+    def cancel_pending_reload(self, browser_role: str) -> None:
+        browser_role = normalize_role(browser_role)
+        with self.lock:
+            self.reload_generation[browser_role] = self.reload_generation.get(browser_role, 0) + 1
+
+    def is_reload_current(self, browser_role: str, token: int) -> bool:
+        browser_role = normalize_role(browser_role)
+        with self.lock:
+            return self.reload_generation.get(browser_role, 0) == token
+
+    def reload_browser_after_delay(self, browser_role: str, delay_s: float, token: int) -> None:
         time.sleep(delay_s)
+        if not self.is_reload_current(browser_role, token):
+            print(f"[route-reload] skipped browser_role={browser_role} reason=reused_before_delay", flush=True)
+            return
         try:
             result = self.client.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=self.args.preflight_timeout)
             print(f"[route-reload] browser_role={browser_role} status={result.get('status')} done={result.get('done')}", flush=True)
@@ -496,14 +536,18 @@ class Coordinator:
         except Exception as exc:
             print(f"[resume] could not read current response for {prompt_role}/{browser_role}: {exc}", flush=True)
             return ""
+        dom_info = snapshot.get("dom_info") or {}
         response = str(snapshot.get("last_response") or "").strip()
+        if dom_info.get("stop_visible"):
+            print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
+            try:
+                response = self.client.recover_response_after_reload(browser_role, self.args.timeout)
+            except Exception as exc:
+                print(f"[resume] could not recover current response for {prompt_role}/{browser_role}: {exc}", flush=True)
+                return ""
         if not response:
             return ""
-        route = self.validate_route(prompt_role, parse_route(response))
-        if not route.ok:
-            print(f"[resume] existing response ignored: {route.error or 'missing route'}", flush=True)
-            return ""
-        print(f"[resume] using existing response for prompt_role={prompt_role} browser_role={browser_role}", flush=True)
+        print(f"[resume] using current response for prompt_role={prompt_role} browser_role={browser_role}", flush=True)
         return response
 
     def build_prompt(self, prompt_role: str, instruction: str, state: FlowState, caller_role: str, include_system: bool) -> str:
@@ -511,10 +555,14 @@ class Coordinator:
         if include_system:
             parts.append(system_prompt(prompt_role, self.prompt_roles, self.finish_roles))
         parts.append(f"PROMPT_ROLE: {prompt_role}")
-        parts.append(f"CALLER_ROLE: {caller_role}")
-        parts.append(f"USER_GOAL:\n{state.goal}")
-        parts.append(f"FLOW_STATE:\n{state.compact(self.args.max_state_chars)}")
-        parts.append(f"INSTRUCTION_FROM_CALLER:\n{instruction}")
+        if caller_role != "USER":
+            parts.append(f"CALLER_ROLE: {caller_role}")
+        parts.append(f"GOAL:\n{state.goal}")
+        if caller_role == "USER":
+            parts.append(f"INSTRUCTION_FROM_CALLER:\n{instruction}")
+        else:
+            route_payload = json.dumps({caller_role: instruction}, ensure_ascii=False, indent=2)
+            parts.append(f"ROUTED_MESSAGE_JSON:\n{route_payload}")
         parts.append(route_contract(self.prompt_roles, self.finish_roles))
         return "\n\n".join(parts)
 
@@ -523,9 +571,11 @@ class Coordinator:
         if include_system:
             parts.append(system_prompt(prompt_role, self.prompt_roles, self.finish_roles))
         parts.append(f"PROMPT_ROLE: {prompt_role}")
-        parts.append(f"CALLER_ROLE: {caller_role}")
+        if caller_role != "USER":
+            parts.append(f"CALLER_ROLE: {caller_role}")
         parts.append("Your previous response did not contain a valid route JSON object. Return the missing work summary and end with exactly one valid JSON object.")
         parts.append(f"PREVIOUS_BAD_RESPONSE:\n{compact_text(bad_response, 8000)}")
+        parts.append(f"GOAL:\n{state.goal}")
         parts.append(f"FLOW_STATE:\n{state.compact(self.args.max_state_chars)}")
         parts.append(route_contract(self.prompt_roles, self.finish_roles))
         return "\n\n".join(parts)
@@ -884,7 +934,6 @@ def run_self_test() -> int:
             self.actions = []
             self.sleeps = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": True}, "last_response": ""},
                 {"dom_info": {"stop_visible": False}, "last_response": "final response"},
             ]
 
@@ -901,16 +950,100 @@ def run_self_test() -> int:
     recovery_client = RecoveryClient()
     recovered = recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
     assert recovered == "final response"
-    assert recovery_client.sleeps[:2] == [5.0, 10.0]
-    assert recovery_client.actions[0][1] == "RELOAD_PAGE"
-    assert recovery_client.actions[1][1] == "SYNC_TRANSCRIPT"
+    assert recovery_client.sleeps == [5.0]
+    assert recovery_client.actions == [("DEV", "SYNC_TRANSCRIPT", 20.0)]
+
+    class ReloadingRecoveryClient(BridgeClient):
+        def __init__(self):
+            self.actions = []
+            self.sleeps = []
+            self.snapshots = [
+                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
+                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
+                {"dom_info": {"stop_visible": False}, "last_response": "final response"},
+            ]
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            self.actions.append((role, action, timeout_s))
+            return {"ok": True, "status": "TRANSCRIPT_SAVED" if action == "SYNC_TRANSCRIPT" else "PAGE_RELOADING", "done": True}
+
+        def role_snapshot(self, role: str) -> dict[str, Any]:
+            return self.snapshots.pop(0)
+
+    reloading_recovery_client = ReloadingRecoveryClient()
+    recovered = reloading_recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
+    assert recovered == "final response"
+    assert reloading_recovery_client.sleeps[:2] == [5.0, 10.0]
+    assert reloading_recovery_client.actions[0][1] == "SYNC_TRANSCRIPT"
+    assert reloading_recovery_client.actions[1][1] == "RELOAD_PAGE"
+    assert reloading_recovery_client.actions[2][1] == "SYNC_TRANSCRIPT"
+
+    class SoftStuckRecoveryClient(BridgeClient):
+        def __init__(self):
+            self.actions = []
+            self.sleeps = []
+            self.snapshots = [
+                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
+                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
+                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
+            ]
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            self.actions.append((role, action, timeout_s))
+            return {"ok": True, "status": "TRANSCRIPT_SAVED" if action == "SYNC_TRANSCRIPT" else "PAGE_RELOADING", "done": True}
+
+        def role_snapshot(self, role: str) -> dict[str, Any]:
+            return self.snapshots.pop(0)
+
+    soft_stuck_client = SoftStuckRecoveryClient()
+    recovered = soft_stuck_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
+    assert recovered == "stable response"
+
+    class ReloadRaceClient(BridgeClient):
+        def __init__(self):
+            self.actions = []
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            self.actions.append((role, action, timeout_s))
+            return {"ok": True, "status": "PAGE_RELOADING", "done": True}
+
+    race_args = parse_args(["--reload-after", "--goal", "reload cancel"])
+    race_coord = Coordinator(race_args)
+    race_client = ReloadRaceClient()
+    race_coord.client = race_client
+    token = race_coord.mark_reload_scheduled("DEV")
+    race_coord.cancel_pending_reload("DEV")
+    race_coord.reload_browser_after_delay("DEV", 0.0, token)
+    assert race_client.actions == []
+
+    token = race_coord.mark_reload_scheduled("DEV")
+    race_coord.reload_browser_after_delay("DEV", 0.0, token)
+    assert race_client.actions == [("DEV", "RELOAD_PAGE", race_coord.args.preflight_timeout)]
 
     class ResumeClient(BridgeClient):
         def __init__(self):
             self.called_browser = False
+            self.actions = []
+            self.snapshots = [
+                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
+                {"dom_info": {"stop_visible": False}, "last_response": '```json\n{"REVIEW":"review existing DEV output"}\n```'},
+            ]
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            self.actions.append((role, action, timeout_s))
+            return {"ok": True, "status": "TRANSCRIPT_SAVED", "done": True}
 
         def role_snapshot(self, role: str) -> dict[str, Any]:
-            return {"last_response": '```json\n{"REVIEW":"review existing DEV output"}\n```'}
+            return self.snapshots.pop(0)
 
         def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
             self.called_browser = True
@@ -924,6 +1057,20 @@ def run_self_test() -> int:
     resume_result = resume_coord.dispatch_role("DEV", "resume", resume_state, "USER", 0, follow_routes=False)
     assert resume_result and resume_result.route.targets == {"REVIEW": "review existing DEV output"}
     assert not resume_client.called_browser
+    assert resume_client.actions[0][1] == "SYNC_TRANSCRIPT"
+
+    route_prompt_args = parse_args(["--goal", "route payload only"])
+    route_prompt_coord = Coordinator(route_prompt_args)
+    route_prompt_state = FlowState("route payload only")
+    routed_prompt = route_prompt_coord.build_prompt("REVIEW", "Review implementation and evidence.", route_prompt_state, "DEV", include_system=False)
+    assert "GOAL:\nroute payload only" in routed_prompt
+    assert '"DEV": "Review implementation and evidence."' in routed_prompt
+    assert "FLOW_STATE:" not in routed_prompt
+    assert "USER_GOAL:" not in routed_prompt
+
+    user_prompt = route_prompt_coord.build_prompt("DEV", "Start from goal", route_prompt_state, "USER", include_system=False)
+    assert "CALLER_ROLE: USER" not in user_prompt
+    assert "GOAL:\nroute payload only" in user_prompt
 
     print("self-test ok")
     return 0

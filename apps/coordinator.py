@@ -192,9 +192,13 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         except RuntimeError as exc:
             print(f"[resume] could not read current response for {prompt_role}/{browser_role}: {exc}", flush=True)
             return ""
-        dom_info = snapshot.get("dom_info") or {}
-        response = str(snapshot.get("last_response") or "").strip()
-        if dom_info.get("stop_visible"):
+        activity = self.client.response_activity(snapshot)
+        response = activity.response
+        if self.client.is_manual_input_pending(activity):
+            raise ManualInputPendingError(
+                f"{browser_role} composer has manual input; not parsing or replacing current page",
+            )
+        if self.client.is_response_active(activity):
             print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
             try:
                 response = self.client.wait_for_current_response(browser_role, self.args.timeout)

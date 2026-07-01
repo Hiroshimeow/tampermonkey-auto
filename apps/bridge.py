@@ -27,16 +27,34 @@ class ResponseActivity:
     stop_visible: bool
     has_response: bool
     changed: bool
+    composer_exists: bool
     composer_text_len: int
     composer_text: str
+    composer_attachment_count: int
+    send_enabled: bool | None
+    user_count: int
+    assistant_count: int
+    image_count: int
+
+    @property
+    def response_len(self) -> int:
+        return len(self.response)
 
     @property
     def active(self) -> bool:
         return self.stop_visible
 
     @property
+    def streaming(self) -> bool:
+        return self.active and self.changed
+
+    @property
     def manual_input_pending(self) -> bool:
-        return self.composer_text_len > 0 or bool(self.composer_text.strip())
+        return self.composer_text_len > 0 or bool(self.composer_text.strip()) or self.composer_attachment_count > 0
+
+    @property
+    def clean_ready(self) -> bool:
+        return self.composer_exists and not self.active and not self.manual_input_pending
 
     @property
     def done(self) -> bool:
@@ -74,11 +92,7 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        activity = self.response_activity(self.role_snapshot(browser_role))
-        if activity.manual_input_pending:
-            raise ManualInputPendingError(
-                f"{browser_role} composer has manual text; not replacing it with an automated prompt",
-            )
+        self.wait_until_clean_ready(browser_role, timeout_s)
         self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
         self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
@@ -139,22 +153,59 @@ class BridgeClient:
         time.sleep(seconds)
 
     @staticmethod
-    def response_activity(snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
+    def _int_value(value: Any, default: int = 0) -> int:
+        try:
+            return int(value or default)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def response_activity(cls, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
         dom_info = snapshot.get("dom_info") or {}
+        messages = dom_info.get("messages") or {}
+        counts = messages.get("counts") or {}
         response = str(snapshot.get("last_response") or "").strip()
         composer_text = str(dom_info.get("composer_text") or "")
-        try:
-            composer_text_len = int(dom_info.get("composer_text_len") or 0)
-        except (TypeError, ValueError):
-            composer_text_len = len(composer_text)
+        composer_text_len = cls._int_value(dom_info.get("composer_text_len"), len(composer_text))
+        attachments = dom_info.get("composer_attachments") or []
         return ResponseActivity(
             response=response,
             stop_visible=bool(dom_info.get("stop_visible")),
             has_response=bool(response),
             changed=bool(response and response != previous_response),
+            composer_exists=bool(dom_info.get("composer")),
             composer_text_len=composer_text_len,
             composer_text=composer_text,
+            composer_attachment_count=len(attachments) if isinstance(attachments, list) else 0,
+            send_enabled=dom_info.get("send_enabled") if isinstance(dom_info.get("send_enabled"), bool) else None,
+            user_count=cls._int_value(counts.get("user")),
+            assistant_count=cls._int_value(counts.get("assistant")),
+            image_count=cls._int_value(counts.get("images")),
         )
+
+    @staticmethod
+    def is_manual_input_pending(activity: ResponseActivity) -> bool:
+        return activity.manual_input_pending
+
+    @staticmethod
+    def is_response_active(activity: ResponseActivity) -> bool:
+        return activity.active
+
+    @staticmethod
+    def is_response_streaming(activity: ResponseActivity) -> bool:
+        return activity.streaming
+
+    @staticmethod
+    def is_clean_ready(activity: ResponseActivity) -> bool:
+        return activity.clean_ready
+
+    @staticmethod
+    def is_response_done(activity: ResponseActivity) -> bool:
+        return activity.done
+
+    @staticmethod
+    def is_response_stuck(activity: ResponseActivity, elapsed_s: float, active_wait_s: float) -> bool:
+        return activity.active and elapsed_s >= max(0.0, active_wait_s)
 
     def wait_for_current_response(
         self,
@@ -176,18 +227,19 @@ class BridgeClient:
             last_activity = activity
             last_response = activity.response or last_response
 
-            if activity.manual_input_pending:
+            if self.is_manual_input_pending(activity):
                 print(
                     f"[response-watch] role={role} manual_input_pending=true "
-                    f"composer_len={activity.composer_text_len}; waiting without send/reload",
+                    f"composer_len={activity.composer_text_len} attachments={activity.composer_attachment_count}; "
+                    "waiting without send/reload",
                     flush=True,
                 )
                 self.sleep(max(0.1, poll_s))
                 continue
 
-            if activity.done:
+            if self.is_response_done(activity):
                 return activity.response
-            if not activity.active:
+            if not self.is_response_active(activity):
                 if activity.has_response:
                     return activity.response
                 return ""
@@ -195,7 +247,7 @@ class BridgeClient:
             elapsed_in_cycle = time.time() - cycle_started
             bucket = int(elapsed_in_cycle // max(1.0, poll_s * 5))
             if bucket != last_logged_bucket:
-                state = "streaming" if activity.changed else "active"
+                state = "streaming" if self.is_response_streaming(activity) else "active"
                 print(
                     f"[response-watch] role={role} state={state} stop_visible=true "
                     f"response_len={len(last_response)} elapsed={elapsed_in_cycle:.1f}s/{active_wait_s:.1f}s",
@@ -203,7 +255,7 @@ class BridgeClient:
                 )
                 last_logged_bucket = bucket
 
-            if elapsed_in_cycle >= max(0.0, active_wait_s):
+            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s):
                 print(
                     f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page",
                     flush=True,
@@ -216,13 +268,38 @@ class BridgeClient:
 
             self.sleep(max(0.1, poll_s))
 
-        if last_activity and last_activity.manual_input_pending:
+        if last_activity and self.is_manual_input_pending(last_activity):
             raise ManualInputPendingError(
-                f"{role} composer still has manual text after waiting; not sending automated prompt",
+                f"{role} composer still has manual input after waiting; not sending automated prompt",
             )
+        if last_activity and self.is_response_active(last_activity):
+            raise RuntimeError(f"{role} response still active after timeout; last_response_len={len(last_response)}")
         if last_response:
             return last_response
         raise RuntimeError(f"{role} response wait timed out; last_response_len={len(last_response)}")
+
+    def wait_until_clean_ready(
+        self,
+        role: str,
+        timeout_s: float,
+        poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+    ) -> ResponseActivity:
+        deadline = time.time() + max(1.0, timeout_s)
+        while time.time() < deadline:
+            activity = self.response_activity(self.role_snapshot(role))
+            if self.is_manual_input_pending(activity):
+                raise ManualInputPendingError(
+                    f"{role} composer has manual input; not replacing it with an automated prompt",
+                )
+            if self.is_clean_ready(activity):
+                return activity
+            if self.is_response_active(activity):
+                self.wait_for_current_response(role, timeout_s=max(1.0, deadline - time.time()))
+                continue
+            if not activity.composer_exists:
+                print(f"[ready-check] role={role} composer not found; waiting", flush=True)
+            self.sleep(max(0.1, poll_s))
+        raise RuntimeError(f"{role} did not become clean-ready before timeout")
 
     def recover_response_after_reload(
         self,

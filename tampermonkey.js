@@ -257,6 +257,14 @@
         return String(el.innerText || el.textContent || el.value || '').trim();
     }
 
+    function hasManualComposerInput(snapshot) {
+        const textLen = Number(snapshot && snapshot.composer_text_len || 0);
+        const attachmentCount = Array.isArray(snapshot && snapshot.composer_attachments)
+            ? snapshot.composer_attachments.length
+            : 0;
+        return textLen > 0 || attachmentCount > 0;
+    }
+
     function clearComposerText(el) {
         if (!el) {
             return;
@@ -752,6 +760,8 @@
         const stopButton = stopElement();
         const messages = messageSummary();
         const composerRoot = closestComposerRoot();
+        const composerText = textOf(composer);
+        const composerAttachments = composerAttachmentSummary();
         const composerButtons = scopedSendButtonCandidates().slice(0, 12).map((item) => ({
             meta: item.meta,
             scores: item.scores,
@@ -765,12 +775,13 @@
 
         return {
             composer: !!composer,
-            composer_text: textOf(composer),
-            composer_text_len: textOf(composer).length,
+            composer_text: composerText,
+            composer_text_len: composerText.length,
+            manual_input_pending: hasManualComposerInput({ composer_text_len: composerText.length, composer_attachments: composerAttachments }),
             composer_path: composer ? domPath(composer) : '',
             composer_root_path: composerRoot ? domPath(composerRoot) : '',
             composer_buttons: composerButtons,
-            composer_attachments: composerAttachmentSummary(),
+            composer_attachments: composerAttachments,
             file_inputs: visibleFileInputs().map((item) => ({
                 accept: item.accept,
                 multiple: item.multiple,
@@ -1029,6 +1040,19 @@
         const method = String(payload.method || 'auto');
         const snapshotBefore = domSnapshot();
         const composer = composerElement();
+        if (hasManualComposerInput(snapshotBefore) && !payload.force_replace) {
+            await report('PASTE_BLOCKED_MANUAL_INPUT', command.command_id, {
+                text: snapshotBefore.composer_text,
+                result: {
+                    reason: 'manual_input_pending',
+                    requested_text_len: text.length,
+                    before_len: snapshotBefore.composer_text_len,
+                    attachment_count: (snapshotBefore.composer_attachments || []).length
+                },
+                dom_info: snapshotBefore
+            });
+            return;
+        }
         await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
         const ok = setComposerText(composer, text, method);
         const snapshotAfter = domSnapshot();
@@ -1396,11 +1420,12 @@
                 continue;
             }
 
-            if (snapshot.composer_text_len > 0) {
+            if (hasManualComposerInput(snapshot)) {
                 await report('MANUAL_INPUT_PENDING', command.command_id, {
                     text: assistantText,
                     result: {
                         composer_text_len: snapshot.composer_text_len,
+                        attachment_count: (snapshot.composer_attachments || []).length,
                         assistant_len: assistantText.length,
                         stop_visible: snapshot.stop_visible
                     },

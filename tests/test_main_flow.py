@@ -211,13 +211,23 @@ class FakeBridge(BridgeClient):
         time.sleep(min(max(seconds, 0.0), 0.01))
 
 
-def response_snapshot(text: str, stop_visible: bool, composer_text: str = "") -> dict:
+def response_snapshot(
+    text: str,
+    stop_visible: bool,
+    composer_text: str = "",
+    attachments: list | None = None,
+    composer: bool = True,
+) -> dict:
     return {
         "last_response": text,
         "dom_info": {
+            "composer": composer,
             "stop_visible": stop_visible,
             "composer_text": composer_text,
             "composer_text_len": len(composer_text),
+            "composer_attachments": attachments or [],
+            "send_enabled": bool(composer_text),
+            "messages": {"counts": {"user": 1, "assistant": 1, "images": 0}},
         },
     }
 
@@ -269,3 +279,20 @@ def test_call_browser_role_refuses_to_replace_manual_composer_text() -> None:
         bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=1.0)
 
     assert "SET_PROMPT" not in bridge.commands
+
+
+def test_response_activity_classifiers_cover_ready_streaming_stuck_and_manual_attachment() -> None:
+    bridge = BridgeClient("http://127.0.0.1:8500")
+
+    ready = bridge.response_activity(response_snapshot("old", False))
+    assert bridge.is_clean_ready(ready)
+    assert bridge.is_response_done(ready)
+
+    streaming = bridge.response_activity(response_snapshot("new text", True), previous_response="old text")
+    assert bridge.is_response_active(streaming)
+    assert bridge.is_response_streaming(streaming)
+    assert bridge.is_response_stuck(streaming, elapsed_s=301.0, active_wait_s=300.0)
+
+    manual_attachment = bridge.response_activity(response_snapshot("old", False, attachments=[{"label": "remove file"}]))
+    assert bridge.is_manual_input_pending(manual_attachment)
+    assert not bridge.is_clean_ready(manual_attachment)

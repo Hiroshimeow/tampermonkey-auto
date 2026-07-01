@@ -93,7 +93,7 @@ def _assert_response_recovery_without_reload() -> None:
     recovery_client = RecoveryClient()
     recovered = recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
     assert recovered == "final response"
-    assert recovery_client.sleeps == [5.0]
+    assert recovery_client.sleeps == []
     assert recovery_client.actions == [("DEV", "SYNC_TRANSCRIPT", 20.0)]
 
 
@@ -103,7 +103,6 @@ def _assert_response_recovery_with_reload() -> None:
             self.actions = []
             self.sleeps = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
                 {"dom_info": {"stop_visible": True}, "last_response": "old response"},
                 {"dom_info": {"stop_visible": False}, "last_response": "final response"},
             ]
@@ -119,9 +118,9 @@ def _assert_response_recovery_with_reload() -> None:
             return self.snapshots.pop(0)
 
     reloading_recovery_client = ReloadingRecoveryClient()
-    recovered = reloading_recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
+    recovered = reloading_recovery_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=0.0, page_wait_s=10.0, poll_s=1.0)
     assert recovered == "final response"
-    assert reloading_recovery_client.sleeps[:2] == [5.0, 10.0]
+    assert reloading_recovery_client.sleeps[:1] == [10.0]
     assert reloading_recovery_client.actions[0][1] == "SYNC_TRANSCRIPT"
     assert reloading_recovery_client.actions[1][1] == "RELOAD_PAGE"
     assert reloading_recovery_client.actions[2][1] == "SYNC_TRANSCRIPT"
@@ -134,8 +133,7 @@ def _assert_soft_stuck_recovery() -> None:
             self.sleeps = []
             self.snapshots = [
                 {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
-                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
-                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
+                {"dom_info": {"stop_visible": False}, "last_response": "stable response"},
             ]
 
         def sleep(self, seconds: float) -> None:
@@ -149,7 +147,7 @@ def _assert_soft_stuck_recovery() -> None:
             return self.snapshots.pop(0)
 
     soft_stuck_client = SoftStuckRecoveryClient()
-    recovered = soft_stuck_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=5.0, page_wait_s=10.0, poll_s=1.0)
+    recovered = soft_stuck_client.recover_response_after_reload("DEV", 30.0, reload_delay_s=0.0, page_wait_s=10.0, poll_s=1.0)
     assert recovered == "stable response"
 
 

@@ -105,6 +105,8 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             print(f"[manual-input] {exc}", flush=True)
             return None
         elapsed = time.time() - started
+        if include_system:
+            self.system_sent.add(prompt_role)
         route = self.validate_route(prompt_role, parse_route(response))
         repaired = False
 
@@ -116,7 +118,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 response,
                 state,
                 caller_role,
-                include_system=prompt_role not in self.system_sent,
+                include_system=(not self.args.resume and prompt_role not in self.system_sent),
             )
             try:
                 response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
@@ -131,7 +133,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 return None
             route = self.validate_route(prompt_role, parse_route(response))
 
-        if include_system or route.ok:
+        if route.ok:
             self.system_sent.add(prompt_role)
 
         handoff = extract_handoff(response)
@@ -243,21 +245,20 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         caller_role: str,
         include_system: bool,
     ) -> str:
+        contract = route_contract(self.prompt_roles, self.finish_roles)
         if self.uses_goal_only_prompt(prompt_role):
             return goal_only_prompt(state.goal)
+        if self.args.resume:
+            return contract
         parts = []
         if include_system:
             parts.append(system_prompt(prompt_role, self.prompt_roles, self.finish_roles))
-        parts.append(f"PROMPT_ROLE: {prompt_role}")
-        if caller_role != "USER":
-            parts.append(f"CALLER_ROLE: {caller_role}")
-        parts.append(
-            "Your previous response did not contain a valid route JSON object. Return the missing work summary and end with exactly one valid JSON object.",
-        )
-        parts.append(f"PREVIOUS_BAD_RESPONSE:\n{compact_text(bad_response, 8000)}")
-        parts.append(f"GOAL:\n{state.goal}")
-        parts.append(f"FLOW_STATE:\n{state.compact(self.args.max_state_chars)}")
-        parts.append(route_contract(self.prompt_roles, self.finish_roles))
+            parts.append(f"PROMPT_ROLE: {prompt_role}")
+            if caller_role != "USER":
+                parts.append(f"CALLER_ROLE: {caller_role}")
+            parts.append("Your previous response did not end with a valid route JSON object. Reply again using the route contract below.")
+            parts.append(f"GOAL:\n{state.goal}")
+        parts.append(contract)
         return "\n\n".join(parts)
 
     @staticmethod

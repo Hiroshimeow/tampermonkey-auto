@@ -27,6 +27,77 @@ def test_resume_prompt_does_not_include_system_prompt() -> None:
     assert "INSTRUCTION_FROM_CALLER:\ncontinue from current page" in prompt
 
 
+def test_resume_format_repair_only_sends_route_contract() -> None:
+    args = parse_args([
+        "--resume",
+        "--goal",
+        "resume goal",
+        "--role",
+        "A,B",
+        "--start-role",
+        "A",
+        "--max-turns",
+        "1",
+    ])
+    coordinator = Coordinator(args)
+    state = FlowState("resume goal")
+
+    prompt = coordinator.build_format_repair_prompt(
+        "A",
+        "A",
+        state,
+        "USER",
+        include_system=True,
+    )
+
+    assert prompt.startswith("ROUTE_JSON_CONTRACT:")
+    assert "[ROLE PROMPT:" not in prompt
+    assert "PROMPT_ROLE:" not in prompt
+    assert "GOAL:" not in prompt
+    assert "PREVIOUS_BAD_RESPONSE" not in prompt
+    assert "FLOW_STATE" not in prompt
+    assert "Allowed route keys: A, B, FINISH." in prompt
+
+
+def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send() -> None:
+    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--start-role", "A", "--max-turns", "1"])
+    coordinator = Coordinator(args)
+    sent_prompts = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        sent_prompts.append((repair, prompt))
+        if repair:
+            return 'Fixed.\n```json\n{"B":"continue"}\n```'
+        return "A"
+
+    coordinator.call_or_synthetic = fake_call
+
+    coordinator.run("finish the task")
+
+    assert len(sent_prompts) == 2
+    initial_prompt = sent_prompts[0][1]
+    repair_prompt = sent_prompts[1][1]
+    assert "[ROLE PROMPT: A]" in initial_prompt
+    assert repair_prompt.startswith("ROUTE_JSON_CONTRACT:")
+    assert "[ROLE PROMPT:" not in repair_prompt
+    assert "PREVIOUS_BAD_RESPONSE" not in repair_prompt
+    assert "FLOW_STATE" not in repair_prompt
+
+
+def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
+    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--start-role", "A"])
+    coordinator = Coordinator(args)
+    state = FlowState("finish the task")
+
+    prompt = coordinator.build_format_repair_prompt("B", "B", state, "A", include_system=True)
+
+    assert "[ROLE PROMPT: B]" in prompt
+    assert "GOAL:\nfinish the task" in prompt
+    assert "PREVIOUS_BAD_RESPONSE" not in prompt
+    assert "FLOW_STATE" not in prompt
+    assert "ROUTE_JSON_CONTRACT:" in prompt
+
+
 def test_each_role_gets_system_prompt_on_its_first_cycle_not_global_turn_one() -> None:
     args = parse_args(["--goal", "multi role goal", "--prompt-roles", "A,B", "--start-role", "A"])
     coordinator = Coordinator(args)

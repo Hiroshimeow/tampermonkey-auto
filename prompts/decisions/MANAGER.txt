@@ -1,4 +1,4 @@
 [DECISION: MANAGER]
-Use MANAGER when coordination, consolidation, user-facing choice, conflict resolution, or manager-owned final decision is needed.
-Use MANAGER when MANAGER is already controlling the workflow and agents must report back.
-Do not route to MANAGER as a substitute for specialist work that an active target can complete.
+Use MANAGER for coordination, consolidation, user-facing choices, conflict resolution, or manager-owned final decisions.
+Use MANAGER when roles have been asked to report back there.
+Do not use MANAGER as a detour around specialist work.

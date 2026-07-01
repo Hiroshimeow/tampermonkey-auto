@@ -1,4 +1,4 @@
 [DECISION: FINISH]
-Use FINISH only when the full user goal is complete, verified, and no active role needs more work.
-Completion requires concrete evidence appropriate to the task.
-Do not use FINISH for partial progress, unverified claims, or unresolved blockers.
+Use FINISH only when the user's full goal is complete and verified.
+Completion needs evidence that fits the task.
+Do not use FINISH for partial progress, unresolved blockers, or claims that nobody checked.

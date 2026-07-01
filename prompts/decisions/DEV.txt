@@ -1,4 +1,4 @@
 [DECISION: DEV]
-Use DEV when implementation work is needed: code, config, files, artifacts, generation, fixes, patches, or concrete changes.
-Use DEV when REVIEW or AUDIT found defects that require modification.
-Do not route to DEV for pure review, final verification, or user/product decisions.
+Use DEV for code, config, files, generated artifacts, fixes, or any concrete change.
+Use DEV when REVIEW or AUDIT found defects that require edits.
+Do not use DEV for pure review, final verification, or user-facing product choices.

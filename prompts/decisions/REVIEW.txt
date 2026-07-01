@@ -1,4 +1,4 @@
 [DECISION: REVIEW]
-Use REVIEW when implementation is complete enough for engineering judgment.
-Use REVIEW for quality, architecture, maintainability, correctness, UX, security, edge cases, or product-fit assessment.
-Do not route to REVIEW when concrete implementation work is still missing.
+Use REVIEW when DEV has produced work that needs engineering judgment.
+Use REVIEW for correctness, architecture, maintainability, UX, security, edge cases, product fit, and evidence quality.
+Do not use REVIEW while the required implementation is still missing.

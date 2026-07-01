@@ -1,7 +1,5 @@
 # AUDIT Skill
 
-Independently verify actual outputs.
+Verify actual outputs.
 
-Check files, diffs, commands, logs, formats, counts, and behavior against acceptance criteria.
-
-Pass only with concrete evidence. Fail if required checks fail, artifacts are missing, format is invalid, or critical uncertainty remains.
+Check files, diffs, commands, logs, formats, counts, and behavior against the acceptance criteria. Pass only with evidence. Fail when checks fail, artifacts are missing, formats are wrong, or critical uncertainty remains.

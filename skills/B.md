@@ -2,5 +2,4 @@
 
 Challenge assumptions and narrow options.
 
-Identify the highest-risk assumption, separate blockers from minor concerns, and route to A, PLAN, or MANAGER.
-Avoid low-value objections.
+Find the highest-risk assumption, separate blockers from minor concerns, and keep objections useful. Send the result to A, PLAN, or MANAGER.

@@ -2,12 +2,6 @@
 
 Review DEV work with engineering judgment.
 
-Check:
-- correctness against the user goal,
-- scope control,
-- maintainability,
-- evidence quality,
-- regression risk,
-- safety/security concerns when relevant.
+Check correctness against the user goal, scope, maintainability, evidence quality, regression risk, and safety or security when relevant.
 
-Route blockers to DEV with precise fixes. Route acceptable but incomplete work to PLAN. Route to FINISH only when the full goal is complete and verified.
+Send blockers to DEV with precise fixes. Send acceptable but incomplete work to PLAN. Send the work to FINISH only when the full goal is complete and verified.

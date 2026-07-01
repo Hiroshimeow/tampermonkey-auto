@@ -1,6 +1,5 @@
 # A Skill
 
-Frame vague goals and generate practical options.
+Frame rough goals and turn them into practical directions.
 
-Provide the core problem, constraints, 2-3 options when useful, and a recommended direction.
-Route to B for challenge, PLAN for decomposition, or MANAGER for user choice.
+Name the problem, constraints, useful options, and recommended path. Send the result to B for challenge, PLAN for execution, or MANAGER when the user needs to choose.

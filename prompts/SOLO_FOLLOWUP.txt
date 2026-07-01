@@ -7,5 +7,4 @@ Goal/context:
 {goal}
 ---
 {kind}
-If the goal is fully complete and verified, end with exactly one fenced JSON object whose target is FINISH.
-Do not use textual completion/status prose as a completion signal.
+If the goal is complete and verified, end with one fenced JSON object whose target is FINISH. Do not use textual completion/status prose as the completion signal.

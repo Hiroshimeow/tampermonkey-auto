@@ -4,15 +4,33 @@ import json
 import re
 import time
 import urllib.error
+from dataclasses import dataclass
 import urllib.parse
 import urllib.request
 from typing import Any
 
 from apps.constants import (
+    DEFAULT_RESPONSE_ACTIVE_WAIT_BEFORE_RELOAD_S,
     DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
     DEFAULT_RESPONSE_RECOVERY_POLL_S,
     DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
 )
+
+
+@dataclass(frozen=True)
+class ResponseActivity:
+    response: str
+    stop_visible: bool
+    has_response: bool
+    changed: bool
+
+    @property
+    def active(self) -> bool:
+        return self.stop_visible
+
+    @property
+    def done(self) -> bool:
+        return bool(self.response) and not self.stop_visible
 
 
 class BridgeClient:
@@ -105,6 +123,70 @@ class BridgeClient:
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
+    @staticmethod
+    def response_activity(snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
+        dom_info = snapshot.get("dom_info") or {}
+        response = str(snapshot.get("last_response") or "").strip()
+        return ResponseActivity(
+            response=response,
+            stop_visible=bool(dom_info.get("stop_visible")),
+            has_response=bool(response),
+            changed=bool(response and response != previous_response),
+        )
+
+    def wait_for_current_response(
+        self,
+        role: str,
+        timeout_s: float,
+        active_wait_s: float = DEFAULT_RESPONSE_ACTIVE_WAIT_BEFORE_RELOAD_S,
+        page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
+        poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+    ) -> str:
+        deadline = time.time() + max(1.0, timeout_s)
+        cycle_started = time.time()
+        last_response = ""
+        last_logged_bucket = -1
+
+        while time.time() < deadline:
+            self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+            activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            last_response = activity.response or last_response
+
+            if activity.done:
+                return activity.response
+            if not activity.active:
+                if activity.has_response:
+                    return activity.response
+                return ""
+
+            elapsed_in_cycle = time.time() - cycle_started
+            bucket = int(elapsed_in_cycle // max(1.0, poll_s * 5))
+            if bucket != last_logged_bucket:
+                state = "streaming" if activity.changed else "active"
+                print(
+                    f"[response-watch] role={role} state={state} stop_visible=true "
+                    f"response_len={len(last_response)} elapsed={elapsed_in_cycle:.1f}s/{active_wait_s:.1f}s",
+                    flush=True,
+                )
+                last_logged_bucket = bucket
+
+            if elapsed_in_cycle >= max(0.0, active_wait_s):
+                print(
+                    f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page",
+                    flush=True,
+                )
+                self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
+                self.sleep(max(0.0, page_wait_s))
+                cycle_started = time.time()
+                last_logged_bucket = -1
+                continue
+
+            self.sleep(max(0.1, poll_s))
+
+        if last_response:
+            return last_response
+        raise RuntimeError(f"{role} response wait timed out; last_response_len={len(last_response)}")
+
     def recover_response_after_reload(
         self,
         role: str,
@@ -113,42 +195,13 @@ class BridgeClient:
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
     ) -> str:
-        print(f"[response-recovery] role={role} wait={reload_delay_s:.1f}s before deciding reload", flush=True)
-        self.sleep(max(0.0, reload_delay_s))
-        self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
-        pre_reload_snapshot = self.role_snapshot(role)
-        pre_reload_dom = pre_reload_snapshot.get("dom_info") or {}
-        pre_reload_response = str(pre_reload_snapshot.get("last_response") or "").strip()
-        if not pre_reload_dom.get("stop_visible"):
-            return pre_reload_response
-        print(f"[response-recovery] role={role} still responding after initial wait; reloading", flush=True)
-        self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
-        self.sleep(max(0.0, page_wait_s))
-
-        deadline = time.time() + max(1.0, timeout_s)
-        last_response = ""
-        stable_response = ""
-        stable_count = 0
-        while time.time() < deadline:
-            self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
-            snapshot = self.role_snapshot(role)
-            dom_info = snapshot.get("dom_info") or {}
-            last_response = str(snapshot.get("last_response") or "").strip()
-            if not dom_info.get("stop_visible") and last_response:
-                return last_response
-            if dom_info.get("stop_visible"):
-                print(f"[response-recovery] role={role} still responding; waiting", flush=True)
-                if last_response and last_response == stable_response:
-                    stable_count += 1
-                else:
-                    stable_response = last_response
-                    stable_count = 1 if last_response else 0
-                if stable_count >= 2 and stable_response:
-                    print(f"[response-recovery] role={role} accepting stable response while stop is still visible", flush=True)
-                    return stable_response
-            self.sleep(max(0.1, poll_s))
-
-        raise RuntimeError(f"{role} response recovery timed out; last_response_len={len(last_response)}")
+        return self.wait_for_current_response(
+            role,
+            timeout_s=timeout_s,
+            active_wait_s=reload_delay_s,
+            page_wait_s=page_wait_s,
+            poll_s=poll_s,
+        )
 
     def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
         return self.command_roundtrip(role, "NEW_CHAT", timeout_s)

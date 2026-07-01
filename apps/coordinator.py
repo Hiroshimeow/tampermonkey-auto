@@ -177,7 +177,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         if dom_info.get("stop_visible"):
             print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
             try:
-                response = self.client.recover_response_after_reload(browser_role, self.args.timeout)
+                response = self.client.wait_for_current_response(browser_role, self.args.timeout)
             except RuntimeError as exc:
                 print(f"[resume] could not recover current response for {prompt_role}/{browser_role}: {exc}", flush=True)
                 return ""

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+
+from apps.bridge import BridgeClient
 from apps.prompts import role_prompt_path, role_skill_path
 from main import Coordinator, FlowState, parse_args, parse_route
 
@@ -183,3 +186,55 @@ def test_unknown_single_role_continues_until_finish_when_response_has_no_route()
     assert result["approved_by"] == "ABCD"
     assert sent_instructions[0] == "Start from the user goal. Decide the first phase and route work to the right role(s)."
     assert "Continue working until the goal is fully achieved." in sent_instructions[1]
+
+
+class FakeBridge(BridgeClient):
+    def __init__(self, snapshots: list[dict]):
+        super().__init__("http://127.0.0.1:8500")
+        self.snapshots = list(snapshots)
+        self.commands: list[str] = []
+        self.sleeps: list[float] = []
+
+    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict:
+        self.commands.append(action)
+        return {"ok": True, "done": True, "status": f"{action}_DONE"}
+
+    def role_snapshot(self, role: str) -> dict:
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        time.sleep(min(max(seconds, 0.0), 0.01))
+
+
+def response_snapshot(text: str, stop_visible: bool) -> dict:
+    return {"last_response": text, "dom_info": {"stop_visible": stop_visible}}
+
+
+def test_wait_for_current_response_waits_until_stop_disappears_without_reload() -> None:
+    bridge = FakeBridge([
+        response_snapshot("partial", True),
+        response_snapshot("partial plus", True),
+        response_snapshot("final route", False),
+    ])
+
+    response = bridge.wait_for_current_response("REVIEW", timeout_s=2.0, active_wait_s=60.0, poll_s=0.01)
+
+    assert response == "final route"
+    assert "RELOAD_PAGE" not in bridge.commands
+    assert bridge.commands.count("SYNC_TRANSCRIPT") >= 3
+
+
+def test_wait_for_current_response_reloads_after_active_window_then_rechecks() -> None:
+    bridge = FakeBridge([
+        response_snapshot("partial", True),
+        response_snapshot("final route", False),
+    ])
+
+    response = bridge.wait_for_current_response("REVIEW", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
+
+    assert response == "final route"
+    assert "RELOAD_PAGE" in bridge.commands
+    assert 0.01 in bridge.sleeps

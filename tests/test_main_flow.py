@@ -144,6 +144,21 @@ def test_role_flag_configures_prompt_browser_and_start_roles() -> None:
     assert args.start_role == "A"
 
 
+def test_explicit_start_role_overrides_role_shortcut_first_role() -> None:
+    args = parse_args([
+        "--role",
+        "DEV,REVIEW,PLAN",
+        "--start-role",
+        "PLAN",
+        "--goal",
+        "finish the task",
+    ])
+
+    assert args.prompt_roles == "DEV,REVIEW,PLAN"
+    assert args.browser_roles == "DEV,REVIEW,PLAN"
+    assert args.start_role == "PLAN"
+
+
 def test_role_flag_dry_run_routes_through_configured_roles() -> None:
     args = parse_args(["--role", "A,B", "--dry-run", "--max-turns", "3", "--goal", "finish the task"])
     coordinator = Coordinator(args)

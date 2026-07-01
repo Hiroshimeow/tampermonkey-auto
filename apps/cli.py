@@ -48,7 +48,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preflight-timeout", type=float, default=20.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    args.start_role_explicit = any(item == "--start-role" or item.startswith("--start-role=") for item in raw_argv)
     apply_role_shortcut(args)
     return args
 
@@ -60,7 +62,8 @@ def apply_role_shortcut(args: argparse.Namespace) -> None:
     joined = ",".join(roles)
     args.prompt_roles = joined
     args.browser_roles = joined
-    args.start_role = roles[0]
+    if not getattr(args, "start_role_explicit", False):
+        args.start_role = roles[0]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,3 +82,4 @@ def main(argv: list[str] | None = None) -> int:
     print("\n=== FLOW RESULT ===")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") == "complete" else 2
+

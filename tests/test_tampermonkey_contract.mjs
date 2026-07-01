@@ -26,6 +26,9 @@ assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must 
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
 assert.match(source, /function hasManualComposerInput\(snapshot\)/, 'tampermonkey.js must centralize manual composer detection');
+assert.match(source, /function isRealComposerAttachment\(meta\)/, 'tampermonkey.js must filter composer controls out of attachment detection');
+assert.match(source, /composer-plus-btn/, 'composer attachment detection must ignore the Add files button');
+assert.match(source, /realComposerAttachmentCount\(snapshot\) > 0/, 'manual input detection must count only real composer attachments');
 assert.match(source, /manual_input_pending:/, 'domSnapshot must expose manual_input_pending');
 assert.match(source, /PASTE_BLOCKED_MANUAL_INPUT/, 'SET_PROMPT must refuse to overwrite manual composer input');
 assert.match(source, /if \(hasManualComposerInput\(snapshot\)\) \{[\s\S]*?MANUAL_INPUT_PENDING[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must not finish or overwrite while the user is steering or has attachments');

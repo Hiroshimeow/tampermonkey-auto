@@ -159,6 +159,36 @@ class BridgeClient:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _is_real_composer_attachment(meta: Any) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        label = " ".join(
+            str(meta.get(key) or "")
+            for key in ("label", "aria_label", "data_testid")
+        ).lower()
+        if not label:
+            return False
+        if "composer-plus-btn" in label or "add files and more" in label:
+            return False
+        return any(
+            marker in label
+            for marker in (
+                "remove file",
+                "open image",
+                "attached",
+                "file uploaded",
+                "uploading",
+                "remove attachment",
+            )
+        )
+
+    @classmethod
+    def _composer_attachment_count(cls, attachments: Any) -> int:
+        if not isinstance(attachments, list):
+            return 0
+        return sum(1 for meta in attachments if cls._is_real_composer_attachment(meta))
+
     @classmethod
     def response_activity(cls, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
         dom_info = snapshot.get("dom_info") or {}
@@ -176,7 +206,7 @@ class BridgeClient:
             composer_exists=bool(dom_info.get("composer")),
             composer_text_len=composer_text_len,
             composer_text=composer_text,
-            composer_attachment_count=len(attachments) if isinstance(attachments, list) else 0,
+            composer_attachment_count=cls._composer_attachment_count(attachments),
             send_enabled=dom_info.get("send_enabled") if isinstance(dom_info.get("send_enabled"), bool) else None,
             user_count=cls._int_value(counts.get("user")),
             assistant_count=cls._int_value(counts.get("assistant")),

@@ -314,3 +314,11 @@ def test_response_activity_classifiers_cover_ready_streaming_stuck_and_manual_at
     manual_attachment = bridge.response_activity(response_snapshot("old", False, attachments=[{"label": "remove file"}]))
     assert bridge.is_manual_input_pending(manual_attachment)
     assert not bridge.is_clean_ready(manual_attachment)
+
+    plus_button = bridge.response_activity(response_snapshot(
+        "old",
+        False,
+        attachments=[{"aria_label": "Add files and more", "data_testid": "composer-plus-btn"}],
+    ))
+    assert not bridge.is_manual_input_pending(plus_button)
+    assert bridge.is_clean_ready(plus_button)

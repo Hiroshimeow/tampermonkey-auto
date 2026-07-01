@@ -257,12 +257,31 @@
         return String(el.innerText || el.textContent || el.value || '').trim();
     }
 
+    function isRealComposerAttachment(meta) {
+        const label = `${meta && meta.label || ''} ${meta && meta.aria_label || ''} ${meta && meta.data_testid || ''}`.toLowerCase();
+        if (!label) {
+            return false;
+        }
+        if (label.includes('composer-plus-btn') || label.includes('add files and more')) {
+            return false;
+        }
+        return label.includes('remove file')
+            || label.includes('open image')
+            || label.includes('attached')
+            || label.includes('file uploaded')
+            || label.includes('uploading')
+            || label.includes('remove attachment');
+    }
+
+    function realComposerAttachmentCount(snapshot) {
+        return Array.isArray(snapshot && snapshot.composer_attachments)
+            ? snapshot.composer_attachments.filter((meta) => isRealComposerAttachment(meta)).length
+            : 0;
+    }
+
     function hasManualComposerInput(snapshot) {
         const textLen = Number(snapshot && snapshot.composer_text_len || 0);
-        const attachmentCount = Array.isArray(snapshot && snapshot.composer_attachments)
-            ? snapshot.composer_attachments.length
-            : 0;
-        return textLen > 0 || attachmentCount > 0;
+        return textLen > 0 || realComposerAttachmentCount(snapshot) > 0;
     }
 
     function clearComposerText(el) {
@@ -454,14 +473,7 @@
         const buttons = root && root.querySelectorAll
             ? Array.from(root.querySelectorAll('button,[role="button"]'))
             : [];
-        return buttons.map((button) => buttonMeta(button)).filter((meta) => {
-            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.toLowerCase();
-            return label.includes('open image')
-                || label.includes('remove file')
-                || label.includes('attached')
-                || label.includes('upload')
-                || label.includes('file');
-        });
+        return buttons.map((button) => buttonMeta(button)).filter((meta) => isRealComposerAttachment(meta));
     }
 
     function dismissUploadOverlays() {

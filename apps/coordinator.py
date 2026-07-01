@@ -195,9 +195,14 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         activity = self.client.response_activity(snapshot)
         response = activity.response
         if self.client.is_manual_input_pending(activity):
-            raise ManualInputPendingError(
-                f"{browser_role} composer has manual input; not parsing or replacing current page",
+            print(
+                f"[resume] role={browser_role} composer has manual input; waiting for the user to clear or send it",
+                flush=True,
             )
+            self.client.wait_until_clean_ready(browser_role, self.args.timeout)
+            snapshot = self.client.role_snapshot(browser_role)
+            activity = self.client.response_activity(snapshot)
+            response = activity.response
         if self.client.is_response_active(activity):
             print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
             try:

@@ -285,20 +285,38 @@ class BridgeClient:
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
     ) -> ResponseActivity:
         deadline = time.time() + max(1.0, timeout_s)
+        last_activity: ResponseActivity | None = None
+        last_logged_bucket = -1
         while time.time() < deadline:
             activity = self.response_activity(self.role_snapshot(role))
-            if self.is_manual_input_pending(activity):
-                raise ManualInputPendingError(
-                    f"{role} composer has manual input; not replacing it with an automated prompt",
-                )
+            last_activity = activity
             if self.is_clean_ready(activity):
                 return activity
+            remaining_s = max(0.0, deadline - time.time())
+            bucket = int(remaining_s // max(1.0, poll_s * 5))
+            if bucket != last_logged_bucket:
+                if self.is_manual_input_pending(activity):
+                    print(
+                        f"[ready-check] role={role} manual_input_pending=true "
+                        f"composer_len={activity.composer_text_len} attachments={activity.composer_attachment_count}; "
+                        "waiting for the user to clear or send it",
+                        flush=True,
+                    )
+                elif not activity.composer_exists:
+                    print(f"[ready-check] role={role} composer not found; waiting", flush=True)
+                elif self.is_response_active(activity):
+                    print(f"[ready-check] role={role} response active; waiting", flush=True)
+                else:
+                    print(f"[ready-check] role={role} not clean-ready; waiting", flush=True)
+                last_logged_bucket = bucket
             if self.is_response_active(activity):
                 self.wait_for_current_response(role, timeout_s=max(1.0, deadline - time.time()))
                 continue
-            if not activity.composer_exists:
-                print(f"[ready-check] role={role} composer not found; waiting", flush=True)
             self.sleep(max(0.1, poll_s))
+        if last_activity and self.is_manual_input_pending(last_activity):
+            raise ManualInputPendingError(
+                f"{role} composer still has manual input after waiting; not replacing it with an automated prompt",
+            )
         raise RuntimeError(f"{role} did not become clean-ready before timeout")
 
     def recover_response_after_reload(

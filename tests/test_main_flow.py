@@ -270,15 +270,33 @@ def test_wait_for_current_response_blocks_on_manual_composer_text_without_reload
     assert "RELOAD_PAGE" not in bridge.commands
 
 
-def test_call_browser_role_refuses_to_replace_manual_composer_text() -> None:
+def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_text_after_timeout() -> None:
     bridge = FakeBridge([
         response_snapshot("old response", False, composer_text="manual steer"),
     ])
 
     with pytest.raises(ManualInputPendingError):
-        bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=1.0)
+        bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=0.02)
 
     assert "SET_PROMPT" not in bridge.commands
+    assert bridge.sleeps
+
+
+def test_resume_waits_for_manual_input_to_clear_before_using_current_response() -> None:
+    args = parse_args(["--resume", "--goal", "finish the task", "--role", "A", "--timeout", "1"])
+    coordinator = Coordinator(args)
+    bridge = FakeBridge([
+        response_snapshot("old response", False, composer_text="manual steer"),
+        response_snapshot("old response", False, composer_text="manual steer"),
+        response_snapshot('Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: resumed response."}\n```', False),
+    ])
+    coordinator.client = bridge
+
+    response = coordinator.resume_existing_response("A", "A", turn=1)
+
+    assert "TASK COMPLETE" in response
+    assert "SET_PROMPT" not in bridge.commands
+    assert bridge.sleeps
 
 
 def test_response_activity_classifiers_cover_ready_streaming_stuck_and_manual_attachment() -> None:

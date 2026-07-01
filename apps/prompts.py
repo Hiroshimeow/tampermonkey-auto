@@ -64,26 +64,13 @@ def goal_only_prompt(goal: str) -> str:
     )
 
 
+
 def system_prompt(role: str, prompt_roles: list[str], finish_roles: set[str]) -> str:
-    sections = [load_text_file("AGENTS.md")]
-    handoff_guide = load_text_file("prompts/HANDOFF.md", required=False)
-    if handoff_guide:
-        sections.append(f"[HANDOFF GUIDE]\n{handoff_guide}")
     prompt_path = role_prompt_path(role)
     role_prompt = prompt_path.read_text(encoding="utf-8").strip() if prompt_path else ""
-    skill_path = role_skill_path(role)
-    role_skill = skill_path.read_text(encoding="utf-8").strip() if skill_path else ""
-    sections.append(f"[ROLE PROMPT: {role}]\n{role_prompt}")
-    if role_skill:
-        sections.append(f"[ROLE SKILL: {role}]\n{role_skill}")
-    sections.append(
-        "[RUNTIME ROUTE LIMITS]\n"
-        f"Available route roles: {', '.join(prompt_roles)}, FINISH.\n"
-        f"Finish authority roles: {', '.join(sorted(finish_roles))}.\n"
-        "Obey PROMPT_ROLE, not the browser/model role name."
-    )
-    return "\n\n".join(section.strip() for section in sections if section and section.strip())
-
+    if not role_prompt:
+        return ""
+    return f"[ROLE PROMPT: {role}]\n{role_prompt}"
 
 def route_contract(prompt_roles: list[str], finish_roles: set[str]) -> str:
     lines = [

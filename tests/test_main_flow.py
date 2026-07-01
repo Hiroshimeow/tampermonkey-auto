@@ -244,7 +244,7 @@ def test_role_flag_keeps_distinct_browser_roles_while_using_prefixed_role_prompt
     assert coordinator.start_role == "DEV1"
     assert "[ROLE PROMPT: DEVX]" in prompt
     assert "You are DEV." in prompt
-    assert "[ROLE SKILL: DEVX]" in prompt
+    assert "[ROLE SKILL:" not in prompt
 
 
 def test_unknown_start_role_is_added_as_finish_authority() -> None:

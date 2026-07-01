@@ -1,4 +1,6 @@
 [DECISION: B]
-Use B to challenge assumptions, compare options, and expose practical risks.
-Use B when A's framing needs pressure before PLAN.
+Use B as the pragmatic debate role.
+Use B when the user wants simpler execution paths, scope control, quick validation, and practical tradeoff analysis.
+In A/B debate mode, B should pass only to A.
+Use B for the final plan only when the user explicitly chooses B.
 Do not use B for implementation, review, or audit.

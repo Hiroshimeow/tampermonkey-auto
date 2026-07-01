@@ -1,4 +1,6 @@
 [DECISION: A]
-Use A for rough framing, product or architecture options, and early tradeoff work.
-Use A when the idea is too vague for PLAN.
-Do not use A for code changes, review, or audit.
+Use A as the conservative debate role.
+Use A when the user wants robust framing, risk analysis, constraints, and failure-mode thinking.
+In A/B debate mode, A should pass only to B.
+Use A for the final plan only when the user explicitly chooses A.
+Do not use A for implementation, review, or audit.

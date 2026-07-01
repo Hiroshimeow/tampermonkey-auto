@@ -191,15 +191,29 @@ def test_unknown_single_role_continues_until_finish_when_response_has_no_route()
 
 
 class FakeBridge(BridgeClient):
-    def __init__(self, snapshots: list[dict]):
+    def __init__(self, snapshots: list[dict], command_results: dict[str, list[dict]] | None = None):
         super().__init__("http://127.0.0.1:8500")
         self.snapshots = list(snapshots)
+        self.command_results = {key: list(value) for key, value in (command_results or {}).items()}
         self.commands: list[str] = []
         self.sleeps: list[float] = []
 
     def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict:
         self.commands.append(action)
         return {"ok": True, "done": True, "status": f"{action}_DONE"}
+
+    def run_command(self, role: str, action: str, payload: dict, timeout_s: float) -> dict:
+        self.commands.append(action)
+        queued = self.command_results.get(action) or []
+        if queued:
+            return queued.pop(0)
+        if action == "SET_PROMPT":
+            return {"done": True, "status": "PASTE_CONFIRMED"}
+        if action == "CLICK_SEND":
+            return {"done": True, "status": "SEND_ACCEPTED"}
+        if action == "WAIT_ASSISTANT_DONE":
+            return {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "final route"}}
+        return {"done": True, "status": f"{action}_DONE"}
 
     def role_snapshot(self, role: str) -> dict:
         if len(self.snapshots) > 1:
@@ -280,6 +294,41 @@ def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_te
 
     assert "SET_PROMPT" not in bridge.commands
     assert bridge.sleeps
+
+
+def test_call_browser_role_uses_response_that_finishes_while_waiting_to_send() -> None:
+    bridge = FakeBridge([
+        response_snapshot("old response", False, composer_text="queued prompt from interrupted run"),
+        response_snapshot("partial answer", True),
+        response_snapshot("final routed answer", False),
+    ])
+
+    response = bridge.call_browser_role("B", "new automated prompt", timeout_s=2.0)
+
+    assert response == "final routed answer"
+    assert "SET_PROMPT" not in bridge.commands
+    assert "CLICK_SEND" not in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
+def test_call_browser_role_recovers_when_click_send_fails_but_response_started() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("partial answer", True),
+            response_snapshot("final answer", False),
+        ],
+        command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
+    )
+
+    response = bridge.call_browser_role("B", "automated prompt", timeout_s=2.0)
+
+    assert response == "final answer"
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
 
 
 def test_resume_waits_for_manual_input_to_clear_before_using_current_response() -> None:

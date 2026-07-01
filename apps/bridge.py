@@ -92,9 +92,30 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        self.wait_until_clean_ready(browser_role, timeout_s)
+        before_ready = self.response_activity(self.role_snapshot(browser_role))
+        ready = self.wait_until_clean_ready(browser_role, timeout_s)
+        if ready.response and ready.response != before_ready.response:
+            print(
+                f"[ready-check] role={browser_role} response completed while waiting; using it without sending a new prompt",
+                flush=True,
+            )
+            return ready.response
+
         self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
-        self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+        before_send = self.response_activity(self.role_snapshot(browser_role))
+        try:
+            self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+        except RuntimeError as exc:
+            activity = self.response_activity(self.role_snapshot(browser_role), previous_response=before_send.response)
+            if self.is_response_active(activity) or activity.changed:
+                print(
+                    f"[send-recover] role={browser_role} {exc}; response activity detected, waiting for it",
+                    flush=True,
+                )
+                response = self.wait_for_current_response(browser_role, timeout_s)
+                if response:
+                    return response
+            raise
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
         status = str(final.get("status") or "")
         if status != "ASSISTANT_DONE":

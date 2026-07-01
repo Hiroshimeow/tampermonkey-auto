@@ -1396,6 +1396,20 @@
                 continue;
             }
 
+            if (snapshot.composer_text_len > 0) {
+                await report('MANUAL_INPUT_PENDING', command.command_id, {
+                    text: assistantText,
+                    result: {
+                        composer_text_len: snapshot.composer_text_len,
+                        assistant_len: assistantText.length,
+                        stop_visible: snapshot.stop_visible
+                    },
+                    dom_info: snapshot
+                });
+                await sleep(config.report_wait_every_ms);
+                continue;
+            }
+
             if (Date.now() - quietSince >= config.assistant_quiet_ms && hasFreshAssistantOutput) {
                 const synced = await syncTranscript('wait_assistant_done');
                 const finalSnapshot = synced ? synced.snapshot : snapshot;

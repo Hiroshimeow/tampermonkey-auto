@@ -25,6 +25,7 @@ assert.match(source, /acc\.images = \(acc\.images \|\| 0\) \+ item\.image_count;
 assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must persist accepted turn context');
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
+assert.match(source, /if \(snapshot\.composer_text_len > 0\) \{[\s\S]*?MANUAL_INPUT_PENDING[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must not finish or overwrite while the user is typing a steer');
 assert.match(source, /function handleNavigateNewChat\(command\)/, 'tampermonkey.js must implement new-chat navigation');
 assert.match(source, /action === 'NEW_CHAT' \|\| action === 'NAVIGATE_NEW'/, 'NEW_CHAT and NAVIGATE_NEW must be supported');
 assert.match(source, /window\.location\.assign\('\/'\)/, 'new-chat navigation must use the current tab to open ChatGPT root');

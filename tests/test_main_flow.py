@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 
-from apps.bridge import BridgeClient
+import pytest
+
+from apps.bridge import BridgeClient, ManualInputPendingError
 from apps.prompts import role_prompt_path, role_skill_path
 from main import Coordinator, FlowState, parse_args, parse_route
 
@@ -209,8 +211,15 @@ class FakeBridge(BridgeClient):
         time.sleep(min(max(seconds, 0.0), 0.01))
 
 
-def response_snapshot(text: str, stop_visible: bool) -> dict:
-    return {"last_response": text, "dom_info": {"stop_visible": stop_visible}}
+def response_snapshot(text: str, stop_visible: bool, composer_text: str = "") -> dict:
+    return {
+        "last_response": text,
+        "dom_info": {
+            "stop_visible": stop_visible,
+            "composer_text": composer_text,
+            "composer_text_len": len(composer_text),
+        },
+    }
 
 
 def test_wait_for_current_response_waits_until_stop_disappears_without_reload() -> None:
@@ -238,3 +247,25 @@ def test_wait_for_current_response_reloads_after_active_window_then_rechecks() -
     assert response == "final route"
     assert "RELOAD_PAGE" in bridge.commands
     assert 0.01 in bridge.sleeps
+
+
+def test_wait_for_current_response_blocks_on_manual_composer_text_without_reload() -> None:
+    bridge = FakeBridge([
+        response_snapshot("partial response", False, composer_text="manual steer"),
+    ])
+
+    with pytest.raises(ManualInputPendingError):
+        bridge.wait_for_current_response("REVIEW", timeout_s=0.02, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
+
+    assert "RELOAD_PAGE" not in bridge.commands
+
+
+def test_call_browser_role_refuses_to_replace_manual_composer_text() -> None:
+    bridge = FakeBridge([
+        response_snapshot("old response", False, composer_text="manual steer"),
+    ])
+
+    with pytest.raises(ManualInputPendingError):
+        bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=1.0)
+
+    assert "SET_PROMPT" not in bridge.commands

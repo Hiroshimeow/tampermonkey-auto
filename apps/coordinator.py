@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from apps.bridge import BridgeClient
+from apps.bridge import BridgeClient, ManualInputPendingError
 from apps.constants import DEFAULT_FINISH_ROLES
 from apps.dryrun import synthetic_response
 from apps.lifecycle import BrowserLifecycleMixin
@@ -88,12 +88,22 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         prompt = self.build_prompt(prompt_role, instruction, state, caller_role, include_system)
         print(f"\n=== TURN {turn} prompt_role={prompt_role} browser_role={browser_role} caller={caller_role} ===", flush=True)
         started = time.time()
-        response = self.resume_existing_response(prompt_role, browser_role, turn) or self.call_or_synthetic(
-            prompt_role,
-            browser_role,
-            prompt,
-            instruction,
-        )
+        try:
+            response = self.resume_existing_response(prompt_role, browser_role, turn) or self.call_or_synthetic(
+                prompt_role,
+                browser_role,
+                prompt,
+                instruction,
+            )
+        except ManualInputPendingError as exc:
+            self.finished = {
+                "status": "manual_input_pending",
+                "role": prompt_role,
+                "browser_role": browser_role,
+                "message": str(exc),
+            }
+            print(f"[manual-input] {exc}", flush=True)
+            return None
         elapsed = time.time() - started
         route = self.validate_route(prompt_role, parse_route(response))
         repaired = False
@@ -108,7 +118,17 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 caller_role,
                 include_system=prompt_role not in self.system_sent,
             )
-            response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
+            try:
+                response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
+            except ManualInputPendingError as exc:
+                self.finished = {
+                    "status": "manual_input_pending",
+                    "role": prompt_role,
+                    "browser_role": browser_role,
+                    "message": str(exc),
+                }
+                print(f"[manual-input] {exc}", flush=True)
+                return None
             route = self.validate_route(prompt_role, parse_route(response))
 
         if include_system or route.ok:
@@ -178,6 +198,8 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
             try:
                 response = self.client.wait_for_current_response(browser_role, self.args.timeout)
+            except ManualInputPendingError:
+                raise
             except RuntimeError as exc:
                 print(f"[resume] could not recover current response for {prompt_role}/{browser_role}: {exc}", flush=True)
                 return ""

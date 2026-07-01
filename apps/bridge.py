@@ -17,20 +17,30 @@ from apps.constants import (
 )
 
 
+class ManualInputPendingError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class ResponseActivity:
     response: str
     stop_visible: bool
     has_response: bool
     changed: bool
+    composer_text_len: int
+    composer_text: str
 
     @property
     def active(self) -> bool:
         return self.stop_visible
 
     @property
+    def manual_input_pending(self) -> bool:
+        return self.composer_text_len > 0 or bool(self.composer_text.strip())
+
+    @property
     def done(self) -> bool:
-        return bool(self.response) and not self.stop_visible
+        return bool(self.response) and not self.stop_visible and not self.manual_input_pending
 
 
 class BridgeClient:
@@ -64,6 +74,11 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
+        activity = self.response_activity(self.role_snapshot(browser_role))
+        if activity.manual_input_pending:
+            raise ManualInputPendingError(
+                f"{browser_role} composer has manual text; not replacing it with an automated prompt",
+            )
         self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
         self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
@@ -127,11 +142,18 @@ class BridgeClient:
     def response_activity(snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
         dom_info = snapshot.get("dom_info") or {}
         response = str(snapshot.get("last_response") or "").strip()
+        composer_text = str(dom_info.get("composer_text") or "")
+        try:
+            composer_text_len = int(dom_info.get("composer_text_len") or 0)
+        except (TypeError, ValueError):
+            composer_text_len = len(composer_text)
         return ResponseActivity(
             response=response,
             stop_visible=bool(dom_info.get("stop_visible")),
             has_response=bool(response),
             changed=bool(response and response != previous_response),
+            composer_text_len=composer_text_len,
+            composer_text=composer_text,
         )
 
     def wait_for_current_response(
@@ -146,11 +168,22 @@ class BridgeClient:
         cycle_started = time.time()
         last_response = ""
         last_logged_bucket = -1
+        last_activity: ResponseActivity | None = None
 
         while time.time() < deadline:
             self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
             activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            last_activity = activity
             last_response = activity.response or last_response
+
+            if activity.manual_input_pending:
+                print(
+                    f"[response-watch] role={role} manual_input_pending=true "
+                    f"composer_len={activity.composer_text_len}; waiting without send/reload",
+                    flush=True,
+                )
+                self.sleep(max(0.1, poll_s))
+                continue
 
             if activity.done:
                 return activity.response
@@ -183,6 +216,10 @@ class BridgeClient:
 
             self.sleep(max(0.1, poll_s))
 
+        if last_activity and last_activity.manual_input_pending:
+            raise ManualInputPendingError(
+                f"{role} composer still has manual text after waiting; not sending automated prompt",
+            )
         if last_response:
             return last_response
         raise RuntimeError(f"{role} response wait timed out; last_response_len={len(last_response)}")

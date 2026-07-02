@@ -98,14 +98,7 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        before_ready = self.response_activity(self.role_snapshot(browser_role))
-        ready = self.wait_until_clean_ready(browser_role, timeout_s)
-        if ready.response and ready.response != before_ready.response:
-            print(
-                f"[ready-check] role={browser_role} response completed while waiting; using it without sending a new prompt",
-                flush=True,
-            )
-            return ready.response
+        self.wait_until_clean_ready(browser_role, timeout_s)
 
         self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
         before_send = self.response_activity(self.role_snapshot(browser_role))
@@ -129,7 +122,14 @@ class BridgeClient:
                 return self.recover_response_after_reload(browser_role, timeout_s)
             raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
         result = final.get("result") or {}
-        return str(result.get("text") or "").strip()
+        response = str(result.get("text") or "").strip()
+        if self.looks_incomplete_response(response):
+            print(
+                f"[response-watch] role={browser_role} assistant_done text looks incomplete; syncing transcript again",
+                flush=True,
+            )
+            return self.wait_for_current_response(browser_role, timeout_s, require_response=True)
+        return response
 
     def _run_command(
         self,
@@ -280,6 +280,39 @@ class BridgeClient:
     def is_response_stuck(activity: ResponseActivity, elapsed_s: float, active_wait_s: float) -> bool:
         return activity.active and elapsed_s >= max(0.0, active_wait_s)
 
+    @staticmethod
+    def looks_incomplete_response(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return True
+        if value.count("```") % 2 == 1:
+            return True
+        without_language_label = re.sub(r"(?is)^json\s*", "", value).strip()
+        if re.match(r"(?is)^(?:json\s*)?\{\s*$", value):
+            return True
+        if without_language_label.startswith("{") or re.search(r"(?is)```json", value):
+            depth = 0
+            in_string = False
+            escape = False
+            for char in without_language_label:
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == "\\":
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}" and depth:
+                    depth -= 1
+            if depth > 0:
+                return True
+        return False
+
     def wait_for_current_response(
         self,
         role: str,
@@ -287,6 +320,7 @@ class BridgeClient:
         active_wait_s: float = DEFAULT_RESPONSE_ACTIVE_WAIT_BEFORE_RELOAD_S,
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+        require_response: bool = False,
     ) -> str:
         deadline = time.time() + max(1.0, timeout_s)
         cycle_started = time.time()
@@ -327,6 +361,14 @@ class BridgeClient:
                 last_logged_bucket = -1
                 continue
 
+            if activity.has_response and self.looks_incomplete_response(activity.response):
+                print(
+                    f"[response-watch] role={role} response looks incomplete len={activity.response_len}; waiting",
+                    flush=True,
+                )
+                self.sleep(max(0.1, poll_s))
+                continue
+
             if self.is_response_done(activity):
                 return activity.response
             if not self.is_response_active(activity):
@@ -339,6 +381,9 @@ class BridgeClient:
                     continue
                 if activity.has_response:
                     return activity.response
+                if require_response:
+                    self.sleep(max(0.1, poll_s))
+                    continue
                 return ""
 
             elapsed_in_cycle = time.time() - cycle_started
@@ -371,8 +416,12 @@ class BridgeClient:
             )
         if last_activity and self.is_response_active(last_activity):
             raise RuntimeError(f"{role} response still active after timeout; last_response_len={len(last_response)}")
-        if last_response:
+        if last_response and not self.looks_incomplete_response(last_response):
             return last_response
+        if last_response:
+            raise RuntimeError(f"{role} response wait timed out with incomplete response; last_response_len={len(last_response)}")
+        if require_response:
+            raise RuntimeError(f"{role} response wait timed out while waiting for recovered response")
         raise RuntimeError(f"{role} response wait timed out; last_response_len={len(last_response)}")
 
     def wait_until_clean_ready(

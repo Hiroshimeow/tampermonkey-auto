@@ -7,7 +7,6 @@ import time
 from typing import Any
 
 from apps.bridge import BridgeClient, ManualInputPendingError
-from apps.constants import DEFAULT_FINISH_ROLES
 from apps.dryrun import synthetic_response
 from apps.lifecycle import BrowserLifecycleMixin
 from apps.models import FlowState, Route, TurnResult
@@ -24,19 +23,16 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.prompt_roles = normalize_roles(args.prompt_roles)
         self.browser_roles = normalize_roles(args.browser_roles)
         self.finish_roles = set(normalize_roles(args.finish_roles))
-        configured_prompt_roles = list(self.prompt_roles)
         self.manager_role = normalize_role(args.manager_role)
-        self.start_role = normalize_role(args.start_role or self.manager_role)
-        if self.start_role and self.start_role not in self.prompt_roles:
-            self.prompt_roles.append(self.start_role)
-            if normalize_roles(args.finish_roles) == normalize_roles(DEFAULT_FINISH_ROLES):
-                self.finish_roles = {self.start_role}
-        if self.prompt_roles and not (self.finish_roles & set(self.prompt_roles)):
-            fallback_finish = "REVIEW" if "REVIEW" in self.prompt_roles else self.prompt_roles[-1]
-            self.finish_roles = {fallback_finish}
-        if self.start_role not in configured_prompt_roles and normalize_roles(args.finish_roles) == normalize_roles(DEFAULT_FINISH_ROLES):
-            self.finish_roles = {self.start_role}
-        self.max_turns = max(1, args.max_turns)
+        self.start_role = normalize_role(args.start_role)
+        self.manager_mode = self.manager_role in self.prompt_roles
+        if not self.prompt_roles:
+            raise RuntimeError("--role is required")
+        if not self.start_role or self.start_role not in self.prompt_roles:
+            raise RuntimeError(f"start role {self.start_role or '<empty>'} is not configured")
+        if not self.finish_roles or not (self.finish_roles & set(self.prompt_roles)):
+            raise RuntimeError("finish role is not configured")
+        self.max_turns = int(args.max_turns or 0)
         self.turn_count = 0
         self.system_sent: set[str] = set()
         self.browser_cursor = 0
@@ -45,6 +41,9 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.lock = threading.Lock()
         self.background_tasks: list[threading.Thread] = []
         self.reload_generation: dict[str, int] = {}
+
+    def has_turn_budget(self) -> bool:
+        return self.max_turns <= 0 or self.turn_count < self.max_turns
 
     def run(self, goal: str) -> dict[str, Any]:
         state = FlowState(goal=goal)
@@ -73,7 +72,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         follow_routes: bool = True,
     ) -> TurnResult | None:
         with self.lock:
-            if self.finished or self.turn_count >= self.max_turns:
+            if self.finished or not self.has_turn_budget():
                 return None
             self.turn_count += 1
             turn = self.turn_count
@@ -122,6 +121,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 state,
                 caller_role,
                 include_system=(not self.args.resume and prompt_role not in self.system_sent),
+                route_error=route.error,
             )
             try:
                 response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
@@ -243,7 +243,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         else:
             route_payload = json.dumps({caller_role: instruction}, ensure_ascii=False, indent=2)
             parts.append(f"ROUTED_MESSAGE_JSON:\n{route_payload}")
-        parts.append(route_contract(self.prompt_roles, self.finish_roles))
+        parts.append(route_contract(self.prompt_roles, self.finish_roles, self.manager_role))
         return "\n\n".join(parts)
 
     def build_format_repair_prompt(
@@ -253,19 +253,26 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         state: FlowState,
         caller_role: str,
         include_system: bool,
+        route_error: str = "",
     ) -> str:
-        contract = route_contract(self.prompt_roles, self.finish_roles)
+        contract = route_contract(self.prompt_roles, self.finish_roles, self.manager_role)
         if self.uses_goal_only_prompt(prompt_role):
             return goal_only_prompt(state.goal)
         if self.args.resume:
-            return contract
+            parts = []
+            if route_error:
+                parts.append(f"ROUTE_REPAIR_REQUIRED:\n{route_error}")
+            parts.append(contract)
+            return "\n\n".join(parts)
         parts = []
         if include_system:
             parts.append(system_prompt(prompt_role, self.prompt_roles, self.finish_roles))
             parts.append(f"PROMPT_ROLE: {prompt_role}")
             if caller_role != "USER":
                 parts.append(f"CALLER_ROLE: {caller_role}")
-            parts.append("Your previous response did not end with a valid route JSON object. Reply again using the route contract below.")
+            parts.append("Your previous response used an invalid route. Reply again using the route contract below.")
+            if route_error:
+                parts.append(f"ROUTE_ERROR:\n{route_error}")
             parts.append(f"GOAL:\n{state.goal}")
         parts.append(contract)
         return "\n\n".join(parts)

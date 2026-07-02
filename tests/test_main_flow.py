@@ -10,7 +10,7 @@ from main import Coordinator, FlowState, parse_args, parse_route
 
 
 def test_resume_prompt_does_not_include_system_prompt() -> None:
-    args = parse_args(["--resume", "--goal", "resume goal", "--prompt-roles", "A,B,C", "--start-role", "A"])
+    args = parse_args(["--resume", "--goal", "resume goal", "--role", "A,B,C"])
     coordinator = Coordinator(args)
     state = FlowState("resume goal")
 
@@ -34,8 +34,6 @@ def test_resume_format_repair_only_sends_route_contract() -> None:
         "resume goal",
         "--role",
         "A,B",
-        "--start-role",
-        "A",
         "--max-turns",
         "1",
     ])
@@ -60,7 +58,7 @@ def test_resume_format_repair_only_sends_route_contract() -> None:
 
 
 def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--start-role", "A", "--max-turns", "1"])
+    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--max-turns", "1"])
     coordinator = Coordinator(args)
     sent_prompts = []
 
@@ -85,7 +83,7 @@ def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send
 
 
 def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--start-role", "A"])
+    args = parse_args(["--goal", "finish the task", "--role", "A,B"])
     coordinator = Coordinator(args)
     state = FlowState("finish the task")
 
@@ -99,7 +97,7 @@ def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
 
 
 def test_each_role_gets_system_prompt_on_its_first_cycle_not_global_turn_one() -> None:
-    args = parse_args(["--goal", "multi role goal", "--prompt-roles", "A,B", "--start-role", "A"])
+    args = parse_args(["--goal", "multi role goal", "--role", "A,B"])
     coordinator = Coordinator(args)
     coordinator.system_sent.update({"A"})
     state = FlowState("multi role goal")
@@ -115,6 +113,26 @@ def test_each_role_gets_system_prompt_on_its_first_cycle_not_global_turn_one() -
     assert "[ROLE PROMPT: B]" in prompt
     assert "GOAL:\nmulti role goal" in prompt
     assert '"A": "B receives first routed message late"' in prompt
+
+
+def test_route_contract_requires_self_contained_handoff_values() -> None:
+    args = parse_args(["--goal", "finish the task", "--role", "DEV,REVIEW,PLAN"])
+    coordinator = Coordinator(args)
+    state = FlowState("finish the task")
+
+    prompt = coordinator.build_prompt(
+        "PLAN",
+        "Start from the user goal.",
+        state,
+        "USER",
+        include_system=coordinator.should_include_system("PLAN"),
+    )
+
+    assert "Browser roles do not share chat history" in prompt
+    assert "self-contained handoff strings" in prompt
+    assert "Never route vague values" in prompt
+    assert "FINISH authority: PLAN." in prompt
+    assert "Allowed route keys: DEV, REVIEW, PLAN, FINISH." in prompt
 
 
 def test_route_parser_accepts_full_copied_response_with_trailing_route_block() -> None:
@@ -144,19 +162,79 @@ def test_role_flag_configures_prompt_browser_and_start_roles() -> None:
     assert args.start_role == "A"
 
 
-def test_explicit_start_role_overrides_role_shortcut_first_role() -> None:
-    args = parse_args([
-        "--role",
-        "DEV,REVIEW,PLAN",
-        "--start-role",
-        "PLAN",
-        "--goal",
-        "finish the task",
-    ])
+def test_role_shortcut_starts_first_role_and_finishes_highest_precedence_role() -> None:
+    args = parse_args(["--role", "DEV,REVIEW,PLAN", "--goal", "finish the task"])
+    coordinator = Coordinator(args)
 
     assert args.prompt_roles == "DEV,REVIEW,PLAN"
     assert args.browser_roles == "DEV,REVIEW,PLAN"
-    assert args.start_role == "PLAN"
+    assert args.start_role == "DEV"
+    assert args.finish_roles == "PLAN"
+    assert coordinator.start_role == "DEV"
+    assert coordinator.finish_roles == {"PLAN"}
+
+
+def test_manager_mode_starts_first_role_and_finishes_manager() -> None:
+    args = parse_args(["--role", "DEV,MANAGER,REVIEW", "--goal", "finish the task"])
+    coordinator = Coordinator(args)
+
+    assert coordinator.start_role == "DEV"
+    assert coordinator.finish_roles == {"MANAGER"}
+    assert coordinator.manager_mode
+
+
+def test_resume_repair_requires_non_manager_route_to_manager() -> None:
+    args = parse_args(["--role", "DEV,MANAGER,REVIEW", "--resume", "--goal", "finish the task"])
+    coordinator = Coordinator(args)
+    state = FlowState("finish the task")
+    route = coordinator.validate_route("DEV", parse_route('```json\n{"REVIEW":"valid JSON but wrong manager-mode target"}\n```'))
+
+    prompt = coordinator.build_format_repair_prompt(
+        "DEV",
+        "bad route",
+        state,
+        "USER",
+        include_system=True,
+        route_error=route.error,
+    )
+
+    assert not route.ok
+    assert "must route exactly one result to MANAGER" in prompt
+    assert "MANAGER_MODE: MANAGER is active" in prompt
+    assert prompt.startswith("ROUTE_REPAIR_REQUIRED:")
+
+
+def test_plan_role_shortcut_dry_run_routes_through_dev_review_then_plan_finish() -> None:
+    args = parse_args(["--role", "DEV,REVIEW,PLAN", "--dry-run", "--goal", "finish the task"])
+    coordinator = Coordinator(args)
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "complete"
+    assert result["approved_by"] == "PLAN"
+    assert result["turns"] == 3
+
+
+def test_runtime_defaults_are_unlimited_and_reload_after_is_enabled() -> None:
+    args = parse_args(["--role", "DEV", "--goal", "finish the task"])
+    coordinator = Coordinator(args)
+
+    assert args.max_turns == 0
+    assert args.reload_after == 10.0
+    assert coordinator.max_turns == 0
+    coordinator.turn_count = 999
+    assert coordinator.has_turn_budget()
+
+    finite_args = parse_args(["--role", "DEV", "--goal", "finish the task", "--max-turns", "1", "--reload-after", "0"])
+    finite_coordinator = Coordinator(finite_args)
+    finite_coordinator.turn_count = 1
+    assert finite_args.reload_after == 0.0
+    assert not finite_coordinator.has_turn_budget()
+
+
+def test_missing_role_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--goal", "finish the task"])
 
 
 def test_role_flag_dry_run_routes_through_configured_roles() -> None:
@@ -172,9 +250,7 @@ def test_role_flag_dry_run_routes_through_configured_roles() -> None:
 def test_review_route_to_plan_uses_plan_browser_not_dev() -> None:
     args = parse_args([
         "--role",
-        "DEV,REVIEW,PLAN",
-        "--start-role",
-        "REVIEW",
+        "REVIEW,DEV,PLAN",
         "--finish-roles",
         "PLAN",
         "--max-turns",
@@ -204,9 +280,7 @@ def test_review_route_to_plan_uses_plan_browser_not_dev() -> None:
 def test_role_shortcut_does_not_cursor_fallback_to_dev_for_unmapped_route() -> None:
     args = parse_args([
         "--role",
-        "DEV,REVIEW,PLAN",
-        "--start-role",
-        "REVIEW",
+        "REVIEW,DEV,PLAN",
         "--max-turns",
         "2",
         "--goal",
@@ -255,7 +329,7 @@ def test_unknown_role_prompt_uses_goal_only_without_role_prompt() -> None:
 
 
 def test_numbered_role_uses_base_prompt_when_exact_prompt_is_missing() -> None:
-    args = parse_args(["--goal", "finish the task", "--start-role", "DEV1", "--prompt-roles", "DEV1", "--browser-roles", "DEV1"])
+    args = parse_args(["--goal", "finish the task", "--role", "DEV1"])
     coordinator = Coordinator(args)
     state = FlowState("finish the task")
 
@@ -300,14 +374,6 @@ def test_role_flag_keeps_distinct_browser_roles_while_using_prefixed_role_prompt
     assert "[ROLE PROMPT: DEVX]" in prompt
     assert "You are DEV." in prompt
     assert "[ROLE SKILL:" not in prompt
-
-
-def test_unknown_start_role_is_added_as_finish_authority() -> None:
-    args = parse_args(["--goal", "finish the task", "--start-role", "ABCD", "--browser-roles", "DEV"])
-    coordinator = Coordinator(args)
-
-    assert "ABCD" in coordinator.prompt_roles
-    assert coordinator.finish_roles == {"ABCD"}
 
 
 def test_unknown_single_role_continues_until_finish_when_response_has_no_route() -> None:
@@ -494,25 +560,65 @@ def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_te
     assert bridge.sleeps
 
 
-def test_call_browser_role_uses_response_that_finishes_while_waiting_to_send() -> None:
-    bridge = FakeBridge([
-        response_snapshot("old response", False, composer_text="queued prompt from interrupted run"),
-        response_snapshot("partial answer", True),
-        response_snapshot("final routed answer", False),
-    ])
+def test_call_browser_role_does_not_reuse_response_that_finishes_while_waiting_to_send() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False, composer_text="queued prompt from interrupted run"),
+            response_snapshot("partial answer", True),
+            response_snapshot("stale routed answer", False),
+        ],
+        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh routed answer"}}]},
+    )
 
     response = bridge.call_browser_role("B", "new automated prompt", timeout_s=2.0)
 
-    assert response == "final routed answer"
-    assert "SET_PROMPT" not in bridge.commands
-    assert "CLICK_SEND" not in bridge.commands
+    assert response == "fresh routed answer"
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
+def test_call_browser_role_waits_for_recovered_response_when_assistant_done_text_is_empty() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("", False),
+            response_snapshot('JSON\n{"DEV":"continue"}', False),
+        ],
+        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": ""}}]},
+    )
+
+    response = bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=2.0)
+
+    assert response == 'JSON\n{"DEV":"continue"}'
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
+def test_call_browser_role_resyncs_when_assistant_done_text_is_incomplete_json() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("JSON\n{", False),
+            response_snapshot('```json\n{"DEV":"continue"}\n```', False),
+        ],
+        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": "JSON\n{"}}]},
+    )
+
+    response = bridge.call_browser_role("PLAN", "automated prompt", timeout_s=2.0)
+
+    assert response == '```json\n{"DEV":"continue"}\n```'
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
     assert "SYNC_TRANSCRIPT" in bridge.commands
 
 
 def test_call_browser_role_recovers_when_click_send_fails_but_response_started() -> None:
     bridge = FakeBridge(
         [
-            response_snapshot("old response", False),
             response_snapshot("old response", False),
             response_snapshot("old response", False),
             response_snapshot("partial answer", True),

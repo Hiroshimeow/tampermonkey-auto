@@ -66,7 +66,7 @@ class RouteExecutorMixin:
                 self.reset_roles_for_handoff(targets, state)
             child_results = self.dispatch_parallel(targets, state, result.prompt_role, depth + 1)
             joined = format_child_results(result.prompt_role, child_results)
-            if result.prompt_role in self.prompt_roles and not self.finished and self.turn_count < self.max_turns:
+            if result.prompt_role in self.prompt_roles and not self.finished and self.has_turn_budget():
                 self.dispatch_role(result.prompt_role, joined, state, caller_role="PARALLEL_RESULTS", depth=depth)
         else:
             next_role, next_message = next(iter(targets.items()))
@@ -79,6 +79,8 @@ class RouteExecutorMixin:
     def should_continue_goal_only_role(self, route: Route, result: TurnResult) -> bool:
         if not self.uses_goal_only_prompt(result.prompt_role):
             return False
+        if route.targets:
+            return False
         return "FINISH" not in route.targets
 
     def validate_route(self, prompt_role: str, route: Route) -> Route:
@@ -90,9 +92,14 @@ class RouteExecutorMixin:
         if route.command and route.command != "none" and "FINISH" in route.targets:
             route.error = "command is not allowed with FINISH"
             return route
-        if route.is_parallel and self.manager_role in self.prompt_roles and prompt_role != self.manager_role:
+        if route.is_parallel and self.manager_mode and prompt_role != self.manager_role:
             route.error = "only MANAGER may route to multiple roles while MANAGER is active"
             return route
+        if self.manager_mode and prompt_role != self.manager_role:
+            target_roles = {role for role in route.targets if role != "FINISH"}
+            if target_roles != {self.manager_role}:
+                route.error = f"MANAGER mode is active; {prompt_role} must route exactly one result to {self.manager_role}"
+                return route
         return route
 
     def should_execute_handoff_command(

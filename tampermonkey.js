@@ -894,6 +894,51 @@
         });
     }
 
+    function jsonBraceDepth(text) {
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        for (const char of String(text || '')) {
+            if (inString) {
+                if (escape) {
+                    escape = false;
+                } else if (char === '\\') {
+                    escape = true;
+                } else if (char === '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (char === '"') {
+                inString = true;
+            } else if (char === '{') {
+                depth += 1;
+            } else if (char === '}' && depth > 0) {
+                depth -= 1;
+            }
+        }
+        return depth;
+    }
+
+    function looksIncompleteAssistantText(text) {
+        const value = String(text || '').trim();
+        if (!value) {
+            return true;
+        }
+        const fenceCount = (value.match(/```/g) || []).length;
+        if (fenceCount % 2 === 1) {
+            return true;
+        }
+        const withoutLanguageLabel = value.replace(/^json\s*/i, '').trim();
+        if (/^(?:json\s*)?\{\s*$/i.test(value)) {
+            return true;
+        }
+        if ((withoutLanguageLabel.startsWith('{') || /```json/i.test(value)) && jsonBraceDepth(withoutLanguageLabel) > 0) {
+            return true;
+        }
+        return false;
+    }
+
     function buildTurnContext(snapshot, commandId) {
         return {
             command_id: commandId || '',
@@ -1516,7 +1561,7 @@
                 const finalAssistantCount = (finalSnapshot.messages.counts.assistant || 0);
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if (finalHasFreshText || finalHasFreshTurn) {
+                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
                     await report('ASSISTANT_DONE', command.command_id, {
                         text: finalText,
                         result: {
@@ -1542,7 +1587,7 @@
                 const finalAssistantCount = finalSnapshot.messages.counts.assistant || 0;
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if (finalHasFreshText || finalHasFreshTurn) {
+                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
                     await report('ASSISTANT_DONE', command.command_id, {
                         text: finalText,
                         result: {

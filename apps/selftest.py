@@ -19,24 +19,24 @@ def run_self_test() -> int:
     bad_command = parse_route('```json\n{"DEV":"x","command":"wipe"}\n```')
     assert not bad_command.ok and "invalid command" in bad_command.error
 
-    args = parse_args(["--dry-run", "--max-turns", "10", "--goal", "self test goal"])
+    args = parse_args(["--role", "DEV,REVIEW,PLAN", "--dry-run", "--max-turns", "10", "--goal", "self test goal"])
     result = Coordinator(args).run("self test goal")
     assert result["status"] == "complete", result
 
-    parallel_args = parse_args(["--dry-run", "--max-turns", "10", "--goal", "parallel self test"])
+    parallel_args = parse_args(["--role", "MANAGER,DEV,REVIEW", "--dry-run", "--max-turns", "10", "--goal", "parallel self test"])
     parallel_coord = Coordinator(parallel_args)
     parallel_state = FlowState("parallel self test")
     parallel_coord.dispatch_role("MANAGER", "parallel dry run", parallel_state, "USER", 0)
     assert parallel_coord.finished and parallel_coord.finished["status"] == "complete", parallel_coord.finished
     assert any(item.caller_role == "PARALLEL_RESULTS" for item in parallel_state.results), parallel_state.results
 
-    handoff_args = parse_args(["--dry-run", "--max-turns", "2", "--handoff-command-policy", "always", "--goal", "handoff self test"])
+    handoff_args = parse_args(["--role", "MANAGER,DEV", "--dry-run", "--max-turns", "2", "--handoff-command-policy", "always", "--goal", "handoff self test"])
     handoff_coord = Coordinator(handoff_args)
     handoff_state = FlowState("handoff self test")
     handoff_coord.dispatch_role("MANAGER", "handoff dry run", handoff_state, "USER", 0)
     assert handoff_state.phase == 2, handoff_state.phase
 
-    forced_args = parse_args(["--dry-run", "--plan-dev-handoff-every", "2", "--goal", "forced plan handoff"])
+    forced_args = parse_args(["--role", "PLAN,DEV", "--dry-run", "--plan-dev-handoff-every", "2", "--goal", "forced plan handoff"])
     forced_coord = Coordinator(forced_args)
     forced_state = FlowState("forced plan handoff")
     dummy_route = Route(targets={"DEV": "x"})
@@ -47,17 +47,22 @@ def run_self_test() -> int:
     assert forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"DEV": "x"})
     assert not forced_coord.should_force_plan_dev_handoff("PLAN", forced_state, {"REVIEW": "x"})
 
-    reload_off_args = parse_args(["--dry-run", "--goal", "reload off"])
-    reload_off_coord = Coordinator(reload_off_args)
     reload_result = TurnResult(1, "PLAN", "PLAN", "USER", "i", "r", Route(targets={"DEV": "x"}), 0.0)
+    reload_default_args = parse_args(["--role", "PLAN,DEV", "--dry-run", "--goal", "reload default"])
+    reload_default_coord = Coordinator(reload_default_args)
+    assert reload_default_args.reload_after == 10.0
+    assert reload_default_coord.should_reload_previous_role_after_route(reload_result, {"DEV": "x"})
+
+    reload_off_args = parse_args(["--role", "PLAN,DEV", "--dry-run", "--reload-after", "0", "--goal", "reload off"])
+    reload_off_coord = Coordinator(reload_off_args)
     assert not reload_off_coord.should_reload_previous_role_after_route(reload_result, {"DEV": "x"})
 
-    reload_on_args = parse_args(["--dry-run", "--reload-after", "--goal", "reload on"])
+    reload_on_args = parse_args(["--role", "PLAN,DEV", "--dry-run", "--reload-after", "--goal", "reload on"])
     reload_on_coord = Coordinator(reload_on_args)
-    assert reload_on_args.reload_after == 5.0
+    assert reload_on_args.reload_after == 10.0
     assert reload_on_coord.should_reload_previous_role_after_route(reload_result, {"DEV": "x"})
     assert not reload_on_coord.should_reload_previous_role_after_route(reload_result, {"PLAN": "x"})
-    reload_after_2_args = parse_args(["--dry-run", "--reload-after", "2", "--goal", "reload after 2"])
+    reload_after_2_args = parse_args(["--role", "PLAN,DEV", "--dry-run", "--reload-after", "2", "--goal", "reload after 2"])
     assert reload_after_2_args.reload_after == 2.0
 
     _assert_response_recovery_without_reload()
@@ -77,7 +82,7 @@ def _assert_response_recovery_without_reload() -> None:
             self.actions = []
             self.sleeps = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": False}, "last_response": "final response"},
+                {"dom_info": {"stop_visible": False, "composer": True}, "last_response": "final response"},
             ]
 
         def sleep(self, seconds: float) -> None:
@@ -103,8 +108,8 @@ def _assert_response_recovery_with_reload() -> None:
             self.actions = []
             self.sleeps = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
-                {"dom_info": {"stop_visible": False}, "last_response": "final response"},
+                {"dom_info": {"stop_visible": True, "composer": True}, "last_response": "old response"},
+                {"dom_info": {"stop_visible": False, "composer": True}, "last_response": "final response"},
             ]
 
         def sleep(self, seconds: float) -> None:
@@ -132,8 +137,8 @@ def _assert_soft_stuck_recovery() -> None:
             self.actions = []
             self.sleeps = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": True}, "last_response": "stable response"},
-                {"dom_info": {"stop_visible": False}, "last_response": "stable response"},
+                {"dom_info": {"stop_visible": True, "composer": True}, "last_response": "stable response"},
+                {"dom_info": {"stop_visible": False, "composer": True}, "last_response": "stable response"},
             ]
 
         def sleep(self, seconds: float) -> None:
@@ -160,7 +165,7 @@ def _assert_reload_race_cancel() -> None:
             self.actions.append((role, action, timeout_s))
             return {"ok": True, "status": "PAGE_RELOADING", "done": True}
 
-    race_args = parse_args(["--reload-after", "--goal", "reload cancel"])
+    race_args = parse_args(["--role", "PLAN,DEV", "--reload-after", "--goal", "reload cancel"])
     race_coord = Coordinator(race_args)
     race_client = ReloadRaceClient()
     race_coord.client = race_client
@@ -180,8 +185,8 @@ def _assert_resume_existing_response() -> None:
             self.called_browser = False
             self.actions = []
             self.snapshots = [
-                {"dom_info": {"stop_visible": True}, "last_response": "old response"},
-                {"dom_info": {"stop_visible": False}, "last_response": '```json\n{"REVIEW":"review existing DEV output"}\n```'},
+                {"dom_info": {"stop_visible": True, "composer": True}, "last_response": "old response"},
+                {"dom_info": {"stop_visible": False, "composer": True}, "last_response": '```json\n{"REVIEW":"review existing DEV output"}\n```'},
             ]
 
         def sleep(self, seconds: float) -> None:
@@ -198,7 +203,7 @@ def _assert_resume_existing_response() -> None:
             self.called_browser = True
             return '```json\n{"PLAN":"should not be used"}\n```'
 
-    resume_args = parse_args(["--resume", "--goal", "resume existing response"])
+    resume_args = parse_args(["--role", "DEV,REVIEW", "--resume", "--goal", "resume existing response"])
     resume_coord = Coordinator(resume_args)
     resume_client = ResumeClient()
     resume_coord.client = resume_client
@@ -210,7 +215,7 @@ def _assert_resume_existing_response() -> None:
 
 
 def _assert_route_prompt_payload() -> None:
-    route_prompt_args = parse_args(["--goal", "route payload only"])
+    route_prompt_args = parse_args(["--role", "DEV,REVIEW", "--goal", "route payload only"])
     route_prompt_coord = Coordinator(route_prompt_args)
     route_prompt_state = FlowState("route payload only")
     routed_prompt = route_prompt_coord.build_prompt(

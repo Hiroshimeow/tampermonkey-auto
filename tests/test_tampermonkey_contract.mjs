@@ -25,6 +25,8 @@ assert.match(source, /acc\.images = \(acc\.images \|\| 0\) \+ item\.image_count;
 assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must persist accepted turn context');
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
+assert.match(source, /function looksIncompleteAssistantText\(text\)/, 'WAIT_ASSISTANT_DONE must detect partial JSON/code block text');
+assert.match(source, /!looksIncompleteAssistantText\(finalText\)/, 'WAIT_ASSISTANT_DONE must not report done for incomplete final text');
 assert.match(source, /function hasManualComposerInput\(snapshot\)/, 'tampermonkey.js must centralize manual composer detection');
 assert.match(source, /function isRealComposerAttachment\(meta\)/, 'tampermonkey.js must filter composer controls out of attachment detection');
 assert.match(source, /composer-plus-btn/, 'composer attachment detection must ignore the Add files button');

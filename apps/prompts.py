@@ -72,28 +72,35 @@ def system_prompt(role: str, prompt_roles: list[str], finish_roles: set[str]) ->
         return ""
     return f"[ROLE PROMPT: {role}]\n{role_prompt}"
 
-def route_contract(prompt_roles: list[str], finish_roles: set[str]) -> str:
+def route_contract(prompt_roles: list[str], finish_roles: set[str], manager_role: str = "MANAGER") -> str:
     lines = [
         "ROUTE_JSON_CONTRACT:",
         "End your response with exactly one fenced JSON object and nothing after it.",
-        "The JSON object is a route map, not target/message format.",
-        "Valid shape:",
-        "```json",
-        "{",
-        '  "ROLE1": "message to ROLE1, no length limit",',
-        '  "ROLE2": "message to ROLE2, no length limit"',
-        "}",
-        "```",
-        f"Allowed route keys: {', '.join(prompt_roles)}, FINISH.",
-        "Reserved metadata key: command.",
-        "Allowed command values: none, handoff. Missing command means none.",
-        "Use command=handoff to request a reset/new-chat before the routed role receives the message. Runtime policy decides whether the request is executed.",
-        "Include a HANDOFF: block when using command=handoff.",
-        "Use multiple role keys only for independent parallel work. When MANAGER is active, only MANAGER may use multiple route keys.",
-        f"Use FINISH only if your PROMPT_ROLE is one of: {', '.join(sorted(finish_roles))}. If MANAGER is not active, runtime may choose a fallback finish role from active roles.",
-        "Do not use keys named target, reason, message.",
-        "Do not combine FINISH with any role key or command.",
-        "Do not put JSON arrays at the top level.",
-        "The value for each route key must be a non-empty string.",
+        "JSON is a route map: keys are roles, values are self-contained handoff strings.",
+        "Browser roles do not share chat history. Never route vague values like 'continue', 'phase 2', or 'review this'.",
+        "Each route value must include needed context: path/branch if known, objective, current state, exact next action, criteria, checks, blockers.",
+        "If using `.plan/`, route values must name exact handoff file paths. Receivers read only named files; never scan `.plan/` or infer latest.",
     ]
+    if manager_role in prompt_roles:
+        lines.append(
+            f"MANAGER_MODE: {manager_role} is active. If your PROMPT_ROLE is not {manager_role}, route exactly one result to {manager_role}.",
+        )
+    lines.extend(
+        [
+            "Valid shape:",
+            "```json",
+            "{",
+            '  "ROLE": "Self-contained handoff: context, state, next action, criteria, checks"',
+            "}",
+            "```",
+            f"Allowed route keys: {', '.join(prompt_roles)}, FINISH.",
+            f"FINISH authority: {', '.join(sorted(finish_roles))}.",
+            "Use FINISH only when the original goal is complete and verified.",
+            "Do not combine FINISH with role keys or command.",
+            "Only MANAGER may route to multiple roles when MANAGER is active.",
+            "Reserved metadata key: command. Allowed values: none, handoff. Missing means none.",
+            "Use command=handoff only with a HANDOFF: block when the next role needs a reset/new chat.",
+            "Do not use keys named target, reason, message. Do not put JSON arrays at the top level.",
+        ],
+    )
     return "\n".join(lines)

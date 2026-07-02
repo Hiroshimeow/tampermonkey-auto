@@ -174,13 +174,15 @@ def test_main_outputs_json_for_missing_prompt(capsys) -> None:
     assert payload["error"] == {"type": "Error", "message": "--prompt or stdin prompt text is required"}
 
 
-def test_main_json_escapes_unicode_response(monkeypatch, capsys) -> None:
+def test_main_json_outputs_utf8_unicode_response(monkeypatch, capsys) -> None:
+    expected = "\u0111\u00e3 x\u1eed l\u00fd l\u1ed7i"
+
     class FakeClient:
         def __init__(self, base_url: str, request_timeout: float) -> None:
             pass
 
         def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
-            return "đã xử lý lỗi"
+            return expected
 
     monkeypatch.setattr(role, "BridgeClient", FakeClient)
 
@@ -189,5 +191,5 @@ def test_main_json_escapes_unicode_response(monkeypatch, capsys) -> None:
     payload = stdout_json(captured.out)
 
     assert code == 0
-    assert "\\u" in captured.out
-    assert payload["data"]["response"] == "đã xử lý lỗi"
+    assert "\\u" not in captured.out
+    assert payload["data"]["response"] == expected

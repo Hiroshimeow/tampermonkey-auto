@@ -141,7 +141,19 @@ def result_payload(
 
 
 def emit_json(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    try:
+        stdout_buffer = getattr(sys.stdout, "buffer", None)
+        if stdout_buffer is not None:
+            stdout_buffer.write(line.encode("utf-8"))
+            stdout_buffer.flush()
+            return
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        fallback = json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+        sys.stdout.write(fallback)
+        sys.stdout.flush()
 
 def main(argv: list[str] | None = None) -> int:
     configure_stdio_utf8()

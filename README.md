@@ -170,7 +170,7 @@ Notes:
 - stdout is exactly one JSON object.
 - `data.response` is the full assistant response.
 - `summary` is a short preview for logs.
-- JSON uses `ensure_ascii=True` to avoid Windows codepage failures when responses contain Unicode.
+- JSON is written as UTF-8 directly to stdout to avoid Windows codepage failures without expanding Unicode into `\\u....` escapes.
 - Bridge and recovery logs go to stderr.
 
 Exit codes:

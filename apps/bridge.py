@@ -31,6 +31,8 @@ class ResponseActivity:
     composer_text_len: int
     composer_text: str
     composer_attachment_count: int
+    choice_prompt_pending: bool
+    choice_prompt_labels: tuple[str, ...]
     send_enabled: bool | None
     user_count: int
     assistant_count: int
@@ -57,8 +59,12 @@ class ResponseActivity:
         return self.composer_exists and not self.active and not self.manual_input_pending
 
     @property
+    def blocked_by_choice_prompt(self) -> bool:
+        return not self.composer_exists and self.choice_prompt_pending
+
+    @property
     def done(self) -> bool:
-        return bool(self.response) and not self.stop_visible and not self.manual_input_pending
+        return bool(self.response) and self.composer_exists and not self.stop_visible and not self.manual_input_pending
 
 
 class BridgeClient:
@@ -219,6 +225,20 @@ class BridgeClient:
         composer_text = str(dom_info.get("composer_text") or "")
         composer_text_len = cls._int_value(dom_info.get("composer_text_len"), len(composer_text))
         attachments = dom_info.get("composer_attachments") or []
+        choice_candidates = dom_info.get("choice_prompt_candidates") or []
+        choice_labels = tuple(
+            label
+            for label in (
+                str(
+                    (item.get("label") if isinstance(item, dict) else "")
+                    or ((item.get("meta") or {}).get("label") if isinstance(item, dict) and isinstance(item.get("meta"), dict) else "")
+                    or ((item.get("meta") or {}).get("aria_label") if isinstance(item, dict) and isinstance(item.get("meta"), dict) else "")
+                    or ""
+                ).strip()
+                for item in choice_candidates
+            )
+            if label
+        )
         return ResponseActivity(
             response=response,
             stop_visible=bool(dom_info.get("stop_visible")),
@@ -228,6 +248,8 @@ class BridgeClient:
             composer_text_len=composer_text_len,
             composer_text=composer_text,
             composer_attachment_count=cls._composer_attachment_count(attachments),
+            choice_prompt_pending=bool(dom_info.get("choice_prompt_pending")) or bool(choice_labels),
+            choice_prompt_labels=choice_labels,
             send_enabled=dom_info.get("send_enabled") if isinstance(dom_info.get("send_enabled"), bool) else None,
             user_count=cls._int_value(counts.get("user")),
             assistant_count=cls._int_value(counts.get("assistant")),
@@ -288,9 +310,33 @@ class BridgeClient:
                 self.sleep(max(0.1, poll_s))
                 continue
 
+            if activity.blocked_by_choice_prompt:
+                labels = ", ".join(activity.choice_prompt_labels[:5]) or "unknown"
+                print(
+                    f"[response-watch] role={role} choice prompt pending labels={labels}; clicking safe choice",
+                    flush=True,
+                )
+                result = self.command_roundtrip(role, "CLICK_CHOICE_PROMPT", timeout_s=20.0)
+                status = str(result.get("status") or "")
+                if status != "CHOICE_PROMPT_CLICKED":
+                    raise RuntimeError(
+                        f"{role} choice prompt blocked response recovery and could not be resolved: "
+                        f"status={status or 'timeout'} labels={labels}",
+                    )
+                self.sleep(max(0.5, poll_s))
+                last_logged_bucket = -1
+                continue
+
             if self.is_response_done(activity):
                 return activity.response
             if not self.is_response_active(activity):
+                if activity.has_response and not activity.composer_exists:
+                    print(
+                        f"[response-watch] role={role} response present but composer not ready after reload; waiting",
+                        flush=True,
+                    )
+                    self.sleep(max(0.1, poll_s))
+                    continue
                 if activity.has_response:
                     return activity.response
                 return ""
@@ -343,6 +389,22 @@ class BridgeClient:
             last_activity = activity
             if self.is_clean_ready(activity):
                 return activity
+            if activity.blocked_by_choice_prompt:
+                labels = ", ".join(activity.choice_prompt_labels[:5]) or "unknown"
+                print(
+                    f"[ready-check] role={role} choice prompt pending labels={labels}; clicking safe choice",
+                    flush=True,
+                )
+                result = self.command_roundtrip(role, "CLICK_CHOICE_PROMPT", timeout_s=20.0)
+                status = str(result.get("status") or "")
+                if status != "CHOICE_PROMPT_CLICKED":
+                    raise RuntimeError(
+                        f"{role} choice prompt blocked composer and could not be resolved: "
+                        f"status={status or 'timeout'} labels={labels}",
+                    )
+                self.sleep(max(0.5, poll_s))
+                last_logged_bucket = -1
+                continue
             remaining_s = max(0.0, deadline - time.time())
             bucket = int(remaining_s // max(1.0, poll_s * 5))
             if bucket != last_logged_bucket:
@@ -354,7 +416,9 @@ class BridgeClient:
                         flush=True,
                     )
                 elif not activity.composer_exists:
-                    print(f"[ready-check] role={role} composer not found; waiting", flush=True)
+                    labels = ", ".join(activity.choice_prompt_labels[:5])
+                    suffix = f" choice_labels={labels}" if labels else ""
+                    print(f"[ready-check] role={role} composer not found; waiting{suffix}", flush=True)
                 elif self.is_response_active(activity):
                     print(f"[ready-check] role={role} response active; waiting", flush=True)
                 else:

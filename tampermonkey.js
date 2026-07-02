@@ -562,6 +562,65 @@
         }).sort((a, b) => b.total - a.total);
     }
 
+    function choicePromptCandidates() {
+        const positiveMarkers = [
+            'continue',
+            'proceed',
+            'start',
+            'yes',
+            'ok',
+            'okay',
+            'accept',
+            'approve',
+            'allow',
+            'run',
+            'go ahead',
+            'make a plan',
+            'create plan',
+            'use plan'
+        ];
+        const negativeMarkers = [
+            'cancel',
+            'stop',
+            'not now',
+            'no thanks',
+            'dismiss',
+            'close',
+            'delete',
+            'remove',
+            'archive',
+            'share',
+            'copy'
+        ];
+        return Array.from(document.querySelectorAll('button,[role="button"]')).map((button) => {
+            const meta = buttonMeta(button);
+            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.trim();
+            const lower = label.toLowerCase();
+            const positive = positiveMarkers.some((marker) => lower.includes(marker));
+            const negative = negativeMarkers.some((marker) => lower.includes(marker));
+            return {
+                element: button,
+                meta,
+                label,
+                path: domPath(button),
+                positive,
+                negative,
+                clickable: isVisible(button) && !isDisabled(button)
+            };
+        }).filter((item) => item.label && item.clickable && item.positive && !item.negative).slice(0, 12);
+    }
+
+    function choicePromptSummary() {
+        return choicePromptCandidates().map((item) => ({
+            meta: item.meta,
+            label: item.label,
+            path: item.path,
+            positive: item.positive,
+            negative: item.negative,
+            clickable: item.clickable
+        }));
+    }
+
     function isClickableSendButton(button) {
         return !!button && !isDisabled(button) && isVisible(button);
     }
@@ -784,6 +843,7 @@
             scores: item.scores,
             total: item.total
         }));
+        const choicePrompts = composer ? [] : choicePromptSummary();
 
         return {
             composer: !!composer,
@@ -794,6 +854,8 @@
             composer_root_path: composerRoot ? domPath(composerRoot) : '',
             composer_buttons: composerButtons,
             composer_attachments: composerAttachments,
+            choice_prompt_pending: choicePrompts.length > 0,
+            choice_prompt_candidates: choicePrompts,
             file_inputs: visibleFileInputs().map((item) => ({
                 accept: item.accept,
                 multiple: item.multiple,
@@ -1678,6 +1740,41 @@
         }, config.reload_after_timeout_ms);
     }
 
+    async function handleClickChoicePrompt(command) {
+        const candidates = choicePromptCandidates();
+        const before = domSnapshot();
+        if (!candidates.length) {
+            await report('CHOICE_PROMPT_NOT_FOUND', command.command_id, {
+                result: {
+                    reason: 'no_safe_choice'
+                },
+                dom_info: before
+            });
+            return;
+        }
+
+        const choice = candidates[0];
+        try {
+            choice.element.click();
+            await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
+            await report('CHOICE_PROMPT_CLICKED', command.command_id, {
+                result: {
+                    label: choice.label,
+                    path: choice.path
+                },
+                dom_info: domSnapshot()
+            });
+        } catch (error) {
+            await report('CHOICE_PROMPT_CLICK_FAILED', command.command_id, {
+                result: {
+                    label: choice.label,
+                    reason: String(error && error.message || error)
+                },
+                dom_info: domSnapshot()
+            });
+        }
+    }
+
     async function executeCommand(command) {
         const action = String(command.action || 'WAIT');
         activeCommandId = command.command_id || '';
@@ -1704,6 +1801,8 @@
             await handleWaitAssistantDone(command);
         } else if (action === 'SYNC_TRANSCRIPT') {
             await handleSyncTranscript(command);
+        } else if (action === 'CLICK_CHOICE_PROMPT') {
+            await handleClickChoicePrompt(command);
         } else if (action === 'SET_ROLE') {
             await handleSetOrTakeoverRole(command, false);
         } else if (action === 'TAKEOVER_ROLE' || action === 'PHYSICAL_TAKEOVER_ROLE') {

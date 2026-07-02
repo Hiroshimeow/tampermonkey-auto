@@ -169,6 +169,61 @@ def test_role_flag_dry_run_routes_through_configured_roles() -> None:
     assert result["approved_by"] == "B"
 
 
+def test_review_route_to_plan_uses_plan_browser_not_dev() -> None:
+    args = parse_args([
+        "--role",
+        "DEV,REVIEW,PLAN",
+        "--start-role",
+        "REVIEW",
+        "--finish-roles",
+        "PLAN",
+        "--max-turns",
+        "2",
+        "--goal",
+        "finish the task",
+    ])
+    coordinator = Coordinator(args)
+    calls = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        calls.append((prompt_role, browser_role, prompt))
+        if prompt_role == "REVIEW":
+            return 'Reviewed.\n```json\n{"PLAN":"REVIEW PASS for latest DEV pass; no blocker."}\n```'
+        return 'Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: PLAN received REVIEW handoff."}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "complete"
+    assert [(role, browser) for role, browser, _prompt in calls] == [("REVIEW", "REVIEW"), ("PLAN", "PLAN")]
+    assert "PROMPT_ROLE: PLAN" in calls[1][2]
+    assert "CALLER_ROLE: REVIEW" in calls[1][2]
+
+
+def test_role_shortcut_does_not_cursor_fallback_to_dev_for_unmapped_route() -> None:
+    args = parse_args([
+        "--role",
+        "DEV,REVIEW,PLAN",
+        "--start-role",
+        "REVIEW",
+        "--max-turns",
+        "2",
+        "--goal",
+        "finish the task",
+    ])
+    args.browser_roles = "DEV,REVIEW"
+    coordinator = Coordinator(args)
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        return 'Reviewed.\n```json\n{"PLAN":"Send to PLAN, not DEV."}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+
+    with pytest.raises(RuntimeError, match="no browser role is available for PLAN"):
+        coordinator.run("finish the task")
+
+
 def test_single_unknown_role_flag_runs_as_goal_only_finish_role() -> None:
     args = parse_args(["--role", "ABCD", "--goal", "finish the task"])
     coordinator = Coordinator(args)
@@ -286,6 +341,8 @@ class FakeBridge(BridgeClient):
 
     def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict:
         self.commands.append(action)
+        if action == "CLICK_CHOICE_PROMPT":
+            return {"ok": True, "done": True, "status": "CHOICE_PROMPT_CLICKED"}
         return {"ok": True, "done": True, "status": f"{action}_DONE"}
 
     def run_command(self, role: str, action: str, payload: dict, timeout_s: float) -> dict:
@@ -317,6 +374,7 @@ def response_snapshot(
     composer_text: str = "",
     attachments: list | None = None,
     composer: bool = True,
+    choice_candidates: list | None = None,
 ) -> dict:
     return {
         "last_response": text,
@@ -326,10 +384,38 @@ def response_snapshot(
             "composer_text": composer_text,
             "composer_text_len": len(composer_text),
             "composer_attachments": attachments or [],
+            "choice_prompt_pending": bool(choice_candidates),
+            "choice_prompt_candidates": choice_candidates or [],
             "send_enabled": bool(composer_text),
             "messages": {"counts": {"user": 1, "assistant": 1, "images": 0}},
         },
     }
+
+
+def test_wait_until_clean_ready_clicks_choice_prompt_when_composer_missing() -> None:
+    bridge = FakeBridge([
+        response_snapshot("old", False, composer=False, choice_candidates=[{"label": "Continue"}]),
+        response_snapshot("old", False),
+    ])
+
+    activity = bridge.wait_until_clean_ready("DEV", timeout_s=2.0, poll_s=0.01)
+
+    assert activity.clean_ready
+    assert "CLICK_CHOICE_PROMPT" in bridge.commands
+
+
+def test_response_activity_reports_choice_prompt_labels() -> None:
+    bridge = BridgeClient("http://127.0.0.1:8500")
+
+    activity = bridge.response_activity(response_snapshot(
+        "old",
+        False,
+        composer=False,
+        choice_candidates=[{"meta": {"aria_label": "Continue"}}],
+    ))
+
+    assert activity.blocked_by_choice_prompt
+    assert activity.choice_prompt_labels == ("Continue",)
 
 
 def test_wait_for_current_response_waits_until_stop_disappears_without_reload() -> None:
@@ -357,6 +443,32 @@ def test_wait_for_current_response_reloads_after_active_window_then_rechecks() -
     assert response == "final route"
     assert "RELOAD_PAGE" in bridge.commands
     assert 0.01 in bridge.sleeps
+
+
+def test_wait_for_current_response_does_not_return_until_composer_recovers_after_reload() -> None:
+    bridge = FakeBridge([
+        response_snapshot("partial", True),
+        response_snapshot("stale incomplete", False, composer=False),
+        response_snapshot("final route", False),
+    ])
+
+    response = bridge.wait_for_current_response("DEV", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
+
+    assert response == "final route"
+    assert "RELOAD_PAGE" in bridge.commands
+
+
+def test_wait_for_current_response_clicks_choice_prompt_after_reload_before_returning() -> None:
+    bridge = FakeBridge([
+        response_snapshot("partial", True),
+        response_snapshot("stale incomplete", False, composer=False, choice_candidates=[{"label": "Continue"}]),
+        response_snapshot("final route", False),
+    ])
+
+    response = bridge.wait_for_current_response("DEV", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
+
+    assert response == "final route"
+    assert "CLICK_CHOICE_PROMPT" in bridge.commands
 
 
 def test_wait_for_current_response_blocks_on_manual_composer_text_without_reload() -> None:

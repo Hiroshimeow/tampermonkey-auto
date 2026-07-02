@@ -49,6 +49,11 @@ assert.match(source, /new DragEvent\(eventName/, 'file upload must support drag/
 assert.match(source, /querySelectorAll\('input\[type="file"\]'\)/, 'file upload must support file-input fallback');
 assert.match(source, /action === 'UPLOAD_FILE' \|\| action === 'UPLOAD_FILES' \|\| action === 'PASTE_IMAGE' \|\| action === 'PASTE_FILES'/, 'upload command aliases must be routed');
 assert.match(source, /composer_attachments:/, 'domSnapshot must expose composer attachment metadata');
+assert.match(source, /function choicePromptCandidates\(\)/, 'bridge must detect safe ChatGPT choice prompts when composer is hidden');
+assert.match(source, /choice_prompt_pending:/, 'domSnapshot must expose choice prompt blocking state');
+assert.match(source, /choice_prompt_candidates:/, 'domSnapshot must expose safe choice prompt candidates');
+assert.match(source, /action === 'CLICK_CHOICE_PROMPT'/, 'bridge must support clicking safe choice prompts');
+assert.match(source, /CHOICE_PROMPT_CLICKED/, 'choice prompt click command must report success');
 
 assert.match(source, /function dismissUploadOverlays\(\)/, 'upload flow must detect and dismiss stale upload overlays');
 assert.match(source, /already uploaded this file/, 'upload overlay cleanup must handle duplicate-file modal');

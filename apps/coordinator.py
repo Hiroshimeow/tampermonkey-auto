@@ -81,7 +81,10 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         if prompt_role == "FINISH":
             return None
         if prompt_role not in self.prompt_roles:
-            prompt_role = self.manager_role
+            raise RuntimeError(
+                f"route target role {prompt_role} is not configured; "
+                f"allowed roles: {', '.join(self.prompt_roles)}",
+            )
         browser_role = self.pick_browser_role(prompt_role)
         self.cancel_pending_reload(browser_role)
         include_system = self.should_include_system(prompt_role)
@@ -164,6 +167,12 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             return prompt_role
         if not self.browser_roles:
             raise RuntimeError("no browser roles configured")
+        if getattr(self.args, "role", ""):
+            raise RuntimeError(
+                f"--role requested strict role tabs, but no browser role is available for {prompt_role}; "
+                f"browser roles: {', '.join(self.browser_roles)}. "
+                "Use --role-map LOGICAL=PHYSICAL for shared browser tabs.",
+            )
         role = self.browser_roles[self.browser_cursor % len(self.browser_roles)]
         self.browser_cursor += 1
         return role

@@ -20,7 +20,7 @@ class RouteExecutorMixin:
             return result
 
         if not route.ok:
-            if result.prompt_role != self.manager_role:
+            if result.prompt_role != self.manager_role and self.manager_role in self.prompt_roles:
                 self.dispatch_role(
                     self.manager_role,
                     f"{result.prompt_role} failed to return valid route JSON. Decide recovery. Raw response:\n{result.response}",
@@ -42,6 +42,8 @@ class RouteExecutorMixin:
                     "last_response": result.response,
                 }
                 print(f"[finish] approved_by={result.prompt_role}", flush=True)
+                return result
+            if self.manager_role not in self.prompt_roles:
                 return result
             self.dispatch_role(
                 self.manager_role,
@@ -68,6 +70,7 @@ class RouteExecutorMixin:
                 self.dispatch_role(result.prompt_role, joined, state, caller_role="PARALLEL_RESULTS", depth=depth)
         else:
             next_role, next_message = next(iter(targets.items()))
+            print(f"[dispatch] {result.prompt_role} -> {next_role}", flush=True)
             if execute_handoff or self.should_new_chat(state, next_role):
                 self.reset_roles_for_handoff([next_role], state)
             self.dispatch_role(next_role, next_message, state, caller_role=result.prompt_role, depth=depth + 1)

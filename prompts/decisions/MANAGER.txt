@@ -1,0 +1,4 @@
+[DECISION: MANAGER]
+Use MANAGER for coordination, consolidation, user-facing choices, conflict resolution, or manager-owned final decisions.
+Use MANAGER when roles have been asked to report back there.
+Do not use MANAGER as a detour around specialist work.

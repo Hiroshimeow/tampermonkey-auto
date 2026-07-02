@@ -15,7 +15,7 @@ Do not inject every prompt or every skill into every role.
 For each logical role, inject only:
 
 1. this file: `AGENTS.md`,
-2. `HANDOFF.md`,
+2. `prompts/HANDOFF.md`,
 3. the role prompt listed below,
 4. the role skill listed below,
 5. the current goal/state/handoff from the caller.
@@ -97,7 +97,7 @@ Do not intentionally create duplicate role tabs. Ask `MANAGER` for reset, handof
 
 ## Handoff and Reset
 
-All roles can read `HANDOFF.md`. Use it when context is large, a phase is complete, the next role needs a clean session, or the current chat is drifting.
+All roles can read `prompts/HANDOFF.md`. Use it when context is large, a phase is complete, the next role needs a clean session, or the current chat is drifting.
 
 A role requests reset/new-chat by including both:
 

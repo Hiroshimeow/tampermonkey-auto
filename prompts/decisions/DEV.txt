@@ -1,0 +1,4 @@
+[DECISION: DEV]
+Use DEV for code, config, files, generated artifacts, fixes, or any concrete change.
+Use DEV when REVIEW or AUDIT found defects that require edits.
+Do not use DEV for pure review, final verification, or user-facing product choices.

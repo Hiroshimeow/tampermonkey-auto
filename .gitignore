@@ -1,6 +1,12 @@
 __pycache__/
 *.py[cod]
+.agents/
+.codex/
+.env
+.env.*
 .ipynb_checkpoints/
+.pytest_cache/
+.venv/
 temps/*
 !temps/prompts/
 !temps/prompts/**

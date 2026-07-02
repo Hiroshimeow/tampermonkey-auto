@@ -257,6 +257,33 @@
         return String(el.innerText || el.textContent || el.value || '').trim();
     }
 
+    function isRealComposerAttachment(meta) {
+        const label = `${meta && meta.label || ''} ${meta && meta.aria_label || ''} ${meta && meta.data_testid || ''}`.toLowerCase();
+        if (!label) {
+            return false;
+        }
+        if (label.includes('composer-plus-btn') || label.includes('add files and more')) {
+            return false;
+        }
+        return label.includes('remove file')
+            || label.includes('open image')
+            || label.includes('attached')
+            || label.includes('file uploaded')
+            || label.includes('uploading')
+            || label.includes('remove attachment');
+    }
+
+    function realComposerAttachmentCount(snapshot) {
+        return Array.isArray(snapshot && snapshot.composer_attachments)
+            ? snapshot.composer_attachments.filter((meta) => isRealComposerAttachment(meta)).length
+            : 0;
+    }
+
+    function hasManualComposerInput(snapshot) {
+        const textLen = Number(snapshot && snapshot.composer_text_len || 0);
+        return textLen > 0 || realComposerAttachmentCount(snapshot) > 0;
+    }
+
     function clearComposerText(el) {
         if (!el) {
             return;
@@ -446,14 +473,7 @@
         const buttons = root && root.querySelectorAll
             ? Array.from(root.querySelectorAll('button,[role="button"]'))
             : [];
-        return buttons.map((button) => buttonMeta(button)).filter((meta) => {
-            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.toLowerCase();
-            return label.includes('open image')
-                || label.includes('remove file')
-                || label.includes('attached')
-                || label.includes('upload')
-                || label.includes('file');
-        });
+        return buttons.map((button) => buttonMeta(button)).filter((meta) => isRealComposerAttachment(meta));
     }
 
     function dismissUploadOverlays() {
@@ -540,6 +560,65 @@
                 total
             };
         }).sort((a, b) => b.total - a.total);
+    }
+
+    function choicePromptCandidates() {
+        const positiveMarkers = [
+            'continue',
+            'proceed',
+            'start',
+            'yes',
+            'ok',
+            'okay',
+            'accept',
+            'approve',
+            'allow',
+            'run',
+            'go ahead',
+            'make a plan',
+            'create plan',
+            'use plan'
+        ];
+        const negativeMarkers = [
+            'cancel',
+            'stop',
+            'not now',
+            'no thanks',
+            'dismiss',
+            'close',
+            'delete',
+            'remove',
+            'archive',
+            'share',
+            'copy'
+        ];
+        return Array.from(document.querySelectorAll('button,[role="button"]')).map((button) => {
+            const meta = buttonMeta(button);
+            const label = `${meta.label || ''} ${meta.aria_label || ''} ${meta.data_testid || ''}`.trim();
+            const lower = label.toLowerCase();
+            const positive = positiveMarkers.some((marker) => lower.includes(marker));
+            const negative = negativeMarkers.some((marker) => lower.includes(marker));
+            return {
+                element: button,
+                meta,
+                label,
+                path: domPath(button),
+                positive,
+                negative,
+                clickable: isVisible(button) && !isDisabled(button)
+            };
+        }).filter((item) => item.label && item.clickable && item.positive && !item.negative).slice(0, 12);
+    }
+
+    function choicePromptSummary() {
+        return choicePromptCandidates().map((item) => ({
+            meta: item.meta,
+            label: item.label,
+            path: item.path,
+            positive: item.positive,
+            negative: item.negative,
+            clickable: item.clickable
+        }));
     }
 
     function isClickableSendButton(button) {
@@ -752,6 +831,8 @@
         const stopButton = stopElement();
         const messages = messageSummary();
         const composerRoot = closestComposerRoot();
+        const composerText = textOf(composer);
+        const composerAttachments = composerAttachmentSummary();
         const composerButtons = scopedSendButtonCandidates().slice(0, 12).map((item) => ({
             meta: item.meta,
             scores: item.scores,
@@ -762,15 +843,19 @@
             scores: item.scores,
             total: item.total
         }));
+        const choicePrompts = composer ? [] : choicePromptSummary();
 
         return {
             composer: !!composer,
-            composer_text: textOf(composer),
-            composer_text_len: textOf(composer).length,
+            composer_text: composerText,
+            composer_text_len: composerText.length,
+            manual_input_pending: hasManualComposerInput({ composer_text_len: composerText.length, composer_attachments: composerAttachments }),
             composer_path: composer ? domPath(composer) : '',
             composer_root_path: composerRoot ? domPath(composerRoot) : '',
             composer_buttons: composerButtons,
-            composer_attachments: composerAttachmentSummary(),
+            composer_attachments: composerAttachments,
+            choice_prompt_pending: choicePrompts.length > 0,
+            choice_prompt_candidates: choicePrompts,
             file_inputs: visibleFileInputs().map((item) => ({
                 accept: item.accept,
                 multiple: item.multiple,
@@ -807,6 +892,51 @@
             length: message.length || 0,
             text: message.text || ''
         });
+    }
+
+    function jsonBraceDepth(text) {
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        for (const char of String(text || '')) {
+            if (inString) {
+                if (escape) {
+                    escape = false;
+                } else if (char === '\\') {
+                    escape = true;
+                } else if (char === '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (char === '"') {
+                inString = true;
+            } else if (char === '{') {
+                depth += 1;
+            } else if (char === '}' && depth > 0) {
+                depth -= 1;
+            }
+        }
+        return depth;
+    }
+
+    function looksIncompleteAssistantText(text) {
+        const value = String(text || '').trim();
+        if (!value) {
+            return true;
+        }
+        const fenceCount = (value.match(/```/g) || []).length;
+        if (fenceCount % 2 === 1) {
+            return true;
+        }
+        const withoutLanguageLabel = value.replace(/^json\s*/i, '').trim();
+        if (/^(?:json\s*)?\{\s*$/i.test(value)) {
+            return true;
+        }
+        if ((withoutLanguageLabel.startsWith('{') || /```json/i.test(value)) && jsonBraceDepth(withoutLanguageLabel) > 0) {
+            return true;
+        }
+        return false;
     }
 
     function buildTurnContext(snapshot, commandId) {
@@ -1029,6 +1159,19 @@
         const method = String(payload.method || 'auto');
         const snapshotBefore = domSnapshot();
         const composer = composerElement();
+        if (hasManualComposerInput(snapshotBefore) && !payload.force_replace) {
+            await report('PASTE_BLOCKED_MANUAL_INPUT', command.command_id, {
+                text: snapshotBefore.composer_text,
+                result: {
+                    reason: 'manual_input_pending',
+                    requested_text_len: text.length,
+                    before_len: snapshotBefore.composer_text_len,
+                    attachment_count: (snapshotBefore.composer_attachments || []).length
+                },
+                dom_info: snapshotBefore
+            });
+            return;
+        }
         await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
         const ok = setComposerText(composer, text, method);
         const snapshotAfter = domSnapshot();
@@ -1396,6 +1539,21 @@
                 continue;
             }
 
+            if (hasManualComposerInput(snapshot)) {
+                await report('MANUAL_INPUT_PENDING', command.command_id, {
+                    text: assistantText,
+                    result: {
+                        composer_text_len: snapshot.composer_text_len,
+                        attachment_count: (snapshot.composer_attachments || []).length,
+                        assistant_len: assistantText.length,
+                        stop_visible: snapshot.stop_visible
+                    },
+                    dom_info: snapshot
+                });
+                await sleep(config.report_wait_every_ms);
+                continue;
+            }
+
             if (Date.now() - quietSince >= config.assistant_quiet_ms && hasFreshAssistantOutput) {
                 const synced = await syncTranscript('wait_assistant_done');
                 const finalSnapshot = synced ? synced.snapshot : snapshot;
@@ -1403,7 +1561,7 @@
                 const finalAssistantCount = (finalSnapshot.messages.counts.assistant || 0);
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if (finalHasFreshText || finalHasFreshTurn) {
+                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
                     await report('ASSISTANT_DONE', command.command_id, {
                         text: finalText,
                         result: {
@@ -1429,7 +1587,7 @@
                 const finalAssistantCount = finalSnapshot.messages.counts.assistant || 0;
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if (finalHasFreshText || finalHasFreshTurn) {
+                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
                     await report('ASSISTANT_DONE', command.command_id, {
                         text: finalText,
                         result: {
@@ -1627,6 +1785,41 @@
         }, config.reload_after_timeout_ms);
     }
 
+    async function handleClickChoicePrompt(command) {
+        const candidates = choicePromptCandidates();
+        const before = domSnapshot();
+        if (!candidates.length) {
+            await report('CHOICE_PROMPT_NOT_FOUND', command.command_id, {
+                result: {
+                    reason: 'no_safe_choice'
+                },
+                dom_info: before
+            });
+            return;
+        }
+
+        const choice = candidates[0];
+        try {
+            choice.element.click();
+            await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
+            await report('CHOICE_PROMPT_CLICKED', command.command_id, {
+                result: {
+                    label: choice.label,
+                    path: choice.path
+                },
+                dom_info: domSnapshot()
+            });
+        } catch (error) {
+            await report('CHOICE_PROMPT_CLICK_FAILED', command.command_id, {
+                result: {
+                    label: choice.label,
+                    reason: String(error && error.message || error)
+                },
+                dom_info: domSnapshot()
+            });
+        }
+    }
+
     async function executeCommand(command) {
         const action = String(command.action || 'WAIT');
         activeCommandId = command.command_id || '';
@@ -1653,6 +1846,8 @@
             await handleWaitAssistantDone(command);
         } else if (action === 'SYNC_TRANSCRIPT') {
             await handleSyncTranscript(command);
+        } else if (action === 'CLICK_CHOICE_PROMPT') {
+            await handleClickChoicePrompt(command);
         } else if (action === 'SET_ROLE') {
             await handleSetOrTakeoverRole(command, false);
         } else if (action === 'TAKEOVER_ROLE' || action === 'PHYSICAL_TAKEOVER_ROLE') {

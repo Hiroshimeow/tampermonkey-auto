@@ -25,6 +25,15 @@ assert.match(source, /acc\.images = \(acc\.images \|\| 0\) \+ item\.image_count;
 assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must persist accepted turn context');
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
+assert.match(source, /function looksIncompleteAssistantText\(text\)/, 'WAIT_ASSISTANT_DONE must detect partial JSON/code block text');
+assert.match(source, /!looksIncompleteAssistantText\(finalText\)/, 'WAIT_ASSISTANT_DONE must not report done for incomplete final text');
+assert.match(source, /function hasManualComposerInput\(snapshot\)/, 'tampermonkey.js must centralize manual composer detection');
+assert.match(source, /function isRealComposerAttachment\(meta\)/, 'tampermonkey.js must filter composer controls out of attachment detection');
+assert.match(source, /composer-plus-btn/, 'composer attachment detection must ignore the Add files button');
+assert.match(source, /realComposerAttachmentCount\(snapshot\) > 0/, 'manual input detection must count only real composer attachments');
+assert.match(source, /manual_input_pending:/, 'domSnapshot must expose manual_input_pending');
+assert.match(source, /PASTE_BLOCKED_MANUAL_INPUT/, 'SET_PROMPT must refuse to overwrite manual composer input');
+assert.match(source, /if \(hasManualComposerInput\(snapshot\)\) \{[\s\S]*?MANUAL_INPUT_PENDING[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must not finish or overwrite while the user is steering or has attachments');
 assert.match(source, /function handleNavigateNewChat\(command\)/, 'tampermonkey.js must implement new-chat navigation');
 assert.match(source, /action === 'NEW_CHAT' \|\| action === 'NAVIGATE_NEW'/, 'NEW_CHAT and NAVIGATE_NEW must be supported');
 assert.match(source, /window\.location\.assign\('\/'\)/, 'new-chat navigation must use the current tab to open ChatGPT root');
@@ -42,6 +51,11 @@ assert.match(source, /new DragEvent\(eventName/, 'file upload must support drag/
 assert.match(source, /querySelectorAll\('input\[type="file"\]'\)/, 'file upload must support file-input fallback');
 assert.match(source, /action === 'UPLOAD_FILE' \|\| action === 'UPLOAD_FILES' \|\| action === 'PASTE_IMAGE' \|\| action === 'PASTE_FILES'/, 'upload command aliases must be routed');
 assert.match(source, /composer_attachments:/, 'domSnapshot must expose composer attachment metadata');
+assert.match(source, /function choicePromptCandidates\(\)/, 'bridge must detect safe ChatGPT choice prompts when composer is hidden');
+assert.match(source, /choice_prompt_pending:/, 'domSnapshot must expose choice prompt blocking state');
+assert.match(source, /choice_prompt_candidates:/, 'domSnapshot must expose safe choice prompt candidates');
+assert.match(source, /action === 'CLICK_CHOICE_PROMPT'/, 'bridge must support clicking safe choice prompts');
+assert.match(source, /CHOICE_PROMPT_CLICKED/, 'choice prompt click command must report success');
 
 assert.match(source, /function dismissUploadOverlays\(\)/, 'upload flow must detect and dismiss stale upload overlays');
 assert.match(source, /already uploaded this file/, 'upload overlay cleanup must handle duplicate-file modal');

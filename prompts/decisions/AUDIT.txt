@@ -1,0 +1,4 @@
+[DECISION: AUDIT]
+Use AUDIT to verify files, outputs, formats, logs, counts, tests, or artifacts directly.
+Use AUDIT after REVIEW passes or when claims need a reality check.
+Do not use AUDIT when implementation or review is still missing.

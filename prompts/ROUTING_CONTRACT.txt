@@ -1,0 +1,17 @@
+ROUTING CONTRACT:
+
+Every workflow response ends with exactly one fenced JSON object and nothing after it.
+
+Valid shape example:
+{"ROLE":"message to ROLE"}
+
+With a handoff request:
+{"ROLE":"message to ROLE","command":"handoff"}
+
+main.py injects the allowed route keys at runtime.
+Reserved metadata key: command.
+Allowed command values: none, handoff.
+Route values must be non-empty strings.
+
+Use route names as keys.
+Do not use target, reason, or message wrapper keys.

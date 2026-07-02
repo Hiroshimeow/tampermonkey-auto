@@ -1,266 +1,275 @@
-﻿# Browser Agent Runners
+# Tampermonkey Auto Role Runner
 
-Repo nay co 3 entrypoint chinh:
+This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript.
 
-- `server.py`: backend API cho Tampermonkey/browser bridge.
-- `agents.py`: runner chinh cho solo, multi-agent, va MANAGER-first team flow.
-- `solo.py`: wrapper gon cho single-agent loop.
-- `run.ipynb`: notebook chuan de chay va audit tung block.
+It has two common entrypoints:
 
-## SOLO
+- `main.py`: multi-role coordination with route JSON.
+- `role.py`: send exactly one prompt to exactly one browser role and return one machine-readable JSON object.
 
-Dung khi muon 1 agent tu tiep tuc lam viec trong cung session.
+## Prerequisites
 
-```powershell
-uv run solo.py
-uv run solo.py DEV
-uv run solo.py DEV2
-uv run solo.py --goal "sua bug X"
-uv run solo.py DEV2 --goal "tiep tuc refactor tools"
-```
+1. Start the MAuto bridge/server.
+2. Install or update `tampermonkey.js` in the browser.
+3. Open one ChatGPT tab per browser role you want to use.
+4. Make sure each tab is registered with the expected role name, for example `DEV`, `REVIEW`, `PLAN`, or `MANAGER`.
 
-### `solo.py DEV2` co hoi goal khong?
-
-Khong. `DEV2` la ten role/browser slot, khong phai goal. Goal la optional context.
-
-Khi chay:
-
-```powershell
-uv run solo.py DEV2
-```
-
-script khong hoi them goal. No doc web hien tai cua role `DEV2` roi tu quyet dinh theo state.
-
-Neu muon gui goal ma khong bi hoi, dung:
-
-```powershell
-uv run solo.py DEV2 --goal "noi dung task"
-```
-
-### SOLO flow
-
-- Script khong co `--resume`.
-- Script khong co `--newchat`.
-- Script khong hoi goal tu stdin. `--goal` chi la optional context.
-- Dau tien check `stop_visible` va `composer_text_len`.
-- Neu stop button dang hien hoac textarea co draft: wait, khong ghi de user.
-- Neu khong bi block: doc last assistant response hien tai tren web.
-- Neu co last response va response complete: dung script.
-- Neu co last response nhung chua complete: gui continue prompt. Neu parse duoc routing JSON thi lay `message/target/reason`; neu khong parse duoc thi khong paste lai prose cu, chi gui continue instruction + goal/context.
-- Neu khong co last response: coi la web sach/moi, gui system prompt role neu co + `goal` neu co.
-- Neu `prompts/DEV2.txt` khong ton tai thi fallback sang `prompts/DEV.txt`.
-- System prompt chi attach o ask dau tien cua process run.
-- Neu response chua complete thi gui continue prompt ngan trong cung chat.
-- Stop khi response co routing JSON hop le voi `target: "FINISH"`.
-
-### SOLO wait behavior
-
-- `composer_has_text`: textarea dang co draft, script wait. User phai gui draft hoac xoa draft.
-- `assistant_generating`: assistant dang tra loi, script wait response moi.
-- `assistant_ready`: co response hien tai, script dung response do lam dau vao.
-- `empty_chat` / `idle_no_response`: co the gui prompt.
-
-### SOLO busy model
-
-Busy cua `solo.py` chi nen dua tren 2 tin hieu user/browser truc tiep:
+Default bridge URL:
 
 ```text
-composer_text_len > 0  -> wait user send/clear draft
-stop_visible == true   -> wait assistant finish
+http://127.0.0.1:8500
 ```
 
-Sau khi het busy:
+Override it with `--base-url` or `MAUTO_BASE_URL`.
+
+## Main Multi-Role Flow
+
+Standard 3-role command:
+
+```powershell
+uv run python main.py --role DEV,REVIEW,PLAN --goal "your task here"
+```
+
+Rules:
+
+- `--role` is required.
+- The first role in `--role` is the start role.
+- `--role` is also used as the default prompt role list and browser role list.
+- Default finish authority is the highest-precedence role in the list:
 
 ```text
-last_response exists   -> process it; complete thi stop, incomplete thi continue
-last_response empty    -> send initial system+goal prompt
+custom role < DEV < REVIEW < PLAN < MANAGER
 ```
 
-## AGENTS
-
-Dung khi can multi-agent va routing qua JSON.
+Examples:
 
 ```powershell
-uv run agents.py
-uv run agents.py --roles DEV,REVIEW --goal "implement feature X"
-uv run agents.py --roles DEV1,DEV2,REVIEW --start-role DEV1 --goal "chia viec refactor"
-uv run agents.py --roles MANAGER,DEV,REVIEW,AUDIT --start-role MANAGER --goal "audit toan repo"
-uv run agents.py --team --roles DEV,REVIEW,AUDIT --goal "manager-led audit"
-agents.bat --roles DEV,REVIEW --goal "fix tests"
+uv run python main.py --role DEV --goal "single role task"
+uv run python main.py --role DEV,REVIEW,PLAN --goal "implement and review this change"
+uv run python main.py --role DEV,MANAGER,REVIEW --goal "manager-controlled workflow"
 ```
 
-### Command test 5 role: `MANAGER,T1,T2,T3,T4`
+If `MANAGER` is present, manager mode is active:
+
+- Non-manager roles must route back to `MANAGER`.
+- `MANAGER` coordinates the next target role.
+- `MANAGER` has finish authority by default.
+
+Defaults:
+
+```text
+max-turns    = 0      # unlimited until FINISH or unrecoverable no-route
+reload-after = 10.0   # reload previous browser role after routing to another role
+resume       = off
+```
+
+Disable auto reload:
 
 ```powershell
-uv run agents.py --roles MANAGER,T1,T2,T3,T4 --start-role MANAGER --goal "research task here"
+uv run python main.py --role DEV,REVIEW,PLAN --reload-after 0 --goal "your task here"
 ```
 
-Neu muon log ngan hon khi test, nen them gioi han turn:
+Set a debug turn limit:
 
 ```powershell
-uv run agents.py --roles MANAGER,T1,T2,T3,T4 --start-role MANAGER --goal "research task here" --max-turns 8
+uv run python main.py --role DEV,REVIEW,PLAN --max-turns 20 --goal "your task here"
 ```
 
-### AGENTS flow
+## Resume
 
-- Khong truyen `--roles`: hien menu chon role tu `prompts/`.
-- Co `--roles`: danh sach role dang ky se tao `ALLOWED_TARGETS = roles + FINISH`.
-- `--goal` la bat buoc theo logic runtime. Neu khong truyen thi script se hoi `Goal:` qua stdin.
-- Agent chi duoc route toi role trong `ALLOWED_TARGETS`, hoac `FINISH` khi goal da hoan thanh.
-- Role co so fallback prompt: `DEV1`, `DEV2` dung `prompts/DEV.txt` neu khong co prompt rieng.
-- Luot dau cua moi role co the attach system prompt; cac luot sau gui goal/state/message ngan hon.
-- Neu response thieu JSON hoac JSON sai target: script gui format repair prompt.
-- Neu JSON loi qua gioi han: tra ve `format_blocked`.
-- Chi `MANAGER` moi duoc route song song bang target phan tach boi dau phay, va khi do `reason` phai la `parallel_dispatch`.
-- Neu role duoc hoi lan dau ma web dang co response cu, script van cho phep gui prompt moi; no khong coi response cu do la busy.
-- State handoff giua cac role chi giu ket qua moi nhat, khong cong don toan bo lich su turn.
+Use `--resume` only when the current browser tab already has a response you want the runner to route from:
 
-### JSON routing format
+```powershell
+uv run python main.py --role DEV,REVIEW,PLAN --resume --goal "your task here"
+```
 
-Agent nen ket thuc bang mot fenced JSON object:
+`--resume` reads the existing browser response only on the first dispatched turn. Later turns do not reuse old responses.
+
+If manager mode is active and the resumed route JSON does not route to `MANAGER`, the runner sends a repair prompt asking the role to route to `MANAGER`.
+
+## Route JSON Contract
+
+Every role response in `main.py` must end with exactly one fenced JSON object and nothing after it.
+
+Shape:
 
 ```json
 {
-  "target": "REVIEW",
-  "reason": "implementation da xong, can review",
-  "message": "Review thay doi va chi ra bug/blocker neu co."
+  "ROLE_NAME": "self-contained message for that role"
 }
 ```
 
-Neu task da xong, response phai ket thuc bang routing JSON:
-
-```json
-{"target":"FINISH","reason":"complete_verified","message":"evidence summary"}
-```
-
-Rule runtime quan trong:
-
-- Non-`MANAGER` phai chon duy nhat 1 `target`.
-- `MANAGER` moi duoc dung `target` dang `T1,T2,T3` va chi khi `reason="parallel_dispatch"`.
-- Neu sai schema `target/reason/message`, script se repair toi da theo `max_format_repairs` trong `config.toml`.
-
-## MANAGER-first team mode
-
-Team runner da duoc merge vao `agents.py`. Dung `--team` khi muon mac dinh bat dau tu `MANAGER` va de manager dieu phoi worker.
-
-```powershell
-uv run agents.py --team --roles DEV,REVIEW --goal "sua bug va review"
-uv run agents.py --team --roles DEV1,DEV2,REVIEW --goal "chia implementation cho 2 dev"
-uv run agents.py --team --roles DEV,REVIEW,AUDIT --start-role REVIEW --goal "review truoc roi route"
-uv run agents.py --team --roles DEV,REVIEW --goal "task X" --no-parallel
-```
-
-- Mac dinh team mode prepend/start bang `MANAGER` neu prompt `MANAGER` ton tai.
-- `--no-parallel` ep format repair neu manager tra target nhieu role.
-- Core workflow van la `agents.py`; khong con runner team rieng.
-
-## Role prompt fallback
-
-Role co hau to so se fallback ve base role:
-
-```text
-DEV1   -> prompts/DEV1.txt, neu khong co thi prompts/DEV.txt
-DEV2   -> prompts/DEV2.txt, neu khong co thi prompts/DEV.txt
-REVIEW2 -> prompts/REVIEW2.txt, neu khong co thi prompts/REVIEW.txt
-```
-
-Moi role/browser slot van doc lap. `DEV`, `DEV1`, `DEV2` co the cung dung prompt `DEV.txt` nhung la cac session rieng.
-
-## Config
-
-Mot so gia tri lay tu `config.toml` neu runner co dung config:
-
-- `max_turns`: so turn toi da.
-- `timeout_s`: timeout doi assistant.
-- `sleep_s`: khoang nghi giua cac turn.
-- `busy_reload_after_s`: thoi gian wait truoc khi reload de tranh state sai.
-
-## Image + text upload bridge
-
-The browser bridge now supports multimodal turns: text plus optional image/file artifacts. The stable path is not OS clipboard simulation. All image sources are normalized on the Python side, then sent to Tampermonkey as one `UPLOAD_FILES` command.
-
-Supported source kinds:
-
-- local path
-- web URL
-- base64 or data URL
-- OS clipboard image or file list
-- raw bytes from Python
-
-Normalized upload item shape:
+Finish shape:
 
 ```json
 {
-  "filename": "image.png",
-  "mime_type": "image/png",
-  "data_b64": "...",
-  "size": 12345,
-  "source_kind": "local",
-  "meta": {}
+  "FINISH": "final result summary"
 }
 ```
 
-Default upload method is `input`, not `auto`. ChatGPT currently exposes hidden file inputs such as `#upload-files` and `#upload-photos-input`; using the input path avoids duplicate overlay bugs caused by broadcasting the same file through multiple paste/drop targets. `auto`, `paste`, and `drop` are still available only when explicitly requested.
+Rules:
 
-Run a local image upload:
+- Route keys must be valid logical roles from `--role`, or `FINISH`.
+- A role may route to one target role or multiple target roles.
+- `FINISH` is accepted only from a finish-authorized role.
+- If `MANAGER` is active, non-manager roles must route only to `MANAGER`.
+- Route messages must be self-contained because browser roles do not share chat history.
+
+## Workflow Memory Rule
+
+Roles share the same machine and repo, but not the same browser history. Use `.plan/` as durable workflow memory.
+
+Rules for role prompts and routed messages:
+
+- If a role creates an important plan, implementation report, review report, or handoff, write it to an exact file under `.plan/`.
+- Route messages should name the exact file the next role must read.
+- The next role must read only the named file or files.
+- Do not scan `.plan/` looking for the latest file.
+- Do not infer a file name that was not explicitly routed.
+
+Example route message:
+
+```json
+{
+  "DEV": "Read .plan/turn_1_plan_for_task_a.md only, then implement the listed steps. Write your report to .plan/turn_2_dev_for_review_task_a.md and route to REVIEW."
+}
+```
+
+## `role.py`: Single-Role Command For External Agents
+
+`role.py` is the minimal entrypoint for external orchestrators such as opencode, OpenClaw, Hermes, or Codex.
+
+It sends one prompt to one browser role, waits for the assistant response to finish, and prints exactly one JSON object to stdout.
+
+Commands:
 
 ```powershell
-cd E:\python_project\tampermonkey_auto
-py upload_once.py --role IMG --local "C:\path\to\image.png" --text "Describe this image."
+uv run python role.py --role PLAN --prompt "review code changes in E:\python_project\Screens-Trans-Chatbot"
+uv run python role.py --role REVIEW --resp-from DEV --prompt "Review the latest DEV response."
+Get-Content .plan\prompt.txt | uv run python role.py --role PLAN
 ```
 
-Run without sending, useful for UI checks:
+`--resp-from ROLE` reads up to the 3 latest assistant responses from that source role and prefixes them to the prompt before sending it to the target role.
 
-```powershell
-py upload_once.py --role IMG --local "C:\path\to\image.png" --text "Describe this image." --no-send
+If `--resp-from` is omitted, `role.py` sends only `--prompt` or stdin.
+
+Stdout contract:
+
+```json
+{"ok":true,"exit_code":0,"summary":"short preview","data":{"role":"PLAN","resp_from":null,"source_response_count":0,"response":"full assistant response"},"error":null}
 ```
 
-Upload from other sources:
+Failure contract:
 
-```powershell
-py upload_once.py --role IMG --web "https://example.com/image.png" --text "Describe this image."
-py upload_once.py --role IMG --base64-file temps\image.b64 --filename image.png --mime image/png --text "Describe this image."
-py upload_once.py --role IMG --clipboard --text "Describe this clipboard image."
+```json
+{"ok":false,"exit_code":2,"summary":"missing prompt","data":null,"error":{"type":"Error","message":"--prompt or stdin prompt text is required"}}
 ```
 
-Python API:
+Notes:
 
-```python
-import agents
+- stdout is exactly one JSON object.
+- `data.response` is the full assistant response.
+- `summary` is a short preview for logs.
+- JSON is written as UTF-8 directly to stdout to avoid Windows codepage failures without expanding Unicode into `\\u....` escapes.
+- Bridge and recovery logs go to stderr.
 
-agents.run_upload_files(
-    "IMG",
-    ["temps/example.png"],
-    text="Describe this image.",
-)
-
-agents.run_upload_sources(
-    "IMG",
-    [{"kind": "web", "url": "https://example.com/image.png"}],
-    text="Describe this image.",
-)
-```
-
-Safety/robustness rules:
-
-- Do not commit real API keys or bearer tokens. Use environment variables or local `.env` files that remain untracked.
-- Upload payloads are uniquified by default to avoid ChatGPT duplicate-file guards.
-- PNG uploads receive a harmless metadata chunk when uniquified; visible image content is unchanged.
-- Stale upload overlays are dismissed before upload attempts.
-- Test artifacts belong under `temps/`, which is ignored by git.
-
-Recommended workflow model:
+Exit codes:
 
 ```text
-task
--> build multimodal message envelope
--> normalize artifacts
--> upload artifacts if present
--> set/send prompt text
--> wait assistant response
--> capture transcript and attachment evidence
--> route next step
+0 = completed with a non-empty response
+2 = missing input
+3 = bridge/runtime failure or empty response
+4 = manual input is pending in the browser composer
 ```
 
-Use one turn envelope for both text-only and image+text messages. Do not maintain separate text-flow and image-flow paths.
+## External Agent Hard Rules
 
+Use this guide when an external agent is asked to call a browser role through `role.py`.
+
+Hard rules:
+
+1. Run exactly one requested `uv run python role.py ...` command.
+2. Do not perform any other action, no matter how small.
+3. Do not read the repo.
+4. Do not edit files.
+5. Do not run tests.
+6. Do not run `git status`, `git diff`, `git log`, or any other inspection command.
+7. Do not infer or execute a next step.
+8. Wait only for the `role.py` process to finish.
+9. Parse stdout as one JSON object.
+10. If `ok=true` and exit code is `0`, return `data.response` as the result.
+11. If `ok=false` or the exit code is not `0`, report `summary`, `error.type`, `error.message`, and the exit code.
+12. Do not retry unless explicitly instructed.
+13. Treat stderr as runtime logs only. Do not mix stderr into the main result unless reporting an operational failure.
+
+Copyable instruction for external agents:
+
+```text
+Run only this command and wait for it to finish:
+
+uv run python role.py --role <ROLE> --prompt "<PROMPT>"
+
+Do not read files, do not inspect the repo, do not edit anything, do not run tests, and do not run git commands.
+Parse stdout as one JSON object. If ok=true and exit_code=0, return data.response. If it fails, report summary, error.type, error.message, and exit_code. Do not retry unless explicitly asked.
+```
+
+## Prompt Files
+
+Built-in role prompts live in `prompts/`:
+
+```text
+prompts/MANAGER.txt
+prompts/PLAN.txt
+prompts/DEV.txt
+prompts/REVIEW.txt
+```
+
+Custom roles may use exact prompt files such as `prompts/DEV2.txt`. If no exact prompt exists, the runner may fall back to a known role type such as `DEV`, depending on the role name.
+
+If no prompt is available for a role, the runner still works in goal-only mode, but the role must be given self-contained instructions.
+
+## Advanced Overrides
+
+Normal usage should not need these flags:
+
+```text
+--prompt-roles      logical roles allowed in route JSON
+--browser-roles     physical browser roles/tabs to call
+--role-map          map logical roles to physical browser roles
+--finish-roles      override finish-authorized roles
+--parallelism       max parallel target dispatches
+--preflight         test browser commands before running
+```
+
+Example with logical roles mapped to fewer browser tabs:
+
+```powershell
+uv run python main.py `
+  --role DEV,REVIEW,PLAN `
+  --prompt-roles DEV,REVIEW,PLAN `
+  --browser-roles DEV,REVIEW `
+  --role-map PLAN=REVIEW DEV=DEV REVIEW=REVIEW `
+  --finish-roles REVIEW `
+  --goal "your task here"
+```
+
+## Verification
+
+Run the focused tests:
+
+```powershell
+uv run pytest tests/test_role_cli.py tests/test_main_flow.py -q
+```
+
+Run the full Python test suite:
+
+```powershell
+uv run pytest -q
+```
+
+Check the userscript contract:
+
+```powershell
+node --check tampermonkey.js
+node tests/test_tampermonkey_contract.mjs
+```

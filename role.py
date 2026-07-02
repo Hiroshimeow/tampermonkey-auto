@@ -22,6 +22,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--role", default="", help="Target browser role, for example DEV, REVIEW, PLAN, or a custom role.")
     parser.add_argument("--prompt", default="", help="Prompt text to send. If omitted, stdin is used.")
     parser.add_argument("--resp-from", default="", help="Optional source role. Prefix the prompt with up to 3 latest assistant responses from that role.")
+    parser.add_argument("--new-chat", action="store_true", help="Open a new chat for the target role before sending the prompt.")
+    parser.add_argument("--restart", action="store_true", help="Reload the target role browser tab before sending the prompt.")
     parser.add_argument("--base-url", default=os.environ.get("MAUTO_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--timeout", type=float, default=1800.0, help="Max seconds to wait for browser readiness and assistant completion.")
     parser.add_argument("--request-timeout", type=float, default=1200.0, help="HTTP request timeout for bridge calls.")
@@ -96,6 +98,24 @@ def build_prompt(prompt: str, source_role: str, source_responses: list[str]) -> 
 def fetch_source_responses(client: BridgeClient, source_role: str) -> list[str]:
     snapshot = client.role_snapshot(normalize_role(source_role))
     return assistant_responses_from_snapshot(snapshot, limit=3)
+
+def command_failed(result: dict) -> bool:
+    status = str(result.get("status") or "")
+    if not result.get("done"):
+        return True
+    return any(marker in status for marker in ("FAILED", "ERROR", "UNKNOWN"))
+
+
+def run_pre_send_actions(client: BridgeClient, role: str, *, restart: bool, new_chat: bool, timeout_s: float) -> None:
+    action_timeout = max(1.0, min(float(timeout_s), 60.0))
+    if restart:
+        result = client.command_roundtrip(role, "RELOAD_PAGE", timeout_s=action_timeout)
+        if command_failed(result):
+            raise RuntimeError(f"restart failed for role {role}: {result}")
+    if new_chat:
+        result = client.new_chat(role, timeout_s=action_timeout)
+        if command_failed(result):
+            raise RuntimeError(f"new-chat failed for role {role}: {result}")
 
 def response_summary(response: str, limit: int = 180) -> str:
     text = " ".join(str(response or "").split())
@@ -174,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         # BridgeClient may print recovery/status logs; keep stdout machine-readable.
         with redirect_stdout(sys.stderr):
             client = BridgeClient(args.base_url, args.request_timeout)
+            run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
             source_responses = fetch_source_responses(client, source_role) if source_role else []
             final_prompt = build_prompt(prompt, source_role, source_responses)
             response = client.call_browser_role(role, final_prompt, timeout_s=args.timeout)

@@ -146,10 +146,18 @@ Commands:
 ```powershell
 uv run python role.py --role PLAN --prompt "review code changes in E:\python_project\Screens-Trans-Chatbot"
 uv run python role.py --role REVIEW --resp-from DEV --prompt "Review the latest DEV response."
+uv run python role.py --role PLAN --new-chat --prompt "Read .plan\\turn_1_plan.md only and continue."
+uv run python role.py --role DEV --restart --prompt "Read .plan\\turn_2_dev.md only and continue."
 Get-Content .plan\prompt.txt | uv run python role.py --role PLAN
 ```
 
 `--resp-from ROLE` reads up to the 3 latest assistant responses from that source role and prefixes them to the prompt before sending it to the target role.
+
+`--new-chat` opens a new chat for the target role before sending the prompt. This is useful when the next prompt only needs an exact `.plan/...md` file path.
+
+`--restart` reloads the target role browser tab before sending the prompt. Use it when the tab is stale or needs an F5-style recovery.
+
+If both are set, `role.py` runs `--restart` first, then `--new-chat`, then sends the prompt.
 
 If `--resp-from` is omitted, `role.py` sends only `--prompt` or stdin.
 
@@ -188,7 +196,7 @@ Use this guide when an external agent is asked to call a browser role through `r
 
 Hard rules:
 
-1. Run exactly one requested `uv run python role.py ...` command.
+1. Run exactly one requested `uv run python role.py ...` command. Use `--new-chat` only when starting a clean role session from an exact `.plan/...md` file. Use `--restart` only when the browser tab is stale or needs reload recovery.
 2. Do not perform any other action, no matter how small.
 3. Do not read the repo.
 4. Do not edit files.

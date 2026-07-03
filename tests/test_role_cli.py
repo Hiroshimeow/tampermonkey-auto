@@ -174,6 +174,61 @@ def test_main_outputs_json_for_missing_prompt(capsys) -> None:
     assert payload["error"] == {"type": "Error", "message": "--prompt or stdin prompt text is required"}
 
 
+
+def test_main_runs_restart_then_new_chat_before_send(monkeypatch, capsys) -> None:
+    actions = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            actions.append((role_name, action))
+            return {"done": True, "status": "PAGE_RELOADING"}
+
+        def new_chat(self, role_name: str, timeout_s: float = 25.0) -> dict:
+            actions.append((role_name, "NEW_CHAT"))
+            return {"done": True, "status": "NEW_CHAT_NAVIGATING"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            actions.append((role_name, "SEND"))
+            return "ok"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "dev", "--restart", "--new-chat", "--prompt", "hello"])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 0
+    assert actions == [("DEV", "RELOAD_PAGE"), ("DEV", "NEW_CHAT"), ("DEV", "SEND")]
+    assert payload["data"]["response"] == "ok"
+
+
+def test_main_outputs_json_when_restart_fails(monkeypatch, capsys) -> None:
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            return {"done": True, "status": "FAILED"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            raise AssertionError("send should not run when restart fails")
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "dev", "--restart", "--prompt", "hello"])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 3
+    assert payload["ok"] is False
+    assert payload["summary"] == "runtime failed for DEV"
+    assert payload["error"]["type"] == "RuntimeError"
+    assert "restart failed for role DEV" in payload["error"]["message"]
+
+
 def test_main_json_outputs_utf8_unicode_response(monkeypatch, capsys) -> None:
     expected = "\u0111\u00e3 x\u1eed l\u00fd l\u1ed7i"
 

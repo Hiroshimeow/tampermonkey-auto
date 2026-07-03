@@ -12,3 +12,5 @@ temps/*
 !temps/prompts/**
 !temps/skills/
 !temps/skills/**
+.role_state/
+.plan/

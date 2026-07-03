@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
-"""Send one prompt to one browser role and print the completed response."""
+"""Send one prompt to one browser role with durable retry/upload handling."""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import threading
+import time
+from typing import Any
 
+import agents
 from apps.bridge import BridgeClient, ManualInputPendingError
 from apps.constants import DEFAULT_BASE_URL
+from apps.role_renderer import render_direct_role_prompt, rendered_hash_source
 from apps.text import normalize_role
+
+STATE_DIR = Path(".role_state")
+REQUESTS_DIR = STATE_DIR / "requests"
+RESPONSES_DIR = STATE_DIR / "responses"
+UPLOADS_DIR = STATE_DIR / "uploads"
+LOGS_DIR = STATE_DIR / "logs"
+PROMPT_SPILL_THRESHOLD = 8000
+REQUEST_MARKER = "ROLE_REQUEST_ID"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -21,6 +36,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--role", default="", help="Target browser role, for example DEV, REVIEW, PLAN, or a custom role.")
     parser.add_argument("--prompt", default="", help="Prompt text to send. If omitted, stdin is used.")
+    parser.add_argument("--upload", action="append", default=[], help="Local file path to upload before sending. Repeat for multiple files.")
+    parser.add_argument("--request-id", default="", help="Resume or run an exact durable request id.")
+    parser.add_argument("--new-request", action="store_true", help="Force a new logical request even when the same prompt/files were used before.")
     parser.add_argument("--resp-from", default="", help="Optional source role. Prefix the prompt with up to 3 latest assistant responses from that role.")
     parser.add_argument("--new-chat", action="store_true", help="Open a new chat for the target role before sending the prompt.")
     parser.add_argument("--restart", action="store_true", help="Reload the target role browser tab before sending the prompt.")
@@ -39,6 +57,39 @@ def configure_stdio_utf8() -> None:
             reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ensure_state_dirs() -> None:
+    for path in (REQUESTS_DIR, RESPONSES_DIR, UPLOADS_DIR, LOGS_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def short_hash(text: str, length: int = 12) -> str:
+    return sha256_text(text)[:length]
+
+
+def make_run_id() -> str:
+    return f"run_{datetime.now().strftime('%Y%m%d%H%M%S')}_{short_hash(str(time.time_ns()), 6)}"
+
+
+def make_error_id(request_id: str, error: BaseException | str) -> str:
+    return f"err_{request_id}_{short_hash(str(error) + str(time.time_ns()), 6)}"
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -61,6 +112,33 @@ def read_prompt(args: argparse.Namespace) -> str:
     if reader.is_alive() or not result:
         return ""
     return result[0].strip()
+
+
+def validate_upload_paths(paths: list[str]) -> tuple[list[Path], list[str]]:
+    valid: list[Path] = []
+    errors: list[str] = []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if not path.exists():
+            errors.append(f"upload path does not exist: {raw}")
+            continue
+        if not path.is_file():
+            errors.append(f"upload path is not a file: {raw}")
+            continue
+        valid.append(path.resolve())
+    return valid, errors
+
+
+def upload_metadata(paths: list[Path]) -> list[dict[str, str | int]]:
+    return [
+        {
+            "path": str(path),
+            "filename": path.name,
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+        for path in paths
+    ]
 
 
 def assistant_responses_from_snapshot(snapshot: dict, limit: int = 3) -> list[str]:
@@ -99,6 +177,94 @@ def fetch_source_responses(client: BridgeClient, source_role: str) -> list[str]:
     snapshot = client.role_snapshot(normalize_role(source_role))
     return assistant_responses_from_snapshot(snapshot, limit=3)
 
+
+def idempotency_key(role: str, prompt: str, source_role: str, role_prompt_hash: str, uploads: list[dict[str, Any]]) -> str:
+    payload = {
+        "role": role,
+        "prompt": " ".join(prompt.split()),
+        "source_role": source_role,
+        "role_prompt_hash": role_prompt_hash,
+        "uploads": [(item.get("path"), item.get("sha256"), item.get("size")) for item in uploads],
+    }
+    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def request_path(request_id: str) -> Path:
+    return REQUESTS_DIR / f"{request_id}.json"
+
+
+def response_path(request_id: str) -> Path:
+    return RESPONSES_DIR / f"{request_id}.md"
+
+
+def find_existing_request(key: str) -> dict[str, Any] | None:
+    if not REQUESTS_DIR.exists():
+        return None
+    for path in sorted(REQUESTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("idempotency_key") == key and data.get("status") != "failed_final":
+            return data
+    return None
+
+
+def make_request_id(role: str, key: str) -> str:
+    return f"req_{role}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{key[:8]}"
+
+
+def load_ledger(request_id: str) -> dict[str, Any] | None:
+    path = request_path(request_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_ledger(data: dict[str, Any]) -> None:
+    ensure_state_dirs()
+    data["updated_at"] = utc_now()
+    request_path(str(data["request_id"])).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def init_or_load_ledger(
+    *,
+    explicit_request_id: str,
+    force_new: bool,
+    role: str,
+    key: str,
+    prompt_hash: str,
+    role_prompt_hash: str,
+    uploads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ensure_state_dirs()
+    if explicit_request_id:
+        existing = load_ledger(explicit_request_id)
+        if existing:
+            return existing
+        request_id = explicit_request_id
+    else:
+        existing = None if force_new else find_existing_request(key)
+        if existing:
+            return existing
+        request_id = make_request_id(role, key)
+    ledger = {
+        "request_id": request_id,
+        "idempotency_key": key,
+        "role": role,
+        "status": "new",
+        "prompt_hash": prompt_hash,
+        "role_prompt_hash": role_prompt_hash,
+        "role_context_hash": role_prompt_hash,
+        "uploads": uploads,
+        "response_path": str(response_path(request_id)),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+    save_ledger(ledger)
+    return ledger
+
+
 def command_failed(result: dict) -> bool:
     status = str(result.get("status") or "")
     if not result.get("done"):
@@ -112,52 +278,84 @@ def run_pre_send_actions(client: BridgeClient, role: str, *, restart: bool, new_
         result = client.command_roundtrip(role, "RELOAD_PAGE", timeout_s=action_timeout)
         if command_failed(result):
             raise RuntimeError(f"restart failed for role {role}: {result}")
+        if hasattr(client, "wait_until_clean_ready"):
+            client.wait_until_clean_ready(role, min(float(timeout_s), 30.0))
     if new_chat:
         result = client.new_chat(role, timeout_s=action_timeout)
         if command_failed(result):
             raise RuntimeError(f"new-chat failed for role {role}: {result}")
+        if hasattr(client, "wait_until_clean_ready"):
+            client.wait_until_clean_ready(role, min(float(timeout_s), 30.0))
 
-def response_summary(response: str, limit: int = 180) -> str:
-    text = " ".join(str(response or "").split())
-    if not text:
-        return "empty response"
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3].rstrip() + "..."
+def snapshot_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    dom_info = snapshot.get("dom_info") or {}
+    messages_payload = dom_info.get("messages") or {}
+    messages = messages_payload.get("messages") or []
+    return messages if isinstance(messages, list) else []
 
 
-def result_payload(
-    *,
-    ok: bool,
-    exit_code: int,
-    summary: str,
-    role: str = "",
-    source_role: str = "",
-    response: str | None = None,
-    source_response_count: int = 0,
-    error: BaseException | str | None = None,
-) -> dict:
-    error_payload = None
-    if error is not None:
-        error_payload = {
-            "type": type(error).__name__ if isinstance(error, BaseException) else "Error",
-            "message": str(error),
-        }
-    data = None
-    if ok:
-        data = {
-            "role": role,
-            "resp_from": source_role or None,
-            "source_response_count": source_response_count,
-            "response": response or "",
-        }
-    return {
-        "ok": ok,
-        "exit_code": exit_code,
-        "summary": summary,
-        "data": data,
-        "error": error_payload,
-    }
+def find_response_for_marker(snapshot: dict[str, Any], request_id: str) -> tuple[str, bool, bool]:
+    marker = f"{REQUEST_MARKER}: {request_id}"
+    messages = snapshot_messages(snapshot)
+    marker_index = -1
+    for index, item in enumerate(messages):
+        if not isinstance(item, dict):
+            continue
+        if marker in str(item.get("text") or ""):
+            marker_index = index
+    if marker_index < 0:
+        composer_text = str((snapshot.get("dom_info") or {}).get("composer_text") or "")
+        return "", False, marker in composer_text
+    assistant_text = ""
+    for item in messages[marker_index + 1:]:
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "assistant":
+            text = str(item.get("text") or "").strip()
+            if text:
+                assistant_text = text
+    return assistant_text, True, False
+
+
+def recover_existing_response(client: BridgeClient, role: str, request_id: str, timeout_s: float) -> tuple[str, str]:
+    deadline = time.time() + min(timeout_s, 30.0)
+    saw_marker = False
+    saw_composer_marker = False
+    while time.time() < deadline:
+        try:
+            client.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+            snapshot = client.role_snapshot(role)
+        except Exception:
+            time.sleep(0.5)
+            continue
+        response, marker_found, composer_marker = find_response_for_marker(snapshot, request_id)
+        saw_marker = saw_marker or marker_found
+        saw_composer_marker = saw_composer_marker or composer_marker
+        if response:
+            return response, "completed"
+        activity = client.response_activity(snapshot)
+        if marker_found and activity.stop_visible:
+            return client.wait_for_current_response(role, timeout_s, require_response=True), "completed"
+        if composer_marker:
+            return "", "composer_pending"
+        time.sleep(0.5)
+    if saw_marker:
+        return "", "waiting"
+    if saw_composer_marker:
+        return "", "composer_pending"
+    return "", "not_found"
+
+
+def save_response(request_id: str, response: str) -> Path:
+    ensure_state_dirs()
+    path = response_path(request_id)
+    path.write_text(str(response or "").strip() + "\n", encoding="utf-8")
+    return path
+
+
+def write_error_log(error_id: str, payload: dict[str, Any]) -> Path:
+    ensure_state_dirs()
+    path = LOGS_DIR / f"{error_id}.log"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def emit_json(payload: dict) -> None:
@@ -175,54 +373,189 @@ def emit_json(payload: dict) -> None:
         sys.stdout.write(fallback)
         sys.stdout.flush()
 
+
+def success_payload(*, request_id: str, run_id: str, role: str, response_file: Path, uploaded: int, source_role: str, source_response_count: int, recovered: bool = False) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "completed",
+        "exit_code": 0,
+        "request_id": request_id,
+        "run_id": run_id,
+        "role": role,
+        "resp_from": source_role or None,
+        "source_response_count": source_response_count,
+        "response_path": str(response_file),
+        "uploaded": uploaded,
+        "recovered": recovered,
+        "error": None,
+    }
+
+
+def fail_payload(*, exit_code: int, status: str, request_id: str, run_id: str, role: str, error: BaseException | str, message: str = "") -> dict[str, Any]:
+    error_id = make_error_id(request_id or "no_request", error)
+    error_payload = {
+        "type": type(error).__name__ if isinstance(error, BaseException) else "Error",
+        "message": str(error),
+    }
+    payload = {
+        "ok": False,
+        "status": status,
+        "exit_code": exit_code,
+        "request_id": request_id or None,
+        "run_id": run_id,
+        "error_id": error_id,
+        "role": role,
+        "message": message or str(error),
+        "error": error_payload,
+    }
+    payload["log_path"] = str(write_error_log(error_id, payload))
+    return payload
+
+
+def maybe_spill_prompt(request_id: str, prompt: str, uploads: list[Path]) -> tuple[str, list[Path]]:
+    if len(prompt) <= PROMPT_SPILL_THRESHOLD:
+        return prompt, uploads
+    spill_dir = UPLOADS_DIR / request_id
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = spill_dir / "prompt.md"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    short_prompt = (
+        f"{REQUEST_MARKER}: {request_id}\n\n"
+        "Read attached prompt.md and any other attached files. "
+        "Follow the role instructions inside prompt.md and return the requested result directly."
+    )
+    return short_prompt, [prompt_file, *uploads]
+
+
+def run_role_request(client: BridgeClient, role: str, final_prompt: str, uploads: list[Path], ledger: dict[str, Any], timeout_s: float) -> str:
+    if not hasattr(client, "set_prompt") and hasattr(client, "call_browser_role"):
+        return client.call_browser_role(role, final_prompt, timeout_s)
+
+    if uploads:
+        ledger["status"] = "uploading"
+        save_ledger(ledger)
+        payload = agents.build_upload_files_payload(list(uploads), text=final_prompt, method="input", upload_wait_ms=15000)
+        client.upload_files(role, payload, timeout_s)
+        ledger["status"] = "uploaded"
+        save_ledger(ledger)
+        ledger["status"] = "sent"
+        save_ledger(ledger)
+        return client.send_current_prompt_and_wait(role, timeout_s)
+
+    client.set_prompt(role, final_prompt, timeout_s)
+    ledger["status"] = "prompt_set"
+    save_ledger(ledger)
+    ledger["status"] = "sent"
+    save_ledger(ledger)
+    return client.send_current_prompt_and_wait(role, timeout_s)
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_stdio_utf8()
     args = parse_args(argv)
+    run_id = make_run_id()
     role = normalize_role(args.role)
     source_role = normalize_role(args.resp_from)
     prompt = read_prompt(args)
     if not role:
-        exit_code = 2
-        emit_json(result_payload(ok=False, exit_code=exit_code, summary="missing --role", error="--role is required"))
-        return exit_code
+        emit_json(fail_payload(exit_code=2, status="failed_final", request_id="", run_id=run_id, role="", error="--role is required"))
+        return 2
     if not prompt:
-        exit_code = 2
-        emit_json(result_payload(ok=False, exit_code=exit_code, summary="missing prompt", role=role, error="--prompt or stdin prompt text is required"))
-        return exit_code
+        emit_json(fail_payload(exit_code=2, status="failed_final", request_id=f"req_{role}_{short_hash('missing_prompt', 8)}", run_id=run_id, role=role, error="--prompt or stdin prompt text is required"))
+        return 2
+
+    upload_paths, upload_errors = validate_upload_paths(list(args.upload or []))
+    raw_uploads_for_key = [{"path": str(path), "sha256": sha256_file(path), "size": path.stat().st_size} for path in upload_paths]
+    base_prompt_for_key = build_prompt(prompt, source_role, [])
+    context_rendered = render_direct_role_prompt(
+        role=role,
+        user_prompt="USER_PROMPT_PLACEHOLDER",
+        request_id="REQUEST_ID_PLACEHOLDER",
+        request_marker=REQUEST_MARKER,
+    )
+    role_context_hash = sha256_text(rendered_hash_source(context_rendered))
+    key = idempotency_key(role, base_prompt_for_key, source_role, role_context_hash, raw_uploads_for_key)
+    request_id_for_fail = args.request_id or make_request_id(role, key)
+    if upload_errors:
+        emit_json(fail_payload(exit_code=2, status="failed_final", request_id=request_id_for_fail, run_id=run_id, role=role, error="; ".join(upload_errors)))
+        return 2
+
+    upload_meta = upload_metadata(upload_paths)
+    ledger = init_or_load_ledger(
+        explicit_request_id=str(args.request_id or "").strip(),
+        force_new=bool(args.new_request),
+        role=role,
+        key=key,
+        prompt_hash=sha256_text(prompt),
+        role_prompt_hash=role_context_hash,
+        uploads=upload_meta,
+    )
+    request_id = str(ledger["request_id"])
+
+    existing_response_path = Path(str(ledger.get("response_path") or response_path(request_id)))
+    if ledger.get("status") == "completed" and existing_response_path.exists():
+        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
+        return 0
 
     try:
-        # BridgeClient may print recovery/status logs; keep stdout machine-readable.
         with redirect_stdout(sys.stderr):
             client = BridgeClient(args.base_url, args.request_timeout)
+            if ledger.get("status") in {"sent", "waiting", "prompt_set", "uploaded", "failed_retryable"}:
+                recovered_response, recovery_state = recover_existing_response(client, role, request_id, args.timeout)
+                if recovered_response:
+                    path = save_response(request_id, recovered_response)
+                    ledger["status"] = "completed"
+                    ledger["response_path"] = str(path)
+                    save_ledger(ledger)
+                    emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
+                    return 0
+                if recovery_state == "waiting":
+                    raise RuntimeError(f"{role} existing request marker found for {request_id}, but response is still generating; retry same command")
+                if recovery_state == "composer_pending":
+                    response = client.send_current_prompt_and_wait(role, args.timeout)
+                    path = save_response(request_id, response)
+                    ledger["status"] = "completed"
+                    ledger["response_path"] = str(path)
+                    save_ledger(ledger)
+                    emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
+                    return 0
+                if ledger.get("status") in {"sent", "waiting"}:
+                    raise RuntimeError(f"{role} ledger says request {request_id} was sent, but marker was not found after recovery grace; retry later or use --new-request")
+
             run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
             source_responses = fetch_source_responses(client, source_role) if source_role else []
-            final_prompt = build_prompt(prompt, source_role, source_responses)
-            response = client.call_browser_role(role, final_prompt, timeout_s=args.timeout)
+            user_prompt = build_prompt(prompt, source_role, source_responses)
+            rendered = render_direct_role_prompt(
+                role=role,
+                user_prompt=user_prompt,
+                request_id=request_id,
+                request_marker=REQUEST_MARKER,
+            )
+            final_prompt, final_uploads = maybe_spill_prompt(request_id, rendered.text, upload_paths)
+            response = run_role_request(client, role, final_prompt, final_uploads, ledger, args.timeout)
     except ManualInputPendingError as exc:
-        exit_code = 4
-        emit_json(result_payload(ok=False, exit_code=exit_code, summary=f"manual input pending for {role}", role=role, source_role=source_role, error=exc))
-        return exit_code
+        ledger["status"] = "failed_retryable"
+        save_ledger(ledger)
+        emit_json(fail_payload(exit_code=4, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error=exc, message=f"manual input pending for {role}"))
+        return 4
     except Exception as exc:
-        exit_code = 3
-        emit_json(result_payload(ok=False, exit_code=exit_code, summary=f"runtime failed for {role}", role=role, source_role=source_role, error=exc))
-        return exit_code
+        ledger["status"] = "failed_retryable"
+        save_ledger(ledger)
+        emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error=exc, message=f"runtime failed for {role}"))
+        return 3
 
     response = str(response or "").strip()
     if response:
-        exit_code = 0
-        emit_json(result_payload(
-            ok=True,
-            exit_code=exit_code,
-            summary=response_summary(response),
-            role=role,
-            source_role=source_role,
-            response=response,
-            source_response_count=len(source_responses),
-        ))
-        return exit_code
-    exit_code = 3
-    emit_json(result_payload(ok=False, exit_code=exit_code, summary=f"empty response from {role}", role=role, source_role=source_role, error="empty response"))
-    return exit_code
+        path = save_response(request_id, response)
+        ledger["status"] = "completed"
+        ledger["response_path"] = str(path)
+        save_ledger(ledger)
+        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses) if source_role else 0))
+        return 0
+    ledger["status"] = "failed_retryable"
+    save_ledger(ledger)
+    emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error="empty response", message=f"empty response from {role}"))
+    return 3
 
 
 if __name__ == "__main__":

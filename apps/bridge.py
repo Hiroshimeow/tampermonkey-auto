@@ -98,9 +98,21 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        self.wait_until_clean_ready(browser_role, timeout_s)
+        self.set_prompt(browser_role, prompt, timeout_s)
+        return self.send_current_prompt_and_wait(browser_role, timeout_s)
 
-        self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
+    def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
+        self.wait_until_clean_ready(browser_role, min(timeout_s, 30.0))
+        payload = {"text": prompt, "method": "auto"}
+        if force_replace:
+            payload["force_replace"] = True
+        return self._run_command(browser_role, "SET_PROMPT", payload, timeout_s, "PASTE_CONFIRMED")
+
+    def upload_files(self, browser_role: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        self.wait_until_clean_ready(browser_role, min(timeout_s, 30.0))
+        return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
+
+    def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float) -> str:
         before_send = self.response_activity(self.role_snapshot(browser_role))
         try:
             self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
@@ -115,6 +127,9 @@ class BridgeClient:
                 if response:
                     return response
             raise
+        return self.wait_assistant_done(browser_role, timeout_s)
+
+    def wait_assistant_done(self, browser_role: str, timeout_s: float) -> str:
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
         status = str(final.get("status") or "")
         if status != "ASSISTANT_DONE":
@@ -327,10 +342,16 @@ class BridgeClient:
         last_response = ""
         last_logged_bucket = -1
         last_activity: ResponseActivity | None = None
+        active_reload_used = False
 
         while time.time() < deadline:
-            self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
-            activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            try:
+                self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+                activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            except Exception as exc:
+                print(f"[response-watch] role={role} transient snapshot/sync failure: {exc}; waiting", flush=True)
+                self.sleep(max(0.1, poll_s))
+                continue
             last_activity = activity
             last_response = activity.response or last_response
 
@@ -397,11 +418,12 @@ class BridgeClient:
                 )
                 last_logged_bucket = bucket
 
-            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s):
+            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s) and not active_reload_used:
                 print(
-                    f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page",
+                    f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page once",
                     flush=True,
                 )
+                active_reload_used = True
                 self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
                 self.sleep(max(0.0, page_wait_s))
                 cycle_started = time.time()
@@ -434,7 +456,12 @@ class BridgeClient:
         last_activity: ResponseActivity | None = None
         last_logged_bucket = -1
         while time.time() < deadline:
-            activity = self.response_activity(self.role_snapshot(role))
+            try:
+                activity = self.response_activity(self.role_snapshot(role))
+            except Exception as exc:
+                print(f"[ready-check] role={role} transient snapshot failure: {exc}; waiting", flush=True)
+                self.sleep(max(0.1, poll_s))
+                continue
             last_activity = activity
             if self.is_clean_ready(activity):
                 return activity

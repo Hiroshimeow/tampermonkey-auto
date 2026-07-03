@@ -30,7 +30,7 @@ def test_run_upload_files_sends_upload_command(monkeypatch, tmp_path):
         "IMG",
         [image],
         text="describe this",
-        method="paste",
+        method="drop",
         timeout=12,
         print_every=0.5,
         upload_wait_ms=3456,
@@ -43,7 +43,7 @@ def test_run_upload_files_sends_upload_command(monkeypatch, tmp_path):
     assert timeout == 12
     assert print_every == 0.5
     assert payload["text"] == "describe this"
-    assert payload["method"] == "paste"
+    assert payload["method"] == "drop"
     assert payload["upload_wait_ms"] == 3456
     assert payload["files"][0]["filename"].startswith("sample_")
     assert payload["files"][0]["filename"].endswith(".jpg")
@@ -127,9 +127,9 @@ def test_run_upload_sources_sends_unified_upload_command(monkeypatch, tmp_path):
     assert payload["text"] == "hello image"
     assert payload["files"][0]["source_kind"] == "local"
 
-def test_build_upload_files_payload_defaults_to_input_method(tmp_path):
+def test_build_upload_files_payload_defaults_to_drop_method(tmp_path):
     local = tmp_path / "local.png"
-    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-input")
+    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-drop")
 
     payload = agents.build_upload_files_payload(
         [{"kind": "local", "path": local}],
@@ -137,12 +137,12 @@ def test_build_upload_files_payload_defaults_to_input_method(tmp_path):
         uniquify=False,
     )
 
-    assert payload["method"] == "input"
+    assert payload["method"] == "drop"
 
 
-def test_run_upload_files_defaults_to_input_method(monkeypatch, tmp_path):
+def test_run_upload_files_defaults_to_drop_method(monkeypatch, tmp_path):
     local = tmp_path / "local.png"
-    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-input")
+    local.write_bytes(b"\x89PNG\r\n\x1a\ndefault-drop")
     calls = []
 
     def fake_run_command(role, action, payload=None, timeout=300, print_every=2.0):
@@ -153,4 +153,4 @@ def test_run_upload_files_defaults_to_input_method(monkeypatch, tmp_path):
 
     agents.run_upload_files("IMG", [local], text="hello", uniquify=False)
 
-    assert calls[0][2]["method"] == "input"
+    assert calls[0][2]["method"] == "drop"

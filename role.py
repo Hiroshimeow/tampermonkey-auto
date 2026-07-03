@@ -434,7 +434,7 @@ def run_role_request(client: BridgeClient, role: str, final_prompt: str, uploads
     if uploads:
         ledger["status"] = "uploading"
         save_ledger(ledger)
-        payload = agents.build_upload_files_payload(list(uploads), text=final_prompt, method="input", upload_wait_ms=15000)
+        payload = agents.build_upload_files_payload(list(uploads), text=final_prompt, upload_wait_ms=15000)
         client.upload_files(role, payload, timeout_s)
         ledger["status"] = "uploaded"
         save_ledger(ledger)

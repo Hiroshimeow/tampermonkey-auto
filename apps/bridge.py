@@ -102,14 +102,14 @@ class BridgeClient:
         return self.send_current_prompt_and_wait(browser_role, timeout_s)
 
     def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
-        self.wait_until_clean_ready(browser_role, min(timeout_s, 30.0))
+        self.wait_until_clean_ready(browser_role, timeout_s)
         payload = {"text": prompt, "method": "auto"}
         if force_replace:
             payload["force_replace"] = True
         return self._run_command(browser_role, "SET_PROMPT", payload, timeout_s, "PASTE_CONFIRMED")
 
     def upload_files(self, browser_role: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        self.wait_until_clean_ready(browser_role, min(timeout_s, 30.0))
+        self.wait_until_clean_ready(browser_role, timeout_s)
         return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
 
     def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float) -> str:

@@ -560,6 +560,24 @@ def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_te
     assert bridge.sleeps
 
 
+def test_set_prompt_and_upload_wait_for_full_timeout_before_replacing_prompt() -> None:
+    class RecordingBridge(FakeBridge):
+        def __init__(self) -> None:
+            super().__init__([response_snapshot("old response", False)])
+            self.ready_timeouts: list[float] = []
+
+        def wait_until_clean_ready(self, role: str, timeout_s: float, poll_s: float = 2.0):
+            self.ready_timeouts.append(timeout_s)
+            return self.response_activity(response_snapshot("old response", False))
+
+    bridge = RecordingBridge()
+
+    bridge.set_prompt("REVIEW", "automated prompt", timeout_s=1800.0)
+    bridge.upload_files("REVIEW", {"files": [], "text": "attached context"}, timeout_s=1800.0)
+
+    assert bridge.ready_timeouts == [1800.0, 1800.0]
+
+
 def test_call_browser_role_does_not_reuse_response_that_finishes_while_waiting_to_send() -> None:
     bridge = FakeBridge(
         [

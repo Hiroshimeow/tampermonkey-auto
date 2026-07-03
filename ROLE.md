@@ -47,6 +47,8 @@ Rules:
 - The role should return exact report paths when the next role needs that report.
 - The transport agent may pass those report files to the next role with `--upload`.
 - If the role only returns a path, the next role must receive that file path or uploaded file as context; the transport agent must not reinterpret the local work itself.
+- For long answers, multi-role coordination, implementation reports, audit reports, or review reports, returning a `.md` path is correct in mode 1.
+- When a mode 1 role returns only a path, the transport agent must not read/code/review the local contents itself if another local role should continue. It should pass the path or upload the file to the next role.
 
 Good local workflow:
 
@@ -90,6 +92,8 @@ Write your answer to .plan/summary.md and return only the path.
 ```
 
 Reason: when a role works with agent, the transport agent should receive the answer through `response_path`, not through an extra report path.
+
+This restriction applies only to mode 2. In mode 1, returning a `.md` path is often the correct way for local roles to coordinate long work.
 
 Repair if the role answered with only a path:
 
@@ -353,7 +357,7 @@ After `role.py` returns:
 - If success: read `response_path`.
 - If mode 2: return or summarize the answer content from `response_path`.
 - If mode 2 and `response_path` contains only a local path/report path: do not treat it as answered. Call the same role again and require a direct answer in the assistant response.
-- If mode 1: route based on the returned content, usually by uploading the report/handoff file to the next role.
+- If mode 1 and the response contains a report/handoff path: pass that path or upload that file to the next local role. Do not read/code/review it yourself.
 - If retryable: retry same request, preferably with `--request-id`.
 - If final failure: report `request_id`, `error_id`, and `log_path`.
 
@@ -362,5 +366,5 @@ After `role.py` returns:
 Use this as the system instruction for a transport-only agent:
 
 ```text
-You are a transport-only role orchestrator. Your job is to call role.py, upload explicit files when useful, read returned response_path files, and route work between online roles. You must classify each call by behavior, not by role name. There are two modes: mode 1, role works on local; mode 2, role works with agent. In mode 1, let the role use its own local/MCP/repo tools and write .plan/*.md reports or handoffs when useful; you only transport those files between roles. In mode 2, provide all needed context with --upload, ask for a direct answer in the role response, do not ask for an extra .md report path, and avoid asking the role to use local MCP/repo tools. If a mode 2 role returns only a local path, call it again and require a direct answer; do not report the path as the answer. You must not inspect source files, edit code, review code, create plans, or synthesize multi-stream conclusions yourself unless the user explicitly asks for direct Q/A mode. Use a 30-minute process timeout for role.py. On retryable failure, retry the same request with the same prompt/uploads and request_id. Use --new-chat only after a handoff/summary is available or when starting a truly fresh request. Keep outputs concise and report exact request_id/error_id/log_path when blocked.
+You are a transport-only role orchestrator. Your job is to call role.py, upload explicit files when useful, read returned response_path files, and route work between online roles. You must classify each call by behavior, not by role name. There are two modes: mode 1, role works on local; mode 2, role works with agent. In mode 1, let the role use its own local/MCP/repo tools and write .plan/*.md reports or handoffs when useful, especially for long answers or multi-role coordination. If a mode 1 role returns a path, pass the path or upload that file to the next local role; do not read/code/review it yourself. In mode 2, provide all needed context with --upload, ask for a direct answer in the role response, do not ask for an extra .md report path, and avoid asking the role to use local MCP/repo tools. If a mode 2 role returns only a local path, call it again and require a direct answer; do not report the path as the answer. You must not inspect source files, edit code, review code, create plans, or synthesize multi-stream conclusions yourself unless the user explicitly asks for direct Q/A mode. Use a 30-minute process timeout for role.py. On retryable failure, retry the same request with the same prompt/uploads and request_id. Use --new-chat only after a handoff/summary is available or when starting a truly fresh request. Keep outputs concise and report exact request_id/error_id/log_path when blocked.
 ```

@@ -114,6 +114,13 @@ uv run role.py --role DEV --prompt "<paste 800 lines of plan/code here>"
 
 `role.py` itself may spill long rendered prompts into an uploaded `prompt.md`. The agent does not need to manage that.
 
+Upload implementation detail:
+
+- `role.py` and the browser bridge use one upload transport: synthetic drag/drop.
+- The upload method default is owned by shared core code, not by the transport agent.
+- Do not ask for or choose input/paste upload modes. They are retained only as internal reference code for maintainers.
+- A visible ChatGPT "Add anything" drop overlay after upload is acceptable during automation. It does not mean the role failed. If a human wants to manually use that tab afterward, a normal F5/reload clears it.
+
 ## Output Contract
 
 `role.py` returns one JSON object.
@@ -199,6 +206,8 @@ The agent must not manage browser progress itself.
 - saving responses to `.role_state/responses/`
 
 If browser lag/F5 happens, do not open a new chat immediately. Retry the same `role.py` request first.
+
+If the user reports that the ChatGPT UI is visually blocked by a stale upload/drop overlay after automation has completed, a plain browser reload is acceptable for manual use. The transport agent should still prefer `role.py --restart` only when the role tab is stale or the user explicitly asks for reload recovery.
 
 ## New Chat Rules
 

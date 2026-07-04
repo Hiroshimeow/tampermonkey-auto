@@ -82,6 +82,27 @@ def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send
     assert "FLOW_STATE" not in repair_prompt
 
 
+def test_run_reports_invalid_route_stop_instead_of_max_turns() -> None:
+    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--max-turns", "60"])
+    coordinator = Coordinator(args)
+    calls = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        calls.append((prompt_role, repair))
+        return "plain answer without route json"
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "stopped_invalid_route"
+    assert result["turns"] == 1
+    assert result["last_role"] == "A"
+    assert result["last_route_error"] == "missing route JSON object"
+    assert result["last_response"] == "plain answer without route json"
+    assert calls == [("A", False), ("A", True)]
+
+
 def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
     args = parse_args(["--goal", "finish the task", "--role", "A,B"])
     coordinator = Coordinator(args)

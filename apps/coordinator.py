@@ -55,12 +55,38 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.wait_background_tasks()
         if self.finished:
             return self.finished
+        return self.unfinished_result(state)
+
+    def unfinished_result(self, state: FlowState) -> dict[str, Any]:
+        last = state.results[-1] if state.results else None
+        if last and not last.route.ok:
+            return {
+                "status": "stopped_invalid_route",
+                "turns": self.turn_count,
+                "phase": state.phase,
+                "handoffs": state.handoffs,
+                "last_role": last.prompt_role,
+                "last_route_error": last.route.error or "missing route JSON object",
+                "last_response": last.response,
+            }
+        if last and "FINISH" in last.route.targets and last.prompt_role not in self.finish_roles:
+            return {
+                "status": "finish_not_authorized",
+                "turns": self.turn_count,
+                "phase": state.phase,
+                "handoffs": state.handoffs,
+                "last_role": last.prompt_role,
+                "finish_authority": sorted(self.finish_roles),
+                "last_response": last.response,
+            }
+        status = "max_turns_reached" if not self.has_turn_budget() else "no_finish"
         return {
-            "status": "max_turns_or_no_finish",
+            "status": status,
             "turns": self.turn_count,
             "phase": state.phase,
             "handoffs": state.handoffs,
-            "last_response": state.results[-1].response if state.results else "",
+            "last_role": last.prompt_role if last else "",
+            "last_response": last.response if last else "",
         }
 
     def dispatch_role(

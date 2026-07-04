@@ -128,11 +128,20 @@ class BridgeClient:
                     return response
             if prompt:
                 print(
-                    f"[send-recover] role={browser_role} {exc}; no new response detected, reloading and retrying send once",
+                    f"[send-recover] role={browser_role} {exc}; no new response detected, reloading and rechecking before retry",
                     flush=True,
                 )
                 self.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=20.0)
                 self.sleep(DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S)
+                activity = self.response_activity(self.role_snapshot(browser_role), previous_response=before_send.response)
+                if self.is_response_active(activity) or activity.changed:
+                    print(
+                        f"[send-recover] role={browser_role} response appeared after reload, waiting for it",
+                        flush=True,
+                    )
+                    response = self.wait_for_current_response(browser_role, timeout_s, require_response=True)
+                    if response:
+                        return response
                 self.set_prompt(browser_role, prompt, timeout_s, force_replace=True)
                 self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
             else:

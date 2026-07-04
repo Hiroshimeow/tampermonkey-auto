@@ -727,6 +727,27 @@ def test_call_browser_role_reloads_and_retries_once_when_click_send_fails_withou
     assert "RELOAD_PAGE" in bridge.commands
 
 
+def test_call_browser_role_rechecks_after_reload_before_retrying_send() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+        ],
+        command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
+    )
+
+    response = bridge.call_browser_role("DEV", "repair route json", timeout_s=2.0)
+
+    assert response == '```json\n{"REVIEW":"continue"}\n```'
+    assert bridge.commands.count("SET_PROMPT") == 1
+    assert bridge.commands.count("CLICK_SEND") == 1
+    assert "RELOAD_PAGE" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
 def test_call_browser_role_recovers_when_click_send_fails_but_response_started() -> None:
     bridge = FakeBridge(
         [

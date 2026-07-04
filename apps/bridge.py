@@ -99,7 +99,7 @@ class BridgeClient:
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
         self.set_prompt(browser_role, prompt, timeout_s)
-        return self.send_current_prompt_and_wait(browser_role, timeout_s)
+        return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt)
 
     def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
         self.wait_until_clean_ready(browser_role, timeout_s)
@@ -112,7 +112,7 @@ class BridgeClient:
         self.wait_until_clean_ready(browser_role, timeout_s)
         return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
 
-    def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float) -> str:
+    def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float, *, prompt: str | None = None) -> str:
         before_send = self.response_activity(self.role_snapshot(browser_role))
         try:
             self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
@@ -126,7 +126,17 @@ class BridgeClient:
                 response = self.wait_for_current_response(browser_role, timeout_s)
                 if response:
                     return response
-            raise
+            if prompt:
+                print(
+                    f"[send-recover] role={browser_role} {exc}; no new response detected, reloading and retrying send once",
+                    flush=True,
+                )
+                self.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=20.0)
+                self.sleep(DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S)
+                self.set_prompt(browser_role, prompt, timeout_s, force_replace=True)
+                self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+            else:
+                raise
         return self.wait_assistant_done(browser_role, timeout_s)
 
     def wait_assistant_done(self, browser_role: str, timeout_s: float) -> str:

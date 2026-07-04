@@ -135,7 +135,7 @@ class BridgeClient:
         result = final.get("result") or {}
         if status != "ASSISTANT_DONE":
             if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
-                return self.recover_response_after_reload(browser_role, timeout_s)
+                return self.recover_response_after_reload(browser_role, timeout_s, require_response=True)
             if status == "ERROR_COMMAND":
                 reason = str(result.get("reason") or "unknown")
                 print(
@@ -525,6 +525,7 @@ class BridgeClient:
         reload_delay_s: float = DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+        require_response: bool = False,
     ) -> str:
         return self.wait_for_current_response(
             role,
@@ -532,6 +533,7 @@ class BridgeClient:
             active_wait_s=reload_delay_s,
             page_wait_s=page_wait_s,
             poll_s=poll_s,
+            require_response=require_response,
         )
 
     def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:

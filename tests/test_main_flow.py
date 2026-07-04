@@ -634,6 +634,29 @@ def test_call_browser_role_resyncs_when_assistant_done_text_is_incomplete_json()
     assert "SYNC_TRANSCRIPT" in bridge.commands
 
 
+def test_call_browser_role_recovers_when_wait_command_loses_turn_context() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("partial answer", True),
+            response_snapshot('Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: recovered."}\n```', False),
+        ],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {"done": True, "status": "ERROR_COMMAND", "result": {"reason": "missing_send_accept_context"}},
+            ],
+        },
+    )
+
+    response = bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=2.0)
+
+    assert "TASK COMPLETE" in response
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
 def test_call_browser_role_recovers_when_click_send_fails_but_response_started() -> None:
     bridge = FakeBridge(
         [

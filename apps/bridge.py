@@ -132,11 +132,19 @@ class BridgeClient:
     def wait_assistant_done(self, browser_role: str, timeout_s: float) -> str:
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
         status = str(final.get("status") or "")
+        result = final.get("result") or {}
         if status != "ASSISTANT_DONE":
             if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
                 return self.recover_response_after_reload(browser_role, timeout_s)
+            if status == "ERROR_COMMAND":
+                reason = str(result.get("reason") or "unknown")
+                print(
+                    f"[response-watch] role={browser_role} WAIT_ASSISTANT_DONE returned ERROR_COMMAND "
+                    f"reason={reason}; recovering current response",
+                    flush=True,
+                )
+                return self.wait_for_current_response(browser_role, timeout_s, require_response=True)
             raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
-        result = final.get("result") or {}
         response = str(result.get("text") or "").strip()
         if self.looks_incomplete_response(response):
             print(

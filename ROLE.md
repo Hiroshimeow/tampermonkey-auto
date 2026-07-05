@@ -137,6 +137,13 @@ Multiple uploads:
 uv run role.py --role REVIEW --prompt "Review the attached report and patch. Return blockers first." --upload "E:\repo\.plan\dev-report.md" --upload "E:\repo\patch.diff"
 ```
 
+Context-passing options:
+
+- `--prompt`: send short, self-contained instructions or context directly.
+- `--upload <path>`: attach files when context is long, exact, or should be reproducible.
+- `--resp-from ROLE`: prefix the prompt with up to the 3 latest assistant responses from another online role. Use it only when the latest browser response is the useful context; the agent may still choose `--prompt` or `--upload` instead.
+
+
 No `--goal` is used. Use `--prompt` only.
 
 The agent should set a command timeout of 30 minutes when running `role.py`:

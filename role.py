@@ -466,7 +466,6 @@ def main(argv: list[str] | None = None) -> int:
 
     upload_paths, upload_errors = validate_upload_paths(list(args.upload or []))
     raw_uploads_for_key = [{"path": str(path), "sha256": sha256_file(path), "size": path.stat().st_size} for path in upload_paths]
-    base_prompt_for_key = build_prompt(prompt, source_role, [])
     context_rendered = render_direct_role_prompt(
         role=role,
         user_prompt="USER_PROMPT_PLACEHOLDER",
@@ -474,6 +473,18 @@ def main(argv: list[str] | None = None) -> int:
         request_marker=REQUEST_MARKER,
     )
     role_context_hash = sha256_text(rendered_hash_source(context_rendered))
+    source_responses_for_key: list[str] = []
+    client: BridgeClient | None = None
+    if source_role and not args.request_id:
+        try:
+            with redirect_stdout(sys.stderr):
+                client = BridgeClient(args.base_url, args.request_timeout)
+                source_responses_for_key = fetch_source_responses(client, source_role)
+        except Exception as exc:
+            request_id_for_fail = make_request_id(role, idempotency_key(role, prompt, source_role, role_context_hash, raw_uploads_for_key))
+            emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id_for_fail, run_id=run_id, role=role, error=exc, message=f"failed to read responses from {source_role}"))
+            return 3
+    base_prompt_for_key = build_prompt(prompt, source_role, source_responses_for_key)
     key = idempotency_key(role, base_prompt_for_key, source_role, role_context_hash, raw_uploads_for_key)
     request_id_for_fail = args.request_id or make_request_id(role, key)
     if upload_errors:
@@ -494,12 +505,13 @@ def main(argv: list[str] | None = None) -> int:
 
     existing_response_path = Path(str(ledger.get("response_path") or response_path(request_id)))
     if ledger.get("status") == "completed" and existing_response_path.exists():
-        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
+        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
         return 0
 
     try:
         with redirect_stdout(sys.stderr):
-            client = BridgeClient(args.base_url, args.request_timeout)
+            if client is None:
+                client = BridgeClient(args.base_url, args.request_timeout)
             if ledger.get("status") in {"sent", "waiting", "prompt_set", "uploaded", "failed_retryable"}:
                 recovered_response, recovery_state = recover_existing_response(client, role, request_id, args.timeout)
                 if recovered_response:
@@ -523,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError(f"{role} ledger says request {request_id} was sent, but marker was not found after recovery grace; retry later or use --new-request")
 
             run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
-            source_responses = fetch_source_responses(client, source_role) if source_role else []
+            source_responses = source_responses_for_key if source_role and not args.request_id else (fetch_source_responses(client, source_role) if source_role else [])
             user_prompt = build_prompt(prompt, source_role, source_responses)
             rendered = render_direct_role_prompt(
                 role=role,

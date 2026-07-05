@@ -329,6 +329,44 @@ def test_main_missing_upload_path_fails_final(monkeypatch, tmp_path, capsys) -> 
     assert payload["error_id"]
 
 
+def test_resp_from_source_change_creates_new_request(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    source_texts = ["first source response", "second source response"]
+    source_reads = []
+    sent_prompts = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def role_snapshot(self, role_name: str) -> dict:
+            assert role_name == "DEV"
+            index = min(len(source_reads), len(source_texts) - 1)
+            source_reads.append(role_name)
+            return {"dom_info": {"messages": {"messages": [{"role": "assistant", "text": source_texts[index]}]}}}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            sent_prompts.append(prompt)
+            return f"answer {len(sent_prompts)}"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    first_code = role.main(["--role", "review", "--resp-from", "dev", "--prompt", "same prompt"])
+    first = stdout_json(capsys.readouterr().out)
+    second_code = role.main(["--role", "review", "--resp-from", "dev", "--prompt", "same prompt"])
+    second = stdout_json(capsys.readouterr().out)
+
+    assert first_code == 0
+    assert second_code == 0
+    assert first["request_id"] != second["request_id"]
+    assert first["recovered"] is False
+    assert second["recovered"] is False
+    assert response_text(first) == "answer 1"
+    assert response_text(second) == "answer 2"
+    assert "first source response" in sent_prompts[0]
+    assert "second source response" in sent_prompts[1]
+
+
 def test_completed_request_returns_cached_response(monkeypatch, tmp_path, capsys) -> None:
     isolate_role_state(monkeypatch, tmp_path)
 

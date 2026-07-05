@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import threading
 
 from apps.text import compact_text
 
@@ -41,22 +42,35 @@ class FlowState:
     results: list[TurnResult] = field(default_factory=list)
     handoffs: dict[str, str] = field(default_factory=dict)
     phase: int = 1
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def add(self, result: TurnResult) -> None:
-        self.results.append(result)
-        handoff = result.handoff.strip()
-        if handoff:
-            self.handoffs[result.prompt_role] = handoff
+        with self._lock:
+            self.results.append(result)
+            handoff = result.handoff.strip()
+            if handoff:
+                self.handoffs[result.prompt_role] = handoff
+
+    def advance_phase(self) -> int:
+        with self._lock:
+            self.phase += 1
+            return self.phase
 
     def compact(self, max_chars: int) -> str:
-        parts = [f"GOAL:\n{self.goal.strip()}", f"PHASE: {self.phase}"]
-        if self.handoffs:
+        with self._lock:
+            goal = self.goal
+            phase = self.phase
+            handoffs = dict(self.handoffs)
+            results = list(self.results)
+
+        parts = [f"GOAL:\n{goal.strip()}", f"PHASE: {phase}"]
+        if handoffs:
             parts.append("SAVED_HANDOFFS:")
-            for role, handoff in sorted(self.handoffs.items()):
+            for role, handoff in sorted(handoffs.items()):
                 parts.append(f"[{role}]\n{handoff}")
-        if self.results:
+        if results:
             parts.append("RECENT_TURNS:")
-            for item in self.results[-8:]:
+            for item in results[-8:]:
                 parts.append(
                     f"TURN {item.turn} {item.prompt_role} on {item.browser_role} caller={item.caller_role}\n"
                     f"instruction: {compact_text(item.instruction, 900)}\n"

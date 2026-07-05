@@ -76,7 +76,7 @@ class BrowserLifecycleMixin:
             self.reset_browser_for(role)
             did_reset = True
         if did_reset:
-            state.phase += 1
+            state.advance_phase()
 
     def reset_browser_for(self, prompt_role: str) -> None:
         self.system_sent.discard(normalize_role(prompt_role))

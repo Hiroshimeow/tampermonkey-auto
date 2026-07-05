@@ -98,9 +98,21 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        self.wait_until_clean_ready(browser_role, timeout_s)
+        self.set_prompt(browser_role, prompt, timeout_s)
+        return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt)
 
-        self._run_command(browser_role, "SET_PROMPT", {"text": prompt, "method": "auto"}, timeout_s, "PASTE_CONFIRMED")
+    def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
+        self.wait_until_clean_ready(browser_role, timeout_s)
+        payload = {"text": prompt, "method": "auto"}
+        if force_replace:
+            payload["force_replace"] = True
+        return self._run_command(browser_role, "SET_PROMPT", payload, timeout_s, "PASTE_CONFIRMED")
+
+    def upload_files(self, browser_role: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        self.wait_until_clean_ready(browser_role, timeout_s)
+        return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
+
+    def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float, *, prompt: str | None = None) -> str:
         before_send = self.response_activity(self.role_snapshot(browser_role))
         try:
             self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
@@ -114,14 +126,44 @@ class BridgeClient:
                 response = self.wait_for_current_response(browser_role, timeout_s)
                 if response:
                     return response
-            raise
+            if prompt:
+                print(
+                    f"[send-recover] role={browser_role} {exc}; no new response detected, reloading and rechecking before retry",
+                    flush=True,
+                )
+                self.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=20.0)
+                self.sleep(DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S)
+                activity = self.response_activity(self.role_snapshot(browser_role), previous_response=before_send.response)
+                if self.is_response_active(activity) or activity.changed:
+                    print(
+                        f"[send-recover] role={browser_role} response appeared after reload, waiting for it",
+                        flush=True,
+                    )
+                    response = self.wait_for_current_response(browser_role, timeout_s, require_response=True)
+                    if response:
+                        return response
+                self.set_prompt(browser_role, prompt, timeout_s, force_replace=True)
+                self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+            else:
+                raise
+        return self.wait_assistant_done(browser_role, timeout_s)
+
+    def wait_assistant_done(self, browser_role: str, timeout_s: float) -> str:
         final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
         status = str(final.get("status") or "")
+        result = final.get("result") or {}
         if status != "ASSISTANT_DONE":
             if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
-                return self.recover_response_after_reload(browser_role, timeout_s)
+                return self.recover_response_after_reload(browser_role, timeout_s, require_response=True)
+            if status == "ERROR_COMMAND":
+                reason = str(result.get("reason") or "unknown")
+                print(
+                    f"[response-watch] role={browser_role} WAIT_ASSISTANT_DONE returned ERROR_COMMAND "
+                    f"reason={reason}; recovering current response",
+                    flush=True,
+                )
+                return self.wait_for_current_response(browser_role, timeout_s, require_response=True)
             raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
-        result = final.get("result") or {}
         response = str(result.get("text") or "").strip()
         if self.looks_incomplete_response(response):
             print(
@@ -327,10 +369,16 @@ class BridgeClient:
         last_response = ""
         last_logged_bucket = -1
         last_activity: ResponseActivity | None = None
+        active_reload_used = False
 
         while time.time() < deadline:
-            self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
-            activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            try:
+                self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
+                activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+            except Exception as exc:
+                print(f"[response-watch] role={role} transient snapshot/sync failure: {exc}; waiting", flush=True)
+                self.sleep(max(0.1, poll_s))
+                continue
             last_activity = activity
             last_response = activity.response or last_response
 
@@ -397,11 +445,12 @@ class BridgeClient:
                 )
                 last_logged_bucket = bucket
 
-            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s):
+            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s) and not active_reload_used:
                 print(
-                    f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page",
+                    f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page once",
                     flush=True,
                 )
+                active_reload_used = True
                 self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
                 self.sleep(max(0.0, page_wait_s))
                 cycle_started = time.time()
@@ -434,7 +483,12 @@ class BridgeClient:
         last_activity: ResponseActivity | None = None
         last_logged_bucket = -1
         while time.time() < deadline:
-            activity = self.response_activity(self.role_snapshot(role))
+            try:
+                activity = self.response_activity(self.role_snapshot(role))
+            except Exception as exc:
+                print(f"[ready-check] role={role} transient snapshot failure: {exc}; waiting", flush=True)
+                self.sleep(max(0.1, poll_s))
+                continue
             last_activity = activity
             if self.is_clean_ready(activity):
                 return activity
@@ -490,6 +544,7 @@ class BridgeClient:
         reload_delay_s: float = DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+        require_response: bool = False,
     ) -> str:
         return self.wait_for_current_response(
             role,
@@ -497,6 +552,7 @@ class BridgeClient:
             active_wait_s=reload_delay_s,
             page_wait_s=page_wait_s,
             poll_s=poll_s,
+            require_response=require_response,
         )
 
     def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:

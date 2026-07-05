@@ -82,6 +82,27 @@ def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send
     assert "FLOW_STATE" not in repair_prompt
 
 
+def test_run_reports_invalid_route_stop_instead_of_max_turns() -> None:
+    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--max-turns", "60"])
+    coordinator = Coordinator(args)
+    calls = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        calls.append((prompt_role, repair))
+        return "plain answer without route json"
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "stopped_invalid_route"
+    assert result["turns"] == 1
+    assert result["last_role"] == "A"
+    assert result["last_route_error"] == "missing route JSON object"
+    assert result["last_response"] == "plain answer without route json"
+    assert calls == [("A", False), ("A", True)]
+
+
 def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
     args = parse_args(["--goal", "finish the task", "--role", "A,B"])
     coordinator = Coordinator(args)
@@ -560,6 +581,24 @@ def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_te
     assert bridge.sleeps
 
 
+def test_set_prompt_and_upload_wait_for_full_timeout_before_replacing_prompt() -> None:
+    class RecordingBridge(FakeBridge):
+        def __init__(self) -> None:
+            super().__init__([response_snapshot("old response", False)])
+            self.ready_timeouts: list[float] = []
+
+        def wait_until_clean_ready(self, role: str, timeout_s: float, poll_s: float = 2.0):
+            self.ready_timeouts.append(timeout_s)
+            return self.response_activity(response_snapshot("old response", False))
+
+    bridge = RecordingBridge()
+
+    bridge.set_prompt("REVIEW", "automated prompt", timeout_s=1800.0)
+    bridge.upload_files("REVIEW", {"files": [], "text": "attached context"}, timeout_s=1800.0)
+
+    assert bridge.ready_timeouts == [1800.0, 1800.0]
+
+
 def test_call_browser_role_does_not_reuse_response_that_finishes_while_waiting_to_send() -> None:
     bridge = FakeBridge(
         [
@@ -613,6 +652,99 @@ def test_call_browser_role_resyncs_when_assistant_done_text_is_incomplete_json()
     assert response == '```json\n{"DEV":"continue"}\n```'
     assert "SET_PROMPT" in bridge.commands
     assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
+def test_call_browser_role_waits_for_recovered_response_after_assistant_timeout() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("", False),
+            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+        ],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {"done": True, "status": "ASSISTANT_TIMEOUT", "result": {}},
+            ],
+        },
+    )
+
+    response = bridge.call_browser_role("DEV", "automated prompt", timeout_s=2.0)
+
+    assert response == '```json\n{"REVIEW":"continue"}\n```'
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert bridge.commands.count("SYNC_TRANSCRIPT") >= 2
+
+
+def test_call_browser_role_recovers_when_wait_command_loses_turn_context() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old response", False),
+            response_snapshot("old response", False),
+            response_snapshot("partial answer", True),
+            response_snapshot('Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: recovered."}\n```', False),
+        ],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {"done": True, "status": "ERROR_COMMAND", "result": {"reason": "missing_send_accept_context"}},
+            ],
+        },
+    )
+
+    response = bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=2.0)
+
+    assert "TASK COMPLETE" in response
+    assert "SET_PROMPT" in bridge.commands
+    assert "CLICK_SEND" in bridge.commands
+    assert "SYNC_TRANSCRIPT" in bridge.commands
+
+
+def test_call_browser_role_reloads_and_retries_once_when_click_send_fails_without_new_response() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+        ],
+        command_results={
+            "CLICK_SEND": [
+                {"done": True, "status": "SEND_FAILED"},
+            ],
+            "WAIT_ASSISTANT_DONE": [
+                {"done": True, "status": "ASSISTANT_DONE", "result": {"text": '```json\n{"REVIEW":"continue"}\n```'}},
+            ],
+        },
+    )
+
+    response = bridge.call_browser_role("DEV", "repair route json", timeout_s=2.0)
+
+    assert response == '```json\n{"REVIEW":"continue"}\n```'
+    assert bridge.commands.count("SET_PROMPT") == 2
+    assert bridge.commands.count("CLICK_SEND") == 2
+    assert "RELOAD_PAGE" in bridge.commands
+
+
+def test_call_browser_role_rechecks_after_reload_before_retrying_send() -> None:
+    bridge = FakeBridge(
+        [
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot("old invalid response", False),
+            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+        ],
+        command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
+    )
+
+    response = bridge.call_browser_role("DEV", "repair route json", timeout_s=2.0)
+
+    assert response == '```json\n{"REVIEW":"continue"}\n```'
+    assert bridge.commands.count("SET_PROMPT") == 1
+    assert bridge.commands.count("CLICK_SEND") == 1
+    assert "RELOAD_PAGE" in bridge.commands
     assert "SYNC_TRANSCRIPT" in bridge.commands
 
 

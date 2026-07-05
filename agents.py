@@ -27,6 +27,7 @@ import urllib.request
 import zlib
 
 import workflow_engine
+from apps.constants import DEFAULT_UPLOAD_METHOD
 from workflow_engine import (
     COMPLETION_TARGETS,
     RoutingValidation,
@@ -391,7 +392,7 @@ def upload_payload_from_source(source, *, uniquify=True) -> list[dict]:
     raise ValueError(f"unsupported upload source descriptor: {source!r}")
 
 
-def build_upload_files_payload(sources, *, text="", method="input", upload_wait_ms=15000, uniquify=True) -> dict:
+def build_upload_files_payload(sources, *, text="", method=DEFAULT_UPLOAD_METHOD, upload_wait_ms=15000, uniquify=True) -> dict:
     entries = []
     for source in sources:
         entries.extend(upload_payload_from_source(source, uniquify=uniquify))
@@ -405,8 +406,8 @@ def build_upload_files_payload(sources, *, text="", method="input", upload_wait_
     }
 
 
-def run_upload_sources(role, sources, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
-    """Upload local/web/base64/clipboard sources through the browser bridge."""
+def run_upload_sources(role, sources, *, text="", method=DEFAULT_UPLOAD_METHOD, timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+    """Upload local/web/base64/clipboard sources through the browser bridge using drop-only transport."""
     payload = build_upload_files_payload(
         sources,
         text=text,
@@ -417,8 +418,8 @@ def run_upload_sources(role, sources, *, text="", method="input", timeout=180, p
     return run_command(role, "UPLOAD_FILES", payload, timeout=timeout, print_every=print_every)
 
 
-def run_upload_files(role, files, *, text="", method="input", timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
-    """Upload local files to the ChatGPT composer through the browser bridge."""
+def run_upload_files(role, files, *, text="", method=DEFAULT_UPLOAD_METHOD, timeout=180, print_every=2.0, upload_wait_ms=15000, uniquify=True):
+    """Upload local files to the ChatGPT composer through the drop-only browser bridge."""
     return run_upload_sources(
         role,
         list(files),

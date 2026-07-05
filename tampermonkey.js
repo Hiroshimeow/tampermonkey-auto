@@ -439,6 +439,9 @@
         });
     }
 
+    // Reference-only fallback: direct file input assignment worked for some single-file cases,
+    // but it picked ChatGPT's image-only input for mixed uploads and left send disabled.
+    // Keep this helper documented for future debugging; UPLOAD_FILES runtime uses drop only.
     function tryAssignFilesToInput(files) {
         const inputs = visibleFileInputs()
             .filter((item) => !item.disabled)
@@ -1225,7 +1228,15 @@
 
             before = domSnapshot();
             const beforeAttachments = before.composer_attachments || [];
-            const methods = method === 'auto' ? ['input', 'paste', 'drop'] : [method];
+            // Upload policy: use synthetic drag/drop only.
+            // Input assignment and paste upload paths are intentionally left as documented
+            // reference helpers elsewhere in this file, but are not part of the runtime
+            // upload flow. Drop was the only method that reliably handled mixed code/text/image
+            // uploads in ChatGPT without disabling send.
+            const uploadMethod = 'drop';
+            if (method && method !== 'auto' && method !== 'drop') {
+                tried.push({ method, ok: false, ignored: true, reason: 'upload_runtime_is_drop_only' });
+            }
             const targets = uniqueElements([
                 composer,
                 closestComposerRoot(),
@@ -1246,54 +1257,20 @@
                 return false;
             };
 
-            for (const currentMethod of methods) {
-                if (currentMethod === 'input') {
-                    const assigned = tryAssignFilesToInput(files);
-                    tried.push({ method: currentMethod, ok: assigned.ok, input: assigned.input });
-                    if (await checkAfterAttempt(currentMethod)) {
-                        break;
+            for (const target of targets) {
+                const dt = buildFileDataTransfer(files, text);
+                let targetAttempted = false;
+                for (const eventName of ['dragenter', 'dragover', 'drop']) {
+                    try {
+                        dispatchClipboardLikeEvent(target, eventName, dt);
+                        targetAttempted = true;
+                        tried.push({ method: `${uploadMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: true });
+                    } catch (error) {
+                        tried.push({ method: `${uploadMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
                     }
-                } else if (currentMethod === 'paste') {
-                    for (const target of targets) {
-                        const dt = buildFileDataTransfer(files, text);
-                        try {
-                            dispatchClipboardLikeEvent(target, 'paste', dt);
-                            tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: true });
-                        } catch (error) {
-                            tried.push({ method: currentMethod, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
-                        }
-                        if (await checkAfterAttempt(`${currentMethod}:${domPath(target) || target.nodeName || 'document'}`)) {
-                            break;
-                        }
-                    }
-                    if (succeededMethod) {
-                        break;
-                    }
-                } else if (currentMethod === 'drop') {
-                    for (const target of targets) {
-                        const dt = buildFileDataTransfer(files, text);
-                        let targetAttempted = false;
-                        for (const eventName of ['dragenter', 'dragover', 'drop']) {
-                            try {
-                                dispatchClipboardLikeEvent(target, eventName, dt);
-                                targetAttempted = true;
-                                tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: true });
-                            } catch (error) {
-                                tried.push({ method: `${currentMethod}:${eventName}`, target: domPath(target) || target.nodeName || 'document', ok: false, error: String(error && error.message || error) });
-                            }
-                        }
-                        if (targetAttempted && await checkAfterAttempt(`${currentMethod}:${domPath(target) || target.nodeName || 'document'}`)) {
-                            break;
-                        }
-                    }
-                    if (succeededMethod) {
-                        break;
-                    }
-                } else {
-                    tried.push({ method: currentMethod, ok: false, error: 'unsupported_upload_method' });
-                    if (await checkAfterAttempt(currentMethod)) {
-                        break;
-                    }
+                }
+                if (targetAttempted && await checkAfterAttempt(`${uploadMethod}:${domPath(target) || target.nodeName || 'document'}`)) {
+                    break;
                 }
             }
 
@@ -2052,4 +2029,3 @@
     stop();
     start();
 })();
-

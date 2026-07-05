@@ -139,7 +139,7 @@ Example route message:
 
 `role.py` is the minimal entrypoint for external orchestrators such as opencode, OpenClaw, Hermes, or Codex.
 
-It sends one prompt to one browser role, waits for the assistant response to finish, and prints exactly one JSON object to stdout.
+It sends one prompt to one browser role, waits for the assistant response to finish, saves the full response to `.role_state/responses/`, and prints exactly one JSON object to stdout. The JSON intentionally does not include a response preview; callers should read `response_path`.
 
 Commands:
 
@@ -148,8 +148,11 @@ uv run python role.py --role PLAN --prompt "review code changes in E:\python_pro
 uv run python role.py --role REVIEW --resp-from DEV --prompt "Review the latest DEV response."
 uv run python role.py --role PLAN --new-chat --prompt "Read .plan\\turn_1_plan.md only and continue."
 uv run python role.py --role DEV --restart --prompt "Read .plan\\turn_2_dev.md only and continue."
+uv run python role.py --role DEV --prompt "Implement the attached plan." --upload "E:\repo\.plan\plan.md"
 Get-Content .plan\prompt.txt | uv run python role.py --role PLAN
 ```
+
+`--upload <path>` attaches explicit files before sending. Runtime upload uses one browser transport: synthetic drag/drop. Input/paste upload paths are not public modes; they are retained only as internal reference code.
 
 `--resp-from ROLE` reads up to the 3 latest assistant responses from that source role and prefixes them to the prompt before sending it to the target role.
 
@@ -161,25 +164,48 @@ If both are set, `role.py` runs `--restart` first, then `--new-chat`, then sends
 
 If `--resp-from` is omitted, `role.py` sends only `--prompt` or stdin.
 
-Stdout contract:
+Success stdout contract:
 
 ```json
-{"ok":true,"exit_code":0,"summary":"short preview","data":{"role":"PLAN","resp_from":null,"source_response_count":0,"response":"full assistant response"},"error":null}
+{
+  "ok": true,
+  "status": "completed",
+  "exit_code": 0,
+  "request_id": "req_PLAN_...",
+  "run_id": "run_...",
+  "role": "PLAN",
+  "resp_from": null,
+  "source_response_count": 0,
+  "response_path": ".role_state\\responses\\req_PLAN_....md",
+  "uploaded": 0,
+  "recovered": false,
+  "error": null
+}
 ```
 
-Failure contract:
+Failure stdout contract:
 
 ```json
-{"ok":false,"exit_code":2,"summary":"missing prompt","data":null,"error":{"type":"Error","message":"--prompt or stdin prompt text is required"}}
+{
+  "ok": false,
+  "status": "failed_retryable",
+  "exit_code": 3,
+  "request_id": "req_DEV_...",
+  "run_id": "run_...",
+  "error_id": "err_req_DEV_...",
+  "role": "DEV",
+  "message": "runtime failed for DEV",
+  "log_path": ".role_state\\logs\\err_req_DEV_....log"
+}
 ```
 
 Notes:
 
 - stdout is exactly one JSON object.
-- `data.response` is the full assistant response.
-- `summary` is a short preview for logs.
+- On success, read `response_path` for the full assistant response.
 - JSON is written as UTF-8 directly to stdout to avoid Windows codepage failures without expanding Unicode into `\\u....` escapes.
 - Bridge and recovery logs go to stderr.
+- A stale ChatGPT "Add anything" drop overlay after upload is a UI side effect. It does not imply role failure; reload/F5 clears it for manual browser use.
 
 Exit codes:
 
@@ -196,7 +222,7 @@ Use this guide when an external agent is asked to call a browser role through `r
 
 Hard rules:
 
-1. Run exactly one requested `uv run python role.py ...` command. Use `--new-chat` only when starting a clean role session from an exact `.plan/...md` file. Use `--restart` only when the browser tab is stale or needs reload recovery.
+1. Run exactly one requested `uv run python role.py ...` command. Use `--upload` for explicit files instead of pasting large content. Use `--new-chat` only when starting a clean role session from an exact `.plan/...md` file. Use `--restart` only when the browser tab is stale or needs reload recovery.
 2. Do not perform any other action, no matter how small.
 3. Do not read the repo.
 4. Do not edit files.
@@ -205,9 +231,9 @@ Hard rules:
 7. Do not infer or execute a next step.
 8. Wait only for the `role.py` process to finish.
 9. Parse stdout as one JSON object.
-10. If `ok=true` and exit code is `0`, return `data.response` as the result.
-11. If `ok=false` or the exit code is not `0`, report `summary`, `error.type`, `error.message`, and the exit code.
-12. Do not retry unless explicitly instructed.
+10. If `ok=true` and exit code is `0`, read `response_path` and return that file's content as the result.
+11. If `ok=false` or the exit code is not `0`, report `status`, `request_id`, `error_id`, `message`, `log_path`, and the exit code when present.
+12. On retryable failure, retry the same request with the same prompt/uploads and `--request-id` unless the user told you not to retry.
 13. Treat stderr as runtime logs only. Do not mix stderr into the main result unless reporting an operational failure.
 
 Copyable instruction for external agents:
@@ -217,8 +243,7 @@ Run only this command and wait for it to finish:
 
 uv run python role.py --role <ROLE> --prompt "<PROMPT>"
 
-Do not read files, do not inspect the repo, do not edit anything, do not run tests, and do not run git commands.
-Parse stdout as one JSON object. If ok=true and exit_code=0, return data.response. If it fails, report summary, error.type, error.message, and exit_code. Do not retry unless explicitly asked.
+Use --upload <full_path> for files instead of pasting large file contents. Do not read files, do not inspect the repo, do not edit anything, do not run tests, and do not run git commands. Parse stdout as one JSON object. If ok=true and exit_code=0, read response_path and return that file content. If it fails, report status, request_id, error_id, message, log_path, and exit_code. Retry only failed_retryable requests with the same prompt/uploads and request_id.
 ```
 
 ## Prompt Files

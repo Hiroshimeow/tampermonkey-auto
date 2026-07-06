@@ -794,3 +794,54 @@ def test_recovery_escalation_fails_completely_returns_unhealthy(monkeypatch, tmp
     assert payload["action"] == "fresh_tab_or_rerole_required"
     assert "RELOAD_PAGE" in actions
     assert "NEW_CHAT" in actions
+
+
+def test_wait_upload_ready_catches_connection_error(monkeypatch) -> None:
+    bridge = role.BridgeClient("http://127.0.0.1:8500")
+
+    def mock_role_snapshot(self, role_name: str) -> dict:
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(role.BridgeClient, "role_snapshot", mock_role_snapshot)
+
+    readiness = bridge.wait_upload_ready("DEV", request_id="req1", expected_attachment_count=1, timeout_s=0.1, poll_s=0.01)
+    assert readiness.ready is False
+    assert readiness.state == "role_unhealthy"
+    assert readiness.role_health == "role_tab_unhealthy"
+
+
+def test_recover_role_tab_catches_connection_error_and_escalates(monkeypatch) -> None:
+    calls = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def role_snapshot(self, role_name: str) -> dict:
+            calls.append("snapshot")
+            raise ConnectionRefusedError("refused")
+
+        def role_health(self, snapshot: dict) -> role.RoleHealth:
+            return role.RoleHealth(True, "healthy", "none", "READY", 1)
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            calls.append(action)
+            return {"done": True, "status": "FAILED"}
+
+        def new_chat(self, role_name: str, timeout_s: float = 25.0) -> dict:
+            calls.append("NEW_CHAT")
+            return {"done": True, "status": "FAILED"}
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+    client = FakeClient("http://127.0.0.1:8500", 120.0)
+    snapshot, health = role.recover_role_tab(client, "DEV", 5.0, allow_new_chat=True)
+
+    assert snapshot is None
+    assert health.healthy is False
+    assert health.state == "role_tab_unhealthy"
+    assert health.action == "fresh_tab_or_rerole_required"
+    assert "snapshot" in calls
+    assert "RELOAD_PAGE" in calls
+    assert "NEW_CHAT" in calls

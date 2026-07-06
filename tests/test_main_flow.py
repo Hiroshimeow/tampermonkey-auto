@@ -807,3 +807,66 @@ def test_response_activity_classifiers_cover_ready_streaming_stuck_and_manual_at
     ))
     assert not bridge.is_manual_input_pending(plus_button)
     assert bridge.is_clean_ready(plus_button)
+
+
+def test_wait_upload_ready_requires_marker_and_expected_attachments() -> None:
+    bridge = FakeBridge([
+        response_snapshot("old", False, composer_text="ROLE_REQUEST_ID: req_123", attachments=[{"label": "remove file"}]),
+    ])
+
+    readiness = bridge.wait_upload_ready(
+        "DEV",
+        request_id="req_123",
+        expected_attachment_count=1,
+        timeout_s=1.0,
+        poll_s=0.01,
+    )
+
+    assert readiness.ready
+    assert readiness.state == "upload_ready"
+    assert readiness.marker_present is True
+    assert readiness.composer_attachment_count == 1
+
+
+def test_wait_upload_ready_reports_missing_attachments() -> None:
+    bridge = FakeBridge([
+        response_snapshot("old", False, composer_text="ROLE_REQUEST_ID: req_123", attachments=[]),
+    ])
+
+    readiness = bridge.wait_upload_ready(
+        "DEV",
+        request_id="req_123",
+        expected_attachment_count=1,
+        timeout_s=1.0,
+        poll_s=0.01,
+    )
+
+    assert not readiness.ready
+    assert readiness.state == "upload_attachments_missing"
+    assert readiness.marker_present is True
+    assert readiness.expected_attachment_count == 1
+
+
+def test_role_health_detects_offline_or_missing_session() -> None:
+    bridge = BridgeClient("http://127.0.0.1:8500")
+
+    offline = bridge.role_health({"status": "OFFLINE", "sessions": 0, "dom_info": {"messages": {"messages": []}}})
+    missing_session = bridge.role_health({"status": "READY", "sessions": 0, "dom_info": {"composer": True, "messages": {"messages": []}}})
+
+    assert not offline.healthy
+    assert offline.state == "role_tab_unhealthy"
+    assert not missing_session.healthy
+    assert missing_session.action == "reload"
+
+
+def test_wait_until_clean_ready_does_not_treat_upload_attachment_as_clean() -> None:
+    bridge = BridgeClient("http://127.0.0.1:8500")
+
+    uploading = bridge.response_activity(response_snapshot(
+        "old",
+        False,
+        attachments=[{"label": "uploading file"}],
+    ))
+
+    assert bridge.is_manual_input_pending(uploading)
+    assert not bridge.is_clean_ready(uploading)

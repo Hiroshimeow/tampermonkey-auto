@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -16,7 +17,7 @@ import time
 from typing import Any
 
 import agents
-from apps.bridge import BridgeClient, ManualInputPendingError
+from apps.bridge import BridgeClient, ManualInputPendingError, RoleHealth, UploadReadiness
 from apps.constants import DEFAULT_BASE_URL
 from apps.role_renderer import render_direct_role_prompt, rendered_hash_source
 from apps.text import normalize_role
@@ -28,6 +29,52 @@ UPLOADS_DIR = STATE_DIR / "uploads"
 LOGS_DIR = STATE_DIR / "logs"
 PROMPT_SPILL_THRESHOLD = 8000
 REQUEST_MARKER = "ROLE_REQUEST_ID"
+RECOVERY_LEDGER_STATUSES = {
+    "uploading",
+    "upload_ready",
+    "sending",
+    "uploaded",
+    "sent",
+    "failed_retryable",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerState:
+    text_len: int
+    marker_present: bool
+    attachment_count: int
+    expected_attachment_count: int
+    send_enabled: bool | None
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "text_len": self.text_len,
+            "marker_present": self.marker_present,
+            "attachment_count": self.attachment_count,
+            "expected_attachment_count": self.expected_attachment_count,
+            "send_enabled": self.send_enabled,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryOutcome:
+    response: str
+    status: str
+    state: str
+    action: str
+    recoverable: bool
+    role_health: str
+    composer: ComposerState
+    send_allowed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RoleRequestStateError(Exception):
+    outcome: RecoveryOutcome
+
+    def __str__(self) -> str:
+        return f"{self.outcome.status}:{self.outcome.state}:{self.outcome.action}"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -315,33 +362,235 @@ def find_response_for_marker(snapshot: dict[str, Any], request_id: str) -> tuple
     return assistant_text, True, False
 
 
-def recover_existing_response(client: BridgeClient, role: str, request_id: str, timeout_s: float) -> tuple[str, str]:
+def composer_state_from_activity(activity: Any, request_id: str, expected_attachment_count: int) -> ComposerState:
+    return ComposerState(
+        text_len=int(activity.composer_text_len),
+        marker_present=f"{REQUEST_MARKER}: {request_id}" in str(activity.composer_text or ""),
+        attachment_count=int(activity.composer_attachment_count),
+        expected_attachment_count=expected_attachment_count,
+        send_enabled=activity.send_enabled,
+    )
+
+
+def empty_composer_state(expected_attachment_count: int) -> ComposerState:
+    return ComposerState(
+        text_len=0,
+        marker_present=False,
+        attachment_count=0,
+        expected_attachment_count=expected_attachment_count,
+        send_enabled=None,
+    )
+
+
+def outcome_from_upload_readiness(readiness: UploadReadiness) -> RecoveryOutcome:
+    composer = ComposerState(
+        text_len=readiness.composer_text_len,
+        marker_present=readiness.marker_present,
+        attachment_count=readiness.composer_attachment_count,
+        expected_attachment_count=readiness.expected_attachment_count,
+        send_enabled=readiness.send_enabled,
+    )
+    if readiness.state == "role_unhealthy":
+        return RecoveryOutcome(
+            response="",
+            status="role_unhealthy",
+            state="role_tab_unhealthy",
+            action="fresh_tab_or_rerole_required",
+            recoverable=False,
+            role_health=readiness.role_health,
+            composer=composer,
+        )
+    state_map = {
+        "upload_text_missing": ("unfinished_upload_send", "composer_prompt_missing_attachments", "reload_then_reupload", True),
+        "upload_attachments_missing": ("unfinished_upload_send", "composer_prompt_missing_attachments", "reload_then_reupload", True),
+        "upload_composer_missing": ("unfinished_upload_send", "composer_prompt_missing_attachments", "reload_then_reupload", True),
+        "upload_choice_prompt": ("unfinished_upload_send", "composer_prompt_missing_attachments", "reload_then_reupload", True),
+        "upload_waiting": ("unfinished_upload_send", "composer_prompt_missing_attachments", "reload_then_reupload", True),
+    }
+    status, state, action, recoverable = state_map.get(
+        readiness.state,
+        ("failed_retryable", readiness.state, "retry_same_request_or_new_request", True),
+    )
+    return RecoveryOutcome(
+        response="",
+        status=status,
+        state=state,
+        action=action,
+        recoverable=recoverable,
+        role_health=readiness.role_health,
+        composer=composer,
+    )
+
+
+def recover_role_tab(client: BridgeClient, role: str, timeout_s: float, *, allow_new_chat: bool) -> tuple[dict[str, Any] | None, RoleHealth]:
+    action_timeout = max(1.0, min(float(timeout_s), 20.0))
+    snapshot = client.role_snapshot(role)
+    health = client.role_health(snapshot)
+    if health.healthy:
+        return snapshot, health
+
+    reload_result = client.command_roundtrip(role, "RELOAD_PAGE", timeout_s=action_timeout)
+    if not command_failed(reload_result):
+        client.sleep(1.0)
+        snapshot = client.role_snapshot(role)
+        health = client.role_health(snapshot)
+        if health.healthy:
+            return snapshot, health
+
+    if allow_new_chat:
+        new_chat_result = client.new_chat(role, timeout_s=action_timeout)
+        if not command_failed(new_chat_result):
+            client.sleep(1.0)
+            snapshot = client.role_snapshot(role)
+            health = client.role_health(snapshot)
+            if health.healthy:
+                return snapshot, health
+
+    return None, RoleHealth(
+        healthy=False,
+        state="role_tab_unhealthy",
+        action="fresh_tab_or_rerole_required",
+        status=health.status,
+        session_count=health.session_count,
+    )
+
+
+def recover_existing_response(
+    client: BridgeClient,
+    role: str,
+    request_id: str,
+    timeout_s: float,
+    *,
+    expected_attachment_count: int,
+    ledger_status: str,
+    allow_new_chat: bool,
+) -> RecoveryOutcome:
+    snapshot, initial_health = recover_role_tab(client, role, timeout_s, allow_new_chat=allow_new_chat)
+    if snapshot is None:
+        return RecoveryOutcome(
+            response="",
+            status="role_unhealthy",
+            state="role_tab_unhealthy",
+            action="fresh_tab_or_rerole_required",
+            recoverable=False,
+            role_health=initial_health.state,
+            composer=empty_composer_state(expected_attachment_count),
+        )
     deadline = time.time() + min(timeout_s, 30.0)
-    saw_marker = False
-    saw_composer_marker = False
     while time.time() < deadline:
         try:
             client.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
             snapshot = client.role_snapshot(role)
+            health = client.role_health(snapshot)
+            if not health.healthy:
+                return RecoveryOutcome(
+                    response="",
+                    status="role_unhealthy",
+                    state="role_tab_unhealthy",
+                    action="fresh_tab_or_rerole_required",
+                    recoverable=False,
+                    role_health=health.state,
+                    composer=empty_composer_state(expected_attachment_count),
+                )
         except Exception:
             time.sleep(0.5)
             continue
         response, marker_found, composer_marker = find_response_for_marker(snapshot, request_id)
-        saw_marker = saw_marker or marker_found
-        saw_composer_marker = saw_composer_marker or composer_marker
-        if response:
-            return response, "completed"
         activity = client.response_activity(snapshot)
+        composer = composer_state_from_activity(activity, request_id, expected_attachment_count)
+        if response:
+            return RecoveryOutcome(
+                response=response,
+                status="completed",
+                state="completed",
+                action="none",
+                recoverable=False,
+                role_health="healthy",
+                composer=composer,
+            )
         if marker_found and activity.stop_visible:
-            return client.wait_for_current_response(role, timeout_s, require_response=True), "completed"
-        if composer_marker:
-            return "", "composer_pending"
+            return RecoveryOutcome(
+                response="",
+                status="unfinished_upload_send",
+                state="sent_waiting_response",
+                action="wait",
+                recoverable=True,
+                role_health="healthy",
+                composer=composer,
+            )
+        if composer.marker_present and composer.attachment_count >= expected_attachment_count:
+            state = "upload_ready_not_sent" if ledger_status in {"upload_ready", "uploaded", "failed_retryable"} else "composer_prompt_and_attachments_pending"
+            return RecoveryOutcome(
+                response="",
+                status="unfinished_upload_send",
+                state=state,
+                action="safe_click_send",
+                recoverable=True,
+                role_health="healthy",
+                composer=composer,
+                send_allowed=activity.send_enabled is not False,
+            )
+        if composer.marker_present and expected_attachment_count == 0:
+            return RecoveryOutcome(
+                response="",
+                status="unfinished_upload_send",
+                state="composer_prompt_only_pending",
+                action="safe_click_send",
+                recoverable=True,
+                role_health="healthy",
+                composer=composer,
+                send_allowed=activity.send_enabled is not False,
+            )
+        if composer.marker_present:
+            return RecoveryOutcome(
+                response="",
+                status="unfinished_upload_send",
+                state="composer_prompt_missing_attachments",
+                action="reload_then_reupload",
+                recoverable=True,
+                role_health="healthy",
+                composer=composer,
+            )
+        if composer.attachment_count > 0 or composer_marker:
+            return RecoveryOutcome(
+                response="",
+                status="unfinished_upload_send",
+                state="composer_attachments_without_marker",
+                action="new_chat_and_reupload",
+                recoverable=True,
+                role_health="healthy",
+                composer=composer,
+            )
+        if activity.composer_text.strip():
+            return RecoveryOutcome(
+                response="",
+                status="manual_input_pending",
+                state="manual_composer_dirty",
+                action="manual_clear_required",
+                recoverable=False,
+                role_health="healthy",
+                composer=composer,
+            )
         time.sleep(0.5)
-    if saw_marker:
-        return "", "waiting"
-    if saw_composer_marker:
-        return "", "composer_pending"
-    return "", "not_found"
+    if ledger_status in {"sent", "sending"}:
+        return RecoveryOutcome(
+            response="",
+            status="unfinished_upload_send",
+            state="sent_marker_missing",
+            action="retry_same_request_or_new_request",
+            recoverable=True,
+            role_health="healthy",
+            composer=empty_composer_state(expected_attachment_count),
+        )
+    return RecoveryOutcome(
+        response="",
+        status="failed_retryable",
+        state="recovery_marker_not_found",
+        action="retry_same_request_or_new_request",
+        recoverable=True,
+        role_health="healthy",
+        composer=empty_composer_state(expected_attachment_count),
+    )
 
 
 def save_response(request_id: str, response: str) -> Path:
@@ -391,6 +640,24 @@ def success_payload(*, request_id: str, run_id: str, role: str, response_file: P
     }
 
 
+def recovery_payload(*, exit_code: int, request_id: str, run_id: str, role: str, outcome: RecoveryOutcome) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": outcome.status,
+        "exit_code": exit_code,
+        "request_id": request_id or None,
+        "run_id": run_id,
+        "role": role,
+        "state": outcome.state,
+        "action": outcome.action,
+        "recoverable": outcome.recoverable,
+        "role_health": outcome.role_health,
+        "composer": outcome.composer.as_payload(),
+        "message": outcome.state,
+        "error": None,
+    }
+
+
 def fail_payload(*, exit_code: int, status: str, request_id: str, run_id: str, role: str, error: BaseException | str, message: str = "") -> dict[str, Any]:
     error_id = make_error_id(request_id or "no_request", error)
     error_payload = {
@@ -436,18 +703,32 @@ def run_role_request(client: BridgeClient, role: str, final_prompt: str, uploads
         save_ledger(ledger)
         payload = agents.build_upload_files_payload(list(uploads), text=final_prompt, upload_wait_ms=15000)
         client.upload_files(role, payload, timeout_s)
-        ledger["status"] = "uploaded"
+        readiness = client.wait_upload_ready(
+            role,
+            request_id=str(ledger["request_id"]),
+            expected_attachment_count=len(uploads),
+            timeout_s=timeout_s,
+        )
+        if not readiness.ready:
+            raise RoleRequestStateError(outcome_from_upload_readiness(readiness))
+        ledger["status"] = "upload_ready"
         save_ledger(ledger)
+        ledger["status"] = "sending"
+        save_ledger(ledger)
+        response = client.send_current_prompt_and_wait(role, timeout_s)
         ledger["status"] = "sent"
         save_ledger(ledger)
-        return client.send_current_prompt_and_wait(role, timeout_s)
+        return response
 
     client.set_prompt(role, final_prompt, timeout_s)
     ledger["status"] = "prompt_set"
     save_ledger(ledger)
+    ledger["status"] = "sending"
+    save_ledger(ledger)
+    response = client.send_current_prompt_and_wait(role, timeout_s)
     ledger["status"] = "sent"
     save_ledger(ledger)
-    return client.send_current_prompt_and_wait(role, timeout_s)
+    return response
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,48 +789,72 @@ def main(argv: list[str] | None = None) -> int:
         emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
         return 0
 
+    recovered = False
+    source_responses: list[str] = []
     try:
         with redirect_stdout(sys.stderr):
             if client is None:
                 client = BridgeClient(args.base_url, args.request_timeout)
-            if ledger.get("status") in {"sent", "waiting", "prompt_set", "uploaded", "failed_retryable"}:
-                recovered_response, recovery_state = recover_existing_response(client, role, request_id, args.timeout)
-                if recovered_response:
-                    path = save_response(request_id, recovered_response)
-                    ledger["status"] = "completed"
-                    ledger["response_path"] = str(path)
+            if str(ledger.get("status") or "") in RECOVERY_LEDGER_STATUSES:
+                recovery = recover_existing_response(
+                    client,
+                    role,
+                    request_id,
+                    args.timeout,
+                    expected_attachment_count=len(upload_paths),
+                    ledger_status=str(ledger.get("status") or ""),
+                    allow_new_chat=not args.new_chat,
+                )
+                if recovery.response:
+                    response = recovery.response
+                    recovered = True
+                elif recovery.send_allowed and recovery.action == "safe_click_send":
+                    ledger["status"] = "sending"
                     save_ledger(ledger)
-                    emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
-                    return 0
-                if recovery_state == "waiting":
-                    raise RuntimeError(f"{role} existing request marker found for {request_id}, but response is still generating; retry same command")
-                if recovery_state == "composer_pending":
                     response = client.send_current_prompt_and_wait(role, args.timeout)
-                    path = save_response(request_id, response)
-                    ledger["status"] = "completed"
-                    ledger["response_path"] = str(path)
+                    ledger["status"] = "sent"
                     save_ledger(ledger)
-                    emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=0, recovered=True))
-                    return 0
-                if ledger.get("status") in {"sent", "waiting"}:
-                    raise RuntimeError(f"{role} ledger says request {request_id} was sent, but marker was not found after recovery grace; retry later or use --new-request")
+                    recovered = True
+                else:
+                    raise RoleRequestStateError(recovery)
 
-            run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
-            source_responses = source_responses_for_key if source_role and not args.request_id else (fetch_source_responses(client, source_role) if source_role else [])
-            user_prompt = build_prompt(prompt, source_role, source_responses)
-            rendered = render_direct_role_prompt(
-                role=role,
-                user_prompt=user_prompt,
-                request_id=request_id,
-                request_marker=REQUEST_MARKER,
-            )
-            final_prompt, final_uploads = maybe_spill_prompt(request_id, rendered.text, upload_paths)
-            response = run_role_request(client, role, final_prompt, final_uploads, ledger, args.timeout)
+            if not recovered:
+                run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
+                source_responses = source_responses_for_key if source_role and not args.request_id else (fetch_source_responses(client, source_role) if source_role else [])
+                user_prompt = build_prompt(prompt, source_role, source_responses)
+                rendered = render_direct_role_prompt(
+                    role=role,
+                    user_prompt=user_prompt,
+                    request_id=request_id,
+                    request_marker=REQUEST_MARKER,
+                )
+                final_prompt, final_uploads = maybe_spill_prompt(request_id, rendered.text, upload_paths)
+                response = run_role_request(client, role, final_prompt, final_uploads, ledger, args.timeout)
+    except RoleRequestStateError as exc:
+        ledger["status"] = "failed_retryable"
+        save_ledger(ledger)
+        exit_code = 6 if exc.outcome.status == "manual_input_pending" else 5 if exc.outcome.status == "role_unhealthy" else 4
+        emit_json(recovery_payload(exit_code=exit_code, request_id=request_id, run_id=run_id, role=role, outcome=exc.outcome))
+        return exit_code
     except ManualInputPendingError as exc:
         ledger["status"] = "failed_retryable"
         save_ledger(ledger)
-        emit_json(fail_payload(exit_code=4, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error=exc, message=f"manual input pending for {role}"))
-        return 4
+        emit_json(recovery_payload(
+            exit_code=6,
+            request_id=request_id,
+            run_id=run_id,
+            role=role,
+            outcome=RecoveryOutcome(
+                response="",
+                status="manual_input_pending",
+                state="manual_composer_dirty",
+                action="manual_clear_required",
+                recoverable=False,
+                role_health="healthy",
+                composer=empty_composer_state(len(upload_paths)),
+            ),
+        ))
+        return 6
     except Exception as exc:
         ledger["status"] = "failed_retryable"
         save_ledger(ledger)
@@ -562,7 +867,7 @@ def main(argv: list[str] | None = None) -> int:
         ledger["status"] = "completed"
         ledger["response_path"] = str(path)
         save_ledger(ledger)
-        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses) if source_role else 0))
+        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses) if source_role else 0, recovered=recovered))
         return 0
     ledger["status"] = "failed_retryable"
     save_ledger(ledger)

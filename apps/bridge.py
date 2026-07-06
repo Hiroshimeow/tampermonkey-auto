@@ -21,7 +21,7 @@ class ManualInputPendingError(Exception):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResponseActivity:
     response: str
     stop_visible: bool
@@ -65,6 +65,27 @@ class ResponseActivity:
     @property
     def done(self) -> bool:
         return bool(self.response) and self.composer_exists and not self.stop_visible and not self.manual_input_pending
+
+
+@dataclass(frozen=True, slots=True)
+class UploadReadiness:
+    ready: bool
+    state: str
+    composer_text_len: int
+    composer_attachment_count: int
+    marker_present: bool
+    expected_attachment_count: int
+    send_enabled: bool | None
+    role_health: str
+
+
+@dataclass(frozen=True, slots=True)
+class RoleHealth:
+    healthy: bool
+    state: str
+    action: str
+    status: str
+    session_count: int | None
 
 
 class BridgeClient:
@@ -228,6 +249,25 @@ class BridgeClient:
         except (TypeError, ValueError):
             return default
 
+    @classmethod
+    def _session_count(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return len(value)
+        if isinstance(value, dict):
+            if isinstance(value.get("count"), int):
+                return int(value["count"])
+            if isinstance(value.get("sessions"), list):
+                return len(value["sessions"])
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     @staticmethod
     def _is_real_composer_attachment(meta: Any) -> bool:
         if not isinstance(meta, dict):
@@ -257,6 +297,29 @@ class BridgeClient:
         if not isinstance(attachments, list):
             return 0
         return sum(1 for meta in attachments if cls._is_real_composer_attachment(meta))
+
+    @classmethod
+    def role_health(cls, snapshot: dict[str, Any]) -> RoleHealth:
+        dom_info = snapshot.get("dom_info") or {}
+        status = str(snapshot.get("status") or "").strip().upper()
+        activity = cls.response_activity(snapshot)
+        session_count = cls._session_count(snapshot.get("sessions"))
+        messages = ((dom_info.get("messages") or {}).get("messages") or [])
+        has_transcript = isinstance(messages, list) and bool(messages)
+        has_last_response = bool(str(snapshot.get("last_response") or "").strip())
+        if status in {"OFFLINE", "ERROR", "UNKNOWN"}:
+            return RoleHealth(False, "role_tab_unhealthy", "reload", status or "UNKNOWN", session_count)
+        if session_count == 0:
+            return RoleHealth(False, "role_tab_unhealthy", "reload", status or "NO_SESSIONS", session_count)
+        if (
+            not activity.composer_exists
+            and not activity.choice_prompt_pending
+            and not activity.active
+            and not has_transcript
+            and not has_last_response
+        ):
+            return RoleHealth(False, "role_tab_unhealthy", "reload", status or "EMPTY_SNAPSHOT", session_count)
+        return RoleHealth(True, "healthy", "none", status or "OK", session_count)
 
     @classmethod
     def response_activity(cls, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
@@ -354,6 +417,124 @@ class BridgeClient:
             if depth > 0:
                 return True
         return False
+
+    def wait_upload_ready(
+        self,
+        role: str,
+        *,
+        request_id: str,
+        expected_attachment_count: int,
+        timeout_s: float,
+        poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+    ) -> UploadReadiness:
+        deadline = time.time() + max(1.0, timeout_s)
+        marker = f"ROLE_REQUEST_ID: {request_id}"
+        last_readiness = UploadReadiness(
+            ready=False,
+            state="upload_waiting",
+            composer_text_len=0,
+            composer_attachment_count=0,
+            marker_present=False,
+            expected_attachment_count=expected_attachment_count,
+            send_enabled=None,
+            role_health="unknown",
+        )
+        while time.time() < deadline:
+            snapshot = self.role_snapshot(role)
+            health = self.role_health(snapshot)
+            if not health.healthy:
+                return UploadReadiness(
+                    ready=False,
+                    state="role_unhealthy",
+                    composer_text_len=0,
+                    composer_attachment_count=0,
+                    marker_present=False,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=None,
+                    role_health=health.state,
+                )
+            activity = self.response_activity(snapshot)
+            marker_present = marker in activity.composer_text
+            attachments_ready = activity.composer_attachment_count >= expected_attachment_count
+            if activity.choice_prompt_pending:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_choice_prompt",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=marker_present,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            elif not activity.composer_exists:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_composer_missing",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=marker_present,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            elif activity.active:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_waiting",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=marker_present,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            elif not marker_present:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_text_missing",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=False,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            elif not attachments_ready:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_attachments_missing",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=True,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            elif activity.send_enabled is False:
+                last_readiness = UploadReadiness(
+                    ready=False,
+                    state="upload_waiting",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=True,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=False,
+                    role_health=health.state,
+                )
+            else:
+                return UploadReadiness(
+                    ready=True,
+                    state="upload_ready",
+                    composer_text_len=activity.composer_text_len,
+                    composer_attachment_count=activity.composer_attachment_count,
+                    marker_present=True,
+                    expected_attachment_count=expected_attachment_count,
+                    send_enabled=activity.send_enabled,
+                    role_health=health.state,
+                )
+            self.sleep(max(0.1, poll_s))
+        return last_readiness
 
     def wait_for_current_response(
         self,

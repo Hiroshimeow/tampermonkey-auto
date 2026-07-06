@@ -440,8 +440,12 @@ class BridgeClient:
             role_health="unknown",
         )
         while time.time() < deadline:
-            snapshot = self.role_snapshot(role)
-            health = self.role_health(snapshot)
+            try:
+                snapshot = self.role_snapshot(role)
+                health = self.role_health(snapshot)
+            except Exception as exc:
+                health = RoleHealth(False, "role_tab_unhealthy", "reload", f"CONNECTION_ERROR: {type(exc).__name__}", None)
+                snapshot = {}
             if not health.healthy:
                 return UploadReadiness(
                     ready=False,

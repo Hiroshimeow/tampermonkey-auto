@@ -424,27 +424,38 @@ def outcome_from_upload_readiness(readiness: UploadReadiness) -> RecoveryOutcome
 
 def recover_role_tab(client: BridgeClient, role: str, timeout_s: float, *, allow_new_chat: bool) -> tuple[dict[str, Any] | None, RoleHealth]:
     action_timeout = max(1.0, min(float(timeout_s), 20.0))
-    snapshot = client.role_snapshot(role)
-    health = client.role_health(snapshot)
-    if health.healthy:
-        return snapshot, health
-
-    reload_result = client.command_roundtrip(role, "RELOAD_PAGE", timeout_s=action_timeout)
-    if not command_failed(reload_result):
-        client.sleep(1.0)
+    try:
         snapshot = client.role_snapshot(role)
         health = client.role_health(snapshot)
-        if health.healthy:
-            return snapshot, health
+    except Exception as exc:
+        health = RoleHealth(False, "role_tab_unhealthy", "reload", f"CONNECTION_ERROR: {type(exc).__name__}", None)
+        snapshot = None
 
-    if allow_new_chat:
-        new_chat_result = client.new_chat(role, timeout_s=action_timeout)
-        if not command_failed(new_chat_result):
+    if health.healthy and snapshot is not None:
+        return snapshot, health
+
+    try:
+        reload_result = client.command_roundtrip(role, "RELOAD_PAGE", timeout_s=action_timeout)
+        if not command_failed(reload_result):
             client.sleep(1.0)
             snapshot = client.role_snapshot(role)
             health = client.role_health(snapshot)
             if health.healthy:
                 return snapshot, health
+    except Exception:
+        pass
+
+    if allow_new_chat:
+        try:
+            new_chat_result = client.new_chat(role, timeout_s=action_timeout)
+            if not command_failed(new_chat_result):
+                client.sleep(1.0)
+                snapshot = client.role_snapshot(role)
+                health = client.role_health(snapshot)
+                if health.healthy:
+                    return snapshot, health
+        except Exception:
+            pass
 
     return None, RoleHealth(
         healthy=False,
@@ -518,23 +529,23 @@ def recover_existing_response(
                 role_health="healthy",
                 composer=composer,
             )
-        if composer.marker_present and composer.attachment_count >= expected_attachment_count:
-            state = "upload_ready_not_sent" if ledger_status in {"upload_ready", "uploaded", "failed_retryable"} else "composer_prompt_and_attachments_pending"
+        if composer.marker_present and expected_attachment_count == 0:
             return RecoveryOutcome(
                 response="",
                 status="unfinished_upload_send",
-                state=state,
+                state="composer_prompt_only_pending",
                 action="safe_click_send",
                 recoverable=True,
                 role_health="healthy",
                 composer=composer,
                 send_allowed=activity.send_enabled is not False,
             )
-        if composer.marker_present and expected_attachment_count == 0:
+        if composer.marker_present and composer.attachment_count >= expected_attachment_count:
+            state = "upload_ready_not_sent" if ledger_status in {"upload_ready", "uploaded", "failed_retryable"} else "composer_prompt_and_attachments_pending"
             return RecoveryOutcome(
                 response="",
                 status="unfinished_upload_send",
-                state="composer_prompt_only_pending",
+                state=state,
                 action="safe_click_send",
                 recoverable=True,
                 role_health="healthy",

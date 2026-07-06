@@ -631,3 +631,166 @@ def test_completed_request_returns_cached_response(monkeypatch, tmp_path, capsys
     assert second["request_id"] == first["request_id"]
     assert second["recovered"] is True
     assert response_text(second) == "cached answer"
+
+
+def test_composer_prompt_only_pending_expected_attachment_count_zero(monkeypatch, tmp_path, capsys) -> None:
+    state_dir = isolate_role_state(monkeypatch, tmp_path)
+    request_id = "req_DEV_existing"
+    write_ledger(
+        request_id,
+        state_dir,
+        role_name="DEV",
+        status="upload_ready",
+        uploads=[], # expected attachments = 0
+    )
+    calls = []
+
+    class FakeActivity:
+        composer_text_len = 64
+        composer_text = f"ROLE_REQUEST_ID: {request_id}\nbody"
+        composer_attachment_count = 0
+        send_enabled = True
+        stop_visible = False
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def role_snapshot(self, role_name: str) -> dict:
+            return {
+                "status": "READY",
+                "sessions": 1,
+                "dom_info": {
+                    "composer": True,
+                    "composer_text": f"ROLE_REQUEST_ID: {request_id}\nbody",
+                    "composer_text_len": 64,
+                    "composer_attachments": [],
+                    "send_enabled": True,
+                    "messages": {"messages": []},
+                },
+            }
+
+        def role_health(self, snapshot: dict) -> role.RoleHealth:
+            return role.RoleHealth(True, "healthy", "none", "READY", 1)
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            calls.append(action)
+            return {"done": True, "status": f"{action}_DONE"}
+
+        def response_activity(self, snapshot: dict):
+            return FakeActivity()
+
+        def send_current_prompt_and_wait(self, role_name: str, timeout_s: float) -> str:
+            calls.append("SEND")
+            return "recovered prompt-only answer"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "dev", "--prompt", "Review.", "--request-id", request_id])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 0
+    assert "SEND" in calls
+    assert payload["recovered"] is True
+    assert response_text(payload) == "recovered prompt-only answer"
+
+
+def test_recovery_escalation_reload_fails_then_new_chat(monkeypatch, tmp_path, capsys) -> None:
+    state_dir = isolate_role_state(monkeypatch, tmp_path)
+    request_id = "req_DEV_existing"
+    write_ledger(request_id, state_dir, role_name="DEV", status="sent")
+    actions = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def role_snapshot(self, role_name: str) -> dict:
+            # First snapshot: offline. Second snapshot (after reload fail, trying new chat): still offline.
+            # Third snapshot (after new_chat success): healthy!
+            if len(actions) < 2:
+                return {"status": "OFFLINE", "sessions": 0, "dom_info": {"messages": {"messages": []}}}
+            return {"status": "READY", "sessions": 1, "dom_info": {"composer": True, "messages": {"messages": []}}}
+
+        def role_health(self, snapshot: dict) -> role.RoleHealth:
+            if snapshot.get("status") == "OFFLINE":
+                return role.RoleHealth(False, "role_tab_unhealthy", "reload", "OFFLINE", 0)
+            return role.RoleHealth(True, "healthy", "none", "READY", 1)
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            actions.append(action)
+            # reload fails
+            return {"done": True, "status": "FAILED"}
+
+        def new_chat(self, role_name: str, timeout_s: float = 25.0) -> dict:
+            actions.append("NEW_CHAT")
+            # new_chat succeeds
+            return {"done": True, "status": "NEW_CHAT_NAVIGATING"}
+
+        def response_activity(self, snapshot: dict):
+            class FakeActivity:
+                composer_text_len = 0
+                composer_text = ""
+                composer_attachment_count = 0
+                send_enabled = True
+                stop_visible = False
+            return FakeActivity()
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    # Let recover_existing_response run
+    code = role.main(["--role", "dev", "--prompt", "Review.", "--request-id", request_id])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert "RELOAD_PAGE" in actions
+    assert "NEW_CHAT" in actions
+    # Should recover or continue depending on outcome - here outcome gets healthy snapshot but request marker is not in it
+    # status -> failed_retryable with recovery_marker_not_found because role became healthy but no marker in fresh session
+    assert code == 4
+    assert payload["status"] == "unfinished_upload_send"
+    assert payload["state"] == "sent_marker_missing"
+
+
+def test_recovery_escalation_fails_completely_returns_unhealthy(monkeypatch, tmp_path, capsys) -> None:
+    state_dir = isolate_role_state(monkeypatch, tmp_path)
+    request_id = "req_DEV_existing"
+    write_ledger(request_id, state_dir, role_name="DEV", status="sent")
+    actions = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def role_snapshot(self, role_name: str) -> dict:
+            return {"status": "OFFLINE", "sessions": 0, "dom_info": {"messages": {"messages": []}}}
+
+        def role_health(self, snapshot: dict) -> role.RoleHealth:
+            return role.RoleHealth(False, "role_tab_unhealthy", "reload", "OFFLINE", 0)
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            actions.append(action)
+            return {"done": True, "status": "FAILED"}
+
+        def new_chat(self, role_name: str, timeout_s: float = 25.0) -> dict:
+            actions.append("NEW_CHAT")
+            return {"done": True, "status": "FAILED"}
+
+        def sleep(self, seconds: float) -> None:
+            return None
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "dev", "--prompt", "Review.", "--request-id", request_id])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 5
+    assert payload["status"] == "role_unhealthy"
+    assert payload["action"] == "fresh_tab_or_rerole_required"
+    assert "RELOAD_PAGE" in actions
+    assert "NEW_CHAT" in actions

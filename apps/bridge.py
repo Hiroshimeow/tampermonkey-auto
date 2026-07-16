@@ -37,6 +37,7 @@ class ResponseActivity:
     user_count: int
     assistant_count: int
     image_count: int
+    last_user_text: str
 
     @property
     def response_len(self) -> int:
@@ -98,63 +99,210 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
+        snapshot = self.role_snapshot(browser_role)
+        self.ensure_role_online(browser_role, snapshot)
+        baseline = self.response_activity(snapshot)
         self.set_prompt(browser_role, prompt, timeout_s)
-        return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt)
+        return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt, baseline=baseline)
+
+    @staticmethod
+    def ensure_role_online(browser_role: str, snapshot: dict[str, Any]) -> None:
+        status = str(snapshot.get("status") or "").upper()
+        if snapshot.get("online") is False or status == "OFFLINE":
+            age = snapshot.get("last_seen_age_s")
+            age_text = "never seen" if age is None else f"last heartbeat {float(age):.1f}s ago"
+            raise RuntimeError(f"physical role {browser_role} is offline ({age_text})")
+
+    @staticmethod
+    def normalize_composer_text(text: str) -> str:
+        value = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+        value = re.sub(r"\n{2,}", "\n\n", value)
+        if value.endswith("\n"):
+            value = value[:-1]
+        return value
+
+    @classmethod
+    def composer_matches_prompt(cls, activity: ResponseActivity, prompt: str) -> bool:
+        return cls.normalize_composer_text(activity.composer_text) == cls.normalize_composer_text(prompt)
 
     def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
-        self.wait_until_clean_ready(browser_role, timeout_s)
-        payload = {"text": prompt, "method": "auto"}
-        if force_replace:
-            payload["force_replace"] = True
-        return self._run_command(browser_role, "SET_PROMPT", payload, timeout_s, "PASTE_CONFIRMED")
+        del force_replace
+        deadline = time.time() + max(1.0, timeout_s)
+        activity = self.response_activity(self.role_snapshot(browser_role))
+        while activity.active and time.time() < deadline:
+            self.wait_for_current_response(browser_role, max(1.0, deadline - time.time()))
+            activity = self.response_activity(self.role_snapshot(browser_role))
+
+        if activity.composer_attachment_count > 0:
+            raise ManualInputPendingError(
+                f"{browser_role} composer has a manual attachment; automated prompt will not overwrite it",
+            )
+        if activity.composer_text and not self.composer_matches_prompt(activity, prompt):
+            raise ManualInputPendingError(
+                f"{browser_role} composer text differs from the expected automation prompt; ownership was not acquired",
+            )
+
+        result: dict[str, Any] = {"done": True, "status": "PASTE_REUSED"}
+        if not self.composer_matches_prompt(activity, prompt):
+            result = self._run_command(
+                browser_role,
+                "SET_PROMPT",
+                {"text": prompt, "method": "auto", "expected_text": prompt},
+                max(1.0, deadline - time.time()),
+                "PASTE_CONFIRMED",
+            )
+
+        self.wait_for_stable_expected_prompt(
+            browser_role,
+            prompt,
+            max(1.0, deadline - time.time()),
+        )
+        return result
+
+    def wait_for_stable_expected_prompt(
+        self,
+        browser_role: str,
+        prompt: str,
+        timeout_s: float,
+        poll_s: float = 0.1,
+        stable_samples: int = 2,
+    ) -> ResponseActivity:
+        deadline = time.time() + max(1.0, timeout_s)
+        stable = 0
+        last_normalized: str | None = None
+        last_activity: ResponseActivity | None = None
+        while time.time() < deadline:
+            activity = self.response_activity(self.role_snapshot(browser_role))
+            last_activity = activity
+            normalized = self.normalize_composer_text(activity.composer_text)
+            expected = self.normalize_composer_text(prompt)
+            if normalized != expected:
+                if normalized:
+                    raise ManualInputPendingError(
+                        f"{browser_role} composer changed after paste; expected prompt ownership was lost",
+                    )
+                stable = 0
+            elif activity.composer_attachment_count > 0:
+                # ChatGPT can briefly expose an "uploading" attachment while it
+                # processes an automation-owned prompt. Preserve ownership and
+                # wait for the same prompt to become send-ready.
+                stable = 0
+            elif activity.composer_exists and activity.send_enabled is True:
+                stable = stable + 1 if normalized == last_normalized else 1
+                if stable >= max(1, stable_samples):
+                    return activity
+            else:
+                stable = 0
+            last_normalized = normalized
+            self.sleep(max(0.01, poll_s))
+        if last_activity and not self.composer_matches_prompt(last_activity, prompt):
+            raise ManualInputPendingError(
+                f"{browser_role} composer no longer contains the expected automation prompt",
+            )
+        if last_activity and last_activity.composer_attachment_count > 0:
+            raise RuntimeError(f"{browser_role} automation prompt upload did not settle before timeout")
+        raise RuntimeError(f"{browser_role} composer did not become stable and send-ready before timeout")
 
     def upload_files(self, browser_role: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         self.wait_until_clean_ready(browser_role, timeout_s)
         return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
 
-    def send_current_prompt_and_wait(self, browser_role: str, timeout_s: float, *, prompt: str | None = None) -> str:
+    @classmethod
+    def has_send_evidence(cls, activity: ResponseActivity, baseline: ResponseActivity) -> bool:
+        return bool(
+            activity.user_count > baseline.user_count
+            or activity.assistant_count > baseline.assistant_count
+            or activity.last_user_text != baseline.last_user_text
+            or activity.response != baseline.response
+        )
+
+    @staticmethod
+    def is_fresh_response(activity: ResponseActivity, baseline: ResponseActivity | None) -> bool:
+        if baseline is None:
+            return bool(activity.response)
+        return bool(
+            activity.assistant_count > baseline.assistant_count
+            or (activity.response and activity.response != baseline.response)
+        )
+
+    def send_current_prompt_and_wait(
+        self,
+        browser_role: str,
+        timeout_s: float,
+        *,
+        prompt: str | None = None,
+        baseline: ResponseActivity | None = None,
+    ) -> str:
         before_send = self.response_activity(self.role_snapshot(browser_role))
+        response_baseline = baseline or before_send
+        payload = {"expected_text": prompt or ""}
         try:
-            self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+            self._run_command(browser_role, "CLICK_SEND", payload, timeout_s, "SEND_ACCEPTED")
         except RuntimeError as exc:
-            activity = self.response_activity(self.role_snapshot(browser_role), previous_response=before_send.response)
-            if self.is_response_active(activity) or activity.changed:
+            activity = self.response_activity(self.role_snapshot(browser_role), previous_response=response_baseline.response)
+            if prompt and self.has_send_evidence(activity, response_baseline):
                 print(
-                    f"[send-recover] role={browser_role} {exc}; response activity detected, waiting for it",
+                    f"[send-recover] role={browser_role} {exc}; send evidence detected, waiting for fresh response",
                     flush=True,
                 )
-                response = self.wait_for_current_response(browser_role, timeout_s)
-                if response:
-                    return response
-            if prompt:
+                return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
+            if prompt and self.composer_matches_prompt(activity, prompt):
                 print(
-                    f"[send-recover] role={browser_role} {exc}; no new response detected, reloading and rechecking before retry",
+                    f"[send-recover] role={browser_role} {exc}; expected prompt still present, retrying click once in place",
                     flush=True,
                 )
-                self.command_roundtrip(browser_role, "RELOAD_PAGE", timeout_s=20.0)
-                self.sleep(DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S)
-                activity = self.response_activity(self.role_snapshot(browser_role), previous_response=before_send.response)
-                if self.is_response_active(activity) or activity.changed:
-                    print(
-                        f"[send-recover] role={browser_role} response appeared after reload, waiting for it",
-                        flush=True,
+                self.wait_for_stable_expected_prompt(
+                    browser_role,
+                    prompt,
+                    timeout_s,
+                    stable_samples=1,
+                )
+                try:
+                    self._run_command(browser_role, "CLICK_SEND", payload, timeout_s, "SEND_ACCEPTED")
+                except RuntimeError as retry_exc:
+                    final_activity = self.response_activity(
+                        self.role_snapshot(browser_role),
+                        previous_response=response_baseline.response,
                     )
-                    response = self.wait_for_current_response(browser_role, timeout_s, require_response=True)
-                    if response:
-                        return response
-                self.set_prompt(browser_role, prompt, timeout_s, force_replace=True)
-                self._run_command(browser_role, "CLICK_SEND", {}, timeout_s, "SEND_ACCEPTED")
+                    if self.has_send_evidence(final_activity, response_baseline):
+                        print(
+                            f"[send-recover] role={browser_role} {retry_exc}; final send evidence detected after retry, waiting for fresh response",
+                            flush=True,
+                        )
+                        return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
+                    raise
+            elif prompt:
+                raise ManualInputPendingError(
+                    f"{browser_role} composer changed after send failure; automated prompt ownership was lost",
+                ) from exc
             else:
                 raise
-        return self.wait_assistant_done(browser_role, timeout_s)
+        return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
 
-    def wait_assistant_done(self, browser_role: str, timeout_s: float) -> str:
-        final = self.run_command(browser_role, "WAIT_ASSISTANT_DONE", {}, timeout_s)
+    def wait_assistant_done(
+        self,
+        browser_role: str,
+        timeout_s: float,
+        *,
+        baseline: ResponseActivity | None = None,
+    ) -> str:
+        final = self.run_command(
+            browser_role,
+            "WAIT_ASSISTANT_DONE",
+            {"timeout_ms": max(1_000, int(timeout_s * 1_000) - 1_000)},
+            timeout_s,
+        )
         status = str(final.get("status") or "")
         result = final.get("result") or {}
         if status != "ASSISTANT_DONE":
             if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
-                return self.recover_response_after_reload(browser_role, timeout_s, require_response=True)
+                return self.recover_response_after_reload(
+                    browser_role,
+                    timeout_s,
+                    require_response=True,
+                    baseline=baseline,
+                    require_fresh=baseline is not None,
+                )
             if status == "ERROR_COMMAND":
                 reason = str(result.get("reason") or "unknown")
                 print(
@@ -162,15 +310,27 @@ class BridgeClient:
                     f"reason={reason}; recovering current response",
                     flush=True,
                 )
-                return self.wait_for_current_response(browser_role, timeout_s, require_response=True)
+                return self.wait_for_current_response(
+                    browser_role,
+                    timeout_s,
+                    require_response=True,
+                    baseline=baseline,
+                    require_fresh=baseline is not None,
+                )
             raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
         response = str(result.get("text") or "").strip()
-        if self.looks_incomplete_response(response):
+        if self.looks_incomplete_response(response) or (baseline is not None and response == baseline.response):
             print(
-                f"[response-watch] role={browser_role} assistant_done text looks incomplete; syncing transcript again",
+                f"[response-watch] role={browser_role} assistant_done text is incomplete or stale; syncing transcript again",
                 flush=True,
             )
-            return self.wait_for_current_response(browser_role, timeout_s, require_response=True)
+            return self.wait_for_current_response(
+                browser_role,
+                timeout_s,
+                require_response=True,
+                baseline=baseline,
+                require_fresh=baseline is not None,
+            )
         return response
 
     def _run_command(
@@ -263,6 +423,8 @@ class BridgeClient:
         dom_info = snapshot.get("dom_info") or {}
         messages = dom_info.get("messages") or {}
         counts = messages.get("counts") or {}
+        last_user = messages.get("last_user") or {}
+        last_user_text = str(last_user.get("text") or "") if isinstance(last_user, dict) else ""
         response = str(snapshot.get("last_response") or "").strip()
         composer_text = str(dom_info.get("composer_text") or "")
         composer_text_len = cls._int_value(dom_info.get("composer_text_len"), len(composer_text))
@@ -296,6 +458,7 @@ class BridgeClient:
             user_count=cls._int_value(counts.get("user")),
             assistant_count=cls._int_value(counts.get("assistant")),
             image_count=cls._int_value(counts.get("images")),
+            last_user_text=last_user_text,
         )
 
     @staticmethod
@@ -363,6 +526,8 @@ class BridgeClient:
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
         require_response: bool = False,
+        baseline: ResponseActivity | None = None,
+        require_fresh: bool = False,
     ) -> str:
         deadline = time.time() + max(1.0, timeout_s)
         cycle_started = time.time()
@@ -418,7 +583,10 @@ class BridgeClient:
                 continue
 
             if self.is_response_done(activity):
-                return activity.response
+                if not require_fresh or self.is_fresh_response(activity, baseline):
+                    return activity.response
+                self.sleep(max(0.1, poll_s))
+                continue
             if not self.is_response_active(activity):
                 if activity.has_response and not activity.composer_exists:
                     print(
@@ -428,7 +596,10 @@ class BridgeClient:
                     self.sleep(max(0.1, poll_s))
                     continue
                 if activity.has_response:
-                    return activity.response
+                    if not require_fresh or self.is_fresh_response(activity, baseline):
+                        return activity.response
+                    self.sleep(max(0.1, poll_s))
+                    continue
                 if require_response:
                     self.sleep(max(0.1, poll_s))
                     continue
@@ -466,7 +637,9 @@ class BridgeClient:
         if last_activity and self.is_response_active(last_activity):
             raise RuntimeError(f"{role} response still active after timeout; last_response_len={len(last_response)}")
         if last_response and not self.looks_incomplete_response(last_response):
-            return last_response
+            if not require_fresh or (last_activity is not None and self.is_fresh_response(last_activity, baseline)):
+                return last_response
+            raise RuntimeError(f"{role} response wait timed out without a fresh assistant response")
         if last_response:
             raise RuntimeError(f"{role} response wait timed out with incomplete response; last_response_len={len(last_response)}")
         if require_response:
@@ -545,6 +718,8 @@ class BridgeClient:
         page_wait_s: float = DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
         require_response: bool = False,
+        baseline: ResponseActivity | None = None,
+        require_fresh: bool = False,
     ) -> str:
         return self.wait_for_current_response(
             role,
@@ -553,6 +728,77 @@ class BridgeClient:
             page_wait_s=page_wait_s,
             poll_s=poll_s,
             require_response=require_response,
+            baseline=baseline,
+            require_fresh=require_fresh,
+        )
+
+    @staticmethod
+    def _snapshot_page_generation(snapshot: dict[str, Any]) -> str:
+        dom_info = snapshot.get("dom_info") or {}
+        return str(dom_info.get("page_instance_id") or "")
+
+    @staticmethod
+    def _snapshot_page_path(snapshot: dict[str, Any]) -> str:
+        dom_info = snapshot.get("dom_info") or {}
+        return str(dom_info.get("page_path") or "")
+
+    @classmethod
+    def is_clean_new_chat_snapshot(cls, snapshot: dict[str, Any], previous_generation: str) -> bool:
+        dom_info = snapshot.get("dom_info") or {}
+        messages = dom_info.get("messages") or {}
+        counts = messages.get("counts") or {}
+        generation = cls._snapshot_page_generation(snapshot)
+        path = cls._snapshot_page_path(snapshot)
+        activity = cls.response_activity(snapshot)
+        return bool(
+            generation
+            and previous_generation
+            and generation != previous_generation
+            and path == "/"
+            and activity.composer_exists
+            and not activity.composer_text
+            and activity.composer_attachment_count == 0
+            and not activity.stop_visible
+            and not activity.choice_prompt_pending
+            and cls._int_value(counts.get("user")) == 0
+            and cls._int_value(counts.get("assistant")) == 0
+        )
+
+    def wait_new_chat_ready(
+        self,
+        role: str,
+        before_snapshot: dict[str, Any],
+        timeout_s: float,
+        poll_s: float = 0.5,
+    ) -> dict[str, Any]:
+        previous_generation = self._snapshot_page_generation(before_snapshot)
+        if not previous_generation:
+            raise RuntimeError(f"{role} reset readiness cannot be verified: missing pre-reset page_instance_id")
+        deadline = time.time() + max(1.0, timeout_s)
+        last_probe: dict[str, Any] = {}
+        last_snapshot: dict[str, Any] = {}
+        while time.time() < deadline:
+            remaining = max(1.0, deadline - time.time())
+            try:
+                last_probe = self.command_roundtrip(role, "PROBE", timeout_s=min(20.0, remaining))
+                if last_probe.get("done") and str(last_probe.get("status") or "") == "PROBE_DONE":
+                    last_snapshot = self.role_snapshot(role)
+                    if self.is_clean_new_chat_snapshot(last_snapshot, previous_generation):
+                        return {
+                            "done": True,
+                            "status": "NEW_CHAT_READY",
+                            "probe": last_probe,
+                            "page_instance_id": self._snapshot_page_generation(last_snapshot),
+                            "page_path": self._snapshot_page_path(last_snapshot),
+                        }
+            except RuntimeError:
+                pass
+            self.sleep(max(0.05, poll_s))
+        raise RuntimeError(
+            f"{role} new chat did not reach terminal clean readiness before timeout; "
+            f"last_probe_status={last_probe.get('status') or 'none'} "
+            f"last_generation={self._snapshot_page_generation(last_snapshot) or 'none'} "
+            f"last_path={self._snapshot_page_path(last_snapshot) or 'none'}"
         )
 
     def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:

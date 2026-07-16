@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from apps.prompts import goal_only_prompt, role_prompt_path, role_skill_path, route_contract, system_prompt
+from apps.prompts import goal_only_prompt, role_prompt_path, role_skill_path, route_contract, route_repair_contract
+from apps.runtime_config import LoaderManifest, PromptProvenance
 
 
 @dataclass(frozen=True)
@@ -21,10 +22,28 @@ def _read_optional(path: Path | None) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def _append_file_section(parts: list[str], label: str, path: Path | None, *, display_role: str = "") -> tuple[str, ...]:
+def _read_required(path: Path | None, label: str) -> str:
+    if path is None or not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Missing required loader file for {label}: {path or '<unresolved>'}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise FileNotFoundError(f"Required loader file is empty for {label}: {path.as_posix()}")
+    return text
+
+
+def _append_optional_file_section(parts: list[str], label: str, path: Path | None, *, display_role: str = "") -> tuple[str, ...]:
     text = _read_optional(path)
     if not text:
         return ()
+    if display_role:
+        parts.append(f"[{label}: {display_role}]\n{text}")
+    else:
+        parts.append(f"[{label}: {path.as_posix()}]\n{text}")
+    return (path.as_posix(),)
+
+
+def _append_required_file_section(parts: list[str], label: str, path: Path | None, *, display_role: str = "") -> tuple[str, ...]:
+    text = _read_required(path, display_role or label)
     if display_role:
         parts.append(f"[{label}: {display_role}]\n{text}")
     else:
@@ -40,21 +59,16 @@ def render_direct_role_prompt(
     request_marker: str = "ROLE_REQUEST_ID",
     include_skill: bool = True,
 ) -> RenderedPrompt:
-    """Render a direct role.py prompt.
-
-    Direct mode is not a route-json orchestration turn. It gives the target role
-    its local role prompt/skill plus a durable request marker and the user prompt.
-    """
     normalized_role = str(role or "").upper().strip()
     parts: list[str] = []
     files: list[str] = []
 
     prompt_path = role_prompt_path(normalized_role)
-    files.extend(_append_file_section(parts, "ROLE PROMPT", prompt_path, display_role=normalized_role))
+    files.extend(_append_optional_file_section(parts, "ROLE PROMPT", prompt_path, display_role=normalized_role))
 
     if include_skill:
         skill_path = role_skill_path(normalized_role)
-        files.extend(_append_file_section(parts, "ROLE SKILL", skill_path, display_role=normalized_role))
+        files.extend(_append_optional_file_section(parts, "ROLE SKILL", skill_path, display_role=normalized_role))
 
     parts.append(f"{request_marker}: {request_id}")
     parts.append("USER_PROMPT:")
@@ -73,30 +87,33 @@ def render_route_prompt(
     prompt_roles: list[str],
     finish_roles: set[str],
     manager_role: str = "MANAGER",
+    state_text: str = "",
+    provenance: PromptProvenance | None = None,
+    loader_manifest: LoaderManifest | None = None,
     goal_only: bool = False,
 ) -> RenderedPrompt:
-    """Render the Coordinator/main.py route-mode prompt.
-
-    This preserves the existing route contract shape while centralizing prompt
-    assembly so role.py and main.py do not drift.
-    """
     if goal_only:
         text = goal_only_prompt(goal)
         return RenderedPrompt(text=text, content_hash_source=text)
-
     parts: list[str] = []
     files: list[str] = []
+
     if include_system:
-        system = system_prompt(prompt_role, prompt_roles, finish_roles)
-        if system:
-            parts.append(system)
-            path = role_prompt_path(prompt_role)
-            if path:
-                files.append(path.as_posix())
+        if loader_manifest is None:
+            raise FileNotFoundError(f"Missing loader manifest for role {prompt_role}")
+        files.extend(_append_required_file_section(parts, "AGENTS", loader_manifest.agents_path))
+        files.extend(_append_required_file_section(parts, "HANDOFF", loader_manifest.handoff_path))
+        files.extend(_append_required_file_section(parts, "ROLE PROMPT", loader_manifest.prompt_path, display_role=prompt_role))
+        files.extend(_append_required_file_section(parts, "ROLE SKILL", loader_manifest.skill_path, display_role=prompt_role))
+
+    if provenance is not None:
+        parts.append(provenance.render())
     parts.append(f"PROMPT_ROLE: {prompt_role}")
     if caller_role != "USER":
         parts.append(f"CALLER_ROLE: {caller_role}")
     parts.append(f"GOAL:\n{goal}")
+    if state_text:
+        parts.append(f"FLOW_STATE_COMPACT:\n{state_text}")
     if caller_role == "USER":
         parts.append(f"INSTRUCTION_FROM_CALLER:\n{instruction}")
     else:
@@ -120,37 +137,11 @@ def render_format_repair_prompt(
     resume: bool = False,
     goal_only: bool = False,
 ) -> RenderedPrompt:
-    contract = route_contract(prompt_roles, finish_roles, manager_role)
-    if goal_only:
-        text = goal_only_prompt(goal)
-        return RenderedPrompt(text=text, content_hash_source=text)
-    if resume:
-        parts: list[str] = []
-        if route_error:
-            parts.append(f"ROUTE_REPAIR_REQUIRED:\n{route_error}")
-        parts.append(contract)
-        text = "\n\n".join(parts)
-        return RenderedPrompt(text=text, content_hash_source=text)
-
-    parts = []
-    files: list[str] = []
-    if include_system:
-        system = system_prompt(prompt_role, prompt_roles, finish_roles)
-        if system:
-            parts.append(system)
-            path = role_prompt_path(prompt_role)
-            if path:
-                files.append(path.as_posix())
-        parts.append(f"PROMPT_ROLE: {prompt_role}")
-        if caller_role != "USER":
-            parts.append(f"CALLER_ROLE: {caller_role}")
-        parts.append("Your previous response used an invalid route. Reply again using the route contract below.")
-        if route_error:
-            parts.append(f"ROUTE_ERROR:\n{route_error}")
-        parts.append(f"GOAL:\n{goal}")
-    parts.append(contract)
+    del prompt_role, goal, caller_role, include_system, resume, goal_only
+    parts = [f"ROUTE_REPAIR_REQUIRED:\n{route_error or 'missing route JSON object'}"]
+    parts.append(route_repair_contract(prompt_roles, finish_roles, manager_role))
     text = "\n\n".join(parts)
-    return RenderedPrompt(text=text, files=tuple(files), content_hash_source=text)
+    return RenderedPrompt(text=text, content_hash_source=text)
 
 
 def rendered_hash_source(rendered: RenderedPrompt) -> str:

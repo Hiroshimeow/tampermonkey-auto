@@ -96,6 +96,32 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(result_payload["status"], "PROBE_DONE")
         self.assertEqual(result_payload["result"]["state"], "PROBE_DONE")
 
+    def test_fail_closed_browser_states_are_terminal_command_results(self):
+        for state_name in (
+            "SEND_BLOCKED_OWNERSHIP_LOST",
+            "PASTE_BLOCKED_MANUAL_INPUT",
+            "MANUAL_INPUT_PENDING",
+            "CHOICE_PROMPT_CLICKED",
+            "CHOICE_PROMPT_CLICK_FAILED",
+            "CHOICE_PROMPT_NOT_FOUND",
+        ):
+            command = controller.state.create_command("A", "TEST", {})
+            self.client.post(
+                "/api/report",
+                json={
+                    "role": "A",
+                    "session_id": "sess-terminal",
+                    "command_id": command["command_id"],
+                    "state": state_name,
+                    "result": {},
+                    "dom_info": {},
+                },
+            )
+
+            result_payload = self.client.get(f"/api/admin/command/{command['command_id']}").json()
+            self.assertTrue(result_payload["done"], state_name)
+            self.assertEqual(result_payload["status"], state_name)
+
     def test_admin_role_snapshot_and_events(self):
         controller.state.create_command("A", "PROBE", {"depth": 1})
         self.client.post(
@@ -112,12 +138,22 @@ class DiagnosticControllerTests(unittest.TestCase):
         role_payload = role_response.json()
         self.assertEqual(role_payload["role"], "A")
         self.assertEqual(role_payload["status"], "ONLINE")
+        self.assertTrue(role_payload["online"])
+        self.assertIsNotNone(role_payload["last_seen_age_s"])
         self.assertEqual(role_payload["dom_info"]["composer_text_len"], 5)
 
         events_response = self.client.get("/api/admin/events?role=A&limit=5")
         self.assertEqual(events_response.status_code, 200)
         events_payload = events_response.json()
         self.assertGreaterEqual(len(events_payload["events"]), 1)
+
+    def test_admin_role_marks_never_seen_numbered_role_offline(self):
+        role_response = self.client.get("/api/admin/role/REVIEW1")
+
+        role_payload = role_response.json()
+        self.assertEqual(role_payload["status"], "OFFLINE")
+        self.assertFalse(role_payload["online"])
+        self.assertIsNone(role_payload["last_seen_age_s"])
 
     def test_admin_routes_lists_samples(self):
         response = self.client.get("/api/admin/routes")

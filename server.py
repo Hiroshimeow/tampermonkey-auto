@@ -40,6 +40,12 @@ TERMINAL_STATES = {
     "WINDOW_CLOSE_BLOCKED",
     "UPLOAD_FILES_DONE",
     "UPLOAD_FILES_FAILED",
+    "SEND_BLOCKED_OWNERSHIP_LOST",
+    "PASTE_BLOCKED_MANUAL_INPUT",
+    "MANUAL_INPUT_PENDING",
+    "CHOICE_PROMPT_CLICKED",
+    "CHOICE_PROMPT_CLICK_FAILED",
+    "CHOICE_PROMPT_NOT_FOUND",
     "UNKNOWN_COMMAND",
     "ERROR_COMMAND",
 }
@@ -478,9 +484,16 @@ def api_admin_command_result(command_id: str):
 @app.get("/api/admin/role/{role}")
 def api_admin_role(role: str):
     with state.lock:
+        seen_at = float(state.role_seen_at.get(role, 0.0) or 0.0)
+        seen_age_s = max(0.0, time.time() - seen_at) if seen_at else None
+        poll_s = max(0.1, float(state.config.get("poll_ms", 800) or 800) / 1000.0)
+        online = seen_age_s is not None and seen_age_s <= max(10.0, poll_s * 5.0)
         return {
             "role": role,
             "status": state.status.get(role, "OFFLINE"),
+            "online": online,
+            "last_seen_at": seen_at or None,
+            "last_seen_age_s": seen_age_s,
             "sessions": sorted(state.sessions.get(role, set())),
             "dom_info": state.dom_info.get(role, {}),
             "last_user": state.last_user_message.get(role, ""),

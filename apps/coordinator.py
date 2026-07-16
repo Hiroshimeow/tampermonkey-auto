@@ -7,14 +7,16 @@ import time
 from typing import Any
 
 from apps.bridge import BridgeClient, ManualInputPendingError
+from apps.browser_transaction import BrowserSessionRegistry
 from apps.dryrun import synthetic_response
 from apps.lifecycle import BrowserLifecycleMixin
-from apps.models import FlowState, Route, TurnResult
+from apps.models import FlowState, FlowStopError, Route, TurnResult
 from apps.prompts import goal_only_continue_text, has_role_prompt
 from apps.role_renderer import render_format_repair_prompt, render_route_prompt
 from apps.route_executor import RouteExecutorMixin
 from apps.routing import extract_handoff, parse_route
-from apps.text import compact_text, normalize_role, normalize_roles, parse_role_map
+from apps.runtime_config import PromptProvenance, RuntimeRoleConfig
+from apps.text import compact_text, normalize_role, normalize_roles
 
 
 class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
@@ -33,29 +35,65 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             raise RuntimeError(f"start role {self.start_role or '<empty>'} is not configured")
         if not self.finish_roles or not (self.finish_roles & set(self.prompt_roles)):
             raise RuntimeError("finish role is not configured")
+
+        self.runtime_config = RuntimeRoleConfig.build(
+            prompt_roles=self.prompt_roles,
+            browser_roles=self.browser_roles,
+            finish_roles=self.finish_roles,
+            manager_role=self.manager_role,
+            start_role=self.start_role,
+            role_map_value=str(args.role_map or ""),
+            strict_role_tabs=bool(getattr(args, "role", "")),
+        )
+        self.sessions = BrowserSessionRegistry(self.runtime_config.physical_roles)
         self.max_turns = int(args.max_turns or 0)
         self.turn_count = 0
         self.system_sent: set[str] = set()
-        self.browser_cursor = 0
         self.finished: dict[str, Any] | None = None
         self.dry_run = bool(args.dry_run)
         self.lock = threading.Lock()
         self.background_tasks: list[threading.Thread] = []
         self.reload_generation: dict[str, int] = {}
+        self.current_goal = ""
 
     def has_turn_budget(self) -> bool:
         return self.max_turns <= 0 or self.turn_count < self.max_turns
 
     def run(self, goal: str) -> dict[str, Any]:
         state = FlowState(goal=goal)
-        if self.args.preflight and not self.dry_run:
-            self.preflight()
-        first_instruction = "Start from the user goal. Decide the first phase and route work to the right role(s)."
-        self.dispatch_role(self.start_role, first_instruction, state, caller_role="USER", depth=0)
-        self.wait_background_tasks()
+        self.current_goal = goal
+        try:
+            loader_errors = self.runtime_config.loader_errors()
+            if loader_errors:
+                raise FlowStopError(
+                    "loader_error",
+                    "required route-mode loader files are missing, empty, unreadable, or invalidly encoded",
+                    loader_errors=loader_errors,
+                )
+            if self.args.preflight and not self.dry_run:
+                self.preflight()
+            first_instruction = "Start from the user goal. Decide the first phase and route work to the right role(s)."
+            self.dispatch_role(self.start_role, first_instruction, state, caller_role="USER", depth=0)
+            self.wait_background_tasks()
+        except FlowStopError as exc:
+            self.finished = self.flow_stop_result(state, exc.status, exc.message, **exc.details)
+        except RuntimeError as exc:
+            self.finished = self.flow_stop_result(state, "runtime_error", str(exc))
+
         if self.finished:
             return self.finished
         return self.unfinished_result(state)
+
+    def flow_stop_result(self, state: FlowState, status: str, message: str, **details: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "status": status,
+            "message": message,
+            "turns": self.turn_count,
+            "phase": state.phase,
+            "handoffs": state.handoffs,
+        }
+        result.update(details)
+        return result
 
     def unfinished_result(self, state: FlowState) -> dict[str, Any]:
         last = state.results[-1] if state.results else None
@@ -98,74 +136,92 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         depth: int,
         follow_routes: bool = True,
     ) -> TurnResult | None:
+        prompt_role = normalize_role(prompt_role)
+        if prompt_role == "FINISH":
+            return None
+        if prompt_role not in self.prompt_roles:
+            raise FlowStopError(
+                "stopped_invalid_route",
+                f"route target role {prompt_role or '<empty>'} is not configured",
+                invalid_target=prompt_role,
+                allowed_roles=list(self.prompt_roles),
+            )
         with self.lock:
             if self.finished or not self.has_turn_budget():
                 return None
             self.turn_count += 1
             turn = self.turn_count
-        prompt_role = normalize_role(prompt_role)
-        if prompt_role == "FINISH":
-            return None
-        if prompt_role not in self.prompt_roles:
-            raise RuntimeError(
-                f"route target role {prompt_role} is not configured; "
-                f"allowed roles: {', '.join(self.prompt_roles)}",
-            )
+
         browser_role = self.pick_browser_role(prompt_role)
-        self.cancel_pending_reload(browser_role)
-        include_system = self.should_include_system(prompt_role)
-        prompt = self.build_prompt(prompt_role, instruction, state, caller_role, include_system)
         print(f"\n=== TURN {turn} prompt_role={prompt_role} browser_role={browser_role} caller={caller_role} ===", flush=True)
         started = time.time()
-        try:
-            response = self.resume_existing_response(prompt_role, browser_role, turn) or self.call_or_synthetic(
-                prompt_role,
-                browser_role,
-                prompt,
-                instruction,
-            )
-        except ManualInputPendingError as exc:
-            self.finished = {
-                "status": "manual_input_pending",
-                "role": prompt_role,
-                "browser_role": browser_role,
-                "message": str(exc),
-            }
-            print(f"[manual-input] {exc}", flush=True)
-            return None
-        elapsed = time.time() - started
-        if include_system:
-            self.system_sent.add(prompt_role)
-        route = self.validate_route(prompt_role, parse_route(response))
         repaired = False
 
-        if not route.ok and not self.uses_goal_only_prompt(prompt_role):
-            print(f"[format] invalid route from {prompt_role}: {route.error or 'missing route'}", flush=True)
-            repaired = True
-            repair_prompt = self.build_format_repair_prompt(
-                prompt_role,
-                response,
-                state,
-                caller_role,
-                include_system=(not self.args.resume and prompt_role not in self.system_sent),
-                route_error=route.error,
-            )
+        with self.sessions.locked(browser_role) as session:
+            self.cancel_pending_reload(browser_role)
+            include_system = self.should_include_system(prompt_role, browser_role)
             try:
-                response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
+                prompt = self.build_prompt(prompt_role, instruction, state, caller_role, include_system)
+            except (FileNotFoundError, OSError, UnicodeError) as exc:
+                raise FlowStopError(
+                    "loader_error",
+                    str(exc),
+                    role=prompt_role,
+                    browser_role=browser_role,
+                ) from exc
+            try:
+                response = self.resume_existing_response(prompt_role, browser_role, turn, state)
+                if not response:
+                    response = self.call_or_synthetic(prompt_role, browser_role, prompt, instruction)
             except ManualInputPendingError as exc:
                 self.finished = {
                     "status": "manual_input_pending",
                     "role": prompt_role,
                     "browser_role": browser_role,
                     "message": str(exc),
+                    "turns": self.turn_count,
+                    "phase": state.phase,
+                    "handoffs": state.handoffs,
                 }
                 print(f"[manual-input] {exc}", flush=True)
                 return None
-            route = self.validate_route(prompt_role, parse_route(response))
 
-        if route.ok:
-            self.system_sent.add(prompt_role)
+            if include_system:
+                session.mark_bootstrapped(prompt_role)
+                self.system_sent.add(prompt_role)
 
+            route = parse_route(response)
+            if self.uses_goal_only_prompt(prompt_role) and not route.ok and response.strip():
+                route = Route(targets={"FINISH": response.strip()}, raw=response)
+            route = self.validate_route(prompt_role, route)
+            if not route.ok and not self.uses_goal_only_prompt(prompt_role):
+                print(f"[format] invalid route from {prompt_role}: {route.error or 'missing route'}", flush=True)
+                repaired = True
+                repair_prompt = self.build_format_repair_prompt(
+                    prompt_role,
+                    response,
+                    state,
+                    caller_role,
+                    include_system=False,
+                    route_error=route.error,
+                )
+                try:
+                    response = self.call_or_synthetic(prompt_role, browser_role, repair_prompt, instruction, repair=True)
+                except ManualInputPendingError as exc:
+                    self.finished = {
+                        "status": "manual_input_pending",
+                        "role": prompt_role,
+                        "browser_role": browser_role,
+                        "message": str(exc),
+                        "turns": self.turn_count,
+                        "phase": state.phase,
+                        "handoffs": state.handoffs,
+                    }
+                    print(f"[manual-input] {exc}", flush=True)
+                    return None
+                route = self.validate_route(prompt_role, parse_route(response))
+
+        elapsed = time.time() - started
         handoff = extract_handoff(response)
         result = TurnResult(
             turn=turn,
@@ -187,29 +243,13 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         return self.dispatch_route(route, result, state, depth)
 
     def pick_browser_role(self, prompt_role: str) -> str:
-        explicit = parse_role_map(self.args.role_map)
-        if prompt_role in explicit:
-            return explicit[prompt_role]
-        if prompt_role in self.browser_roles:
-            return prompt_role
-        if not self.browser_roles:
-            raise RuntimeError("no browser roles configured")
-        if getattr(self.args, "role", ""):
-            raise RuntimeError(
-                f"--role requested strict role tabs, but no browser role is available for {prompt_role}; "
-                f"browser roles: {', '.join(self.browser_roles)}. "
-                "Use --role-map LOGICAL=PHYSICAL for shared browser tabs.",
-            )
-        role = self.browser_roles[self.browser_cursor % len(self.browser_roles)]
-        self.browser_cursor += 1
-        return role
+        return self.runtime_config.physical_for(prompt_role)
 
-    def should_include_system(self, prompt_role: str) -> bool:
-        if self.args.resume:
-            return False
+    def should_include_system(self, prompt_role: str, browser_role: str | None = None) -> bool:
         if self.uses_goal_only_prompt(prompt_role):
             return False
-        return prompt_role not in self.system_sent
+        physical = browser_role or self.pick_browser_role(prompt_role)
+        return not self.sessions.get(physical).is_bootstrapped(prompt_role)
 
     def uses_goal_only_prompt(self, prompt_role: str) -> bool:
         return not has_role_prompt(normalize_role(prompt_role))
@@ -222,34 +262,35 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             return synthetic_response(prompt_role, instruction, repair, self.prompt_roles)
         return self.client.call_browser_role(browser_role, prompt, timeout_s=self.args.timeout)
 
-    def resume_existing_response(self, prompt_role: str, browser_role: str, turn: int) -> str:
+    def resume_existing_response(self, prompt_role: str, browser_role: str, turn: int, state: FlowState | None = None) -> str:
         if not self.args.resume or self.dry_run or turn != 1:
             return ""
+        goal = state.goal if state is not None else self.current_goal
         try:
             snapshot = self.client.role_snapshot(browser_role)
         except RuntimeError as exc:
             print(f"[resume] could not read current response for {prompt_role}/{browser_role}: {exc}", flush=True)
             return ""
         activity = self.client.response_activity(snapshot)
-        response = activity.response
         if self.client.is_manual_input_pending(activity):
+            raise ManualInputPendingError(
+                f"{browser_role} composer has pending manual input; resume will not overwrite or dispatch it",
+            )
+
+        expected = self.runtime_config.provenance_for(prompt_role, goal)
+        actual = PromptProvenance.extract(activity.last_user_text)
+        if actual != expected:
+            reason = "missing_or_ambiguous" if actual is None else "different_role_config_or_goal"
             print(
-                f"[resume] role={browser_role} composer has manual input; waiting for the user to clear or send it",
+                f"[resume] ignoring current response for prompt_role={prompt_role} browser_role={browser_role} provenance={reason}",
                 flush=True,
             )
-            self.client.wait_until_clean_ready(browser_role, self.args.timeout)
-            snapshot = self.client.role_snapshot(browser_role)
-            activity = self.client.response_activity(snapshot)
-            response = activity.response
+            return ""
+
+        response = activity.response
         if self.client.is_response_active(activity):
             print(f"[resume] role={browser_role} is still responding; waiting for latest response before deciding", flush=True)
-            try:
-                response = self.client.wait_for_current_response(browser_role, self.args.timeout)
-            except ManualInputPendingError:
-                raise
-            except RuntimeError as exc:
-                print(f"[resume] could not recover current response for {prompt_role}/{browser_role}: {exc}", flush=True)
-                return ""
+            response = self.client.wait_for_current_response(browser_role, self.args.timeout, require_response=True)
         if not response:
             return ""
         print(f"[resume] using current response for prompt_role={prompt_role} browser_role={browser_role}", flush=True)
@@ -265,6 +306,9 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             prompt_roles=self.prompt_roles,
             finish_roles=self.finish_roles,
             manager_role=self.manager_role,
+            state_text=state.compact(self.args.max_state_chars),
+            provenance=self.runtime_config.provenance_for(prompt_role, state.goal),
+            loader_manifest=self.runtime_config.loader_manifest(prompt_role),
             goal_only=self.uses_goal_only_prompt(prompt_role),
         )
         return rendered.text
@@ -278,6 +322,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         include_system: bool,
         route_error: str = "",
     ) -> str:
+        del bad_response
         rendered = render_format_repair_prompt(
             prompt_role=prompt_role,
             goal=state.goal,
@@ -288,7 +333,6 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             manager_role=self.manager_role,
             route_error=route_error,
             resume=bool(self.args.resume),
-            goal_only=self.uses_goal_only_prompt(prompt_role),
         )
         return rendered.text
 

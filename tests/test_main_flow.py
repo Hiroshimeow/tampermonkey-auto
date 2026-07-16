@@ -1,439 +1,121 @@
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import replace
+from types import MappingProxyType
+from typing import Any
 
 import pytest
 
-from apps.bridge import BridgeClient, ManualInputPendingError
-from apps.prompts import role_prompt_path, role_skill_path
-from main import Coordinator, FlowState, parse_args, parse_route
+from apps.bridge import BridgeClient, ManualInputPendingError, ResponseActivity
+from apps.cli import main as cli_main
+from apps.models import FlowState, FlowStopError, Route, TurnResult
+from apps.runtime_config import LoaderManifest, PromptProvenance, RuntimeRoleConfig
+from main import Coordinator, parse_args, parse_route
 
 
-def test_resume_prompt_does_not_include_system_prompt() -> None:
-    args = parse_args(["--resume", "--goal", "resume goal", "--role", "A,B,C"])
-    coordinator = Coordinator(args)
-    state = FlowState("resume goal")
-
-    prompt = coordinator.build_prompt(
-        "A",
-        "continue from current page",
-        state,
-        "USER",
-        include_system=coordinator.should_include_system("A"),
-    )
-
-    assert "[ROLE PROMPT:" not in prompt
-    assert "GOAL:\nresume goal" in prompt
-    assert "INSTRUCTION_FROM_CALLER:\ncontinue from current page" in prompt
-
-
-def test_resume_format_repair_only_sends_route_contract() -> None:
-    args = parse_args([
-        "--resume",
-        "--goal",
-        "resume goal",
+def make_args(*extra: str):
+    return parse_args([
         "--role",
-        "A,B",
-        "--max-turns",
-        "1",
+        "DEV,REVIEW",
+        "--goal",
+        "finish the task",
+        "--reload-after",
+        "0",
+        *extra,
     ])
-    coordinator = Coordinator(args)
-    state = FlowState("resume goal")
-
-    prompt = coordinator.build_format_repair_prompt(
-        "A",
-        "A",
-        state,
-        "USER",
-        include_system=True,
-    )
-
-    assert prompt.startswith("ROUTE_JSON_CONTRACT:")
-    assert "[ROLE PROMPT:" not in prompt
-    assert "PROMPT_ROLE:" not in prompt
-    assert "GOAL:" not in prompt
-    assert "PREVIOUS_BAD_RESPONSE" not in prompt
-    assert "FLOW_STATE" not in prompt
-    assert "Allowed route keys: A, B, FINISH." in prompt
 
 
-def test_non_resume_format_repair_does_not_resend_role_prompt_after_initial_send() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--max-turns", "1"])
-    coordinator = Coordinator(args)
-    sent_prompts = []
-
-    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
-        sent_prompts.append((repair, prompt))
-        if repair:
-            return 'Fixed.\n```json\n{"B":"continue"}\n```'
-        return "A"
-
-    coordinator.call_or_synthetic = fake_call
-
-    coordinator.run("finish the task")
-
-    assert len(sent_prompts) == 2
-    initial_prompt = sent_prompts[0][1]
-    repair_prompt = sent_prompts[1][1]
-    assert "[ROLE PROMPT: A]" in initial_prompt
-    assert repair_prompt.startswith("ROUTE_JSON_CONTRACT:")
-    assert "[ROLE PROMPT:" not in repair_prompt
-    assert "PREVIOUS_BAD_RESPONSE" not in repair_prompt
-    assert "FLOW_STATE" not in repair_prompt
-
-
-def test_run_reports_invalid_route_stop_instead_of_max_turns() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "A,B", "--max-turns", "60"])
-    coordinator = Coordinator(args)
-    calls = []
-
-    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
-        calls.append((prompt_role, repair))
-        return "plain answer without route json"
-
-    coordinator.call_or_synthetic = fake_call
-
-    result = coordinator.run("finish the task")
-
-    assert result["status"] == "stopped_invalid_route"
-    assert result["turns"] == 1
-    assert result["last_role"] == "A"
-    assert result["last_route_error"] == "missing route JSON object"
-    assert result["last_response"] == "plain answer without route json"
-    assert calls == [("A", False), ("A", True)]
-
-
-def test_non_resume_format_repair_can_bootstrap_role_instruction_once() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "A,B"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-
-    prompt = coordinator.build_format_repair_prompt("B", "B", state, "A", include_system=True)
-
-    assert "[ROLE PROMPT: B]" in prompt
-    assert "GOAL:\nfinish the task" in prompt
-    assert "PREVIOUS_BAD_RESPONSE" not in prompt
-    assert "FLOW_STATE" not in prompt
-    assert "ROUTE_JSON_CONTRACT:" in prompt
-
-
-def test_each_role_gets_system_prompt_on_its_first_cycle_not_global_turn_one() -> None:
-    args = parse_args(["--goal", "multi role goal", "--role", "A,B"])
-    coordinator = Coordinator(args)
-    coordinator.system_sent.update({"A"})
-    state = FlowState("multi role goal")
-
-    prompt = coordinator.build_prompt(
-        "B",
-        "B receives first routed message late",
-        state,
-        "A",
-        include_system=coordinator.should_include_system("B"),
-    )
-
-    assert "[ROLE PROMPT: B]" in prompt
-    assert "GOAL:\nmulti role goal" in prompt
-    assert '"A": "B receives first routed message late"' in prompt
-
-
-def test_route_contract_requires_self_contained_handoff_values() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "DEV,REVIEW,PLAN"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-
-    prompt = coordinator.build_prompt(
-        "PLAN",
-        "Start from the user goal.",
-        state,
-        "USER",
-        include_system=coordinator.should_include_system("PLAN"),
-    )
-
-    assert "Browser roles do not share chat history" in prompt
-    assert "self-contained handoff strings" in prompt
-    assert "Never route vague values" in prompt
-    assert "FINISH authority: PLAN." in prompt
-    assert "Allowed route keys: DEV, REVIEW, PLAN, FINISH." in prompt
-
-
-def test_route_parser_accepts_full_copied_response_with_trailing_route_block() -> None:
-    response = (
-        "REVIEW result: **khong pass FINISH**\n\n"
-        "Current required tests pass, but new user requirement fails on real parser output.\n\n"
-        "```json\n"
-        "{\n"
-        '  "DEV": "REVIEW khong pass FINISH. Current required tests pass, but new user requirement fails on real parser output."\n'
-        "}\n"
-        "```\n"
-    )
-
-    route = parse_route(response)
-
-    assert route.ok
-    assert route.targets == {
-        "DEV": "REVIEW khong pass FINISH. Current required tests pass, but new user requirement fails on real parser output.",
+def response_snapshot(
+    text: str,
+    *,
+    stop_visible: bool = False,
+    composer_text: str = "",
+    attachments: list[dict[str, Any]] | None = None,
+    composer: bool = True,
+    send_enabled: bool | None = None,
+    include_send_enabled: bool = True,
+    user_count: int = 1,
+    assistant_count: int = 1,
+    last_user_text: str = "",
+    choice_candidates: list[dict[str, Any]] | None = None,
+    page_instance_id: str = "page-1",
+    page_path: str = "/c/existing",
+) -> dict[str, Any]:
+    dom_info: dict[str, Any] = {
+            "page_instance_id": page_instance_id,
+            "page_path": page_path,
+            "composer": composer,
+            "stop_visible": stop_visible,
+            "composer_text": composer_text,
+            "composer_text_len": len(composer_text),
+            "composer_attachments": attachments or [],
+            "choice_prompt_pending": bool(choice_candidates),
+            "choice_prompt_candidates": choice_candidates or [],
+            "messages": {
+                "counts": {"user": user_count, "assistant": assistant_count, "images": 0},
+                "last_user": {"role": "user", "text": last_user_text},
+                "last_assistant": {"role": "assistant", "text": text},
+            },
+        }
+    if include_send_enabled:
+        dom_info["send_enabled"] = bool(composer_text) if send_enabled is None else send_enabled
+    return {
+        "last_response": text,
+        "dom_info": dom_info,
     }
 
 
-def test_role_flag_configures_prompt_browser_and_start_roles() -> None:
-    args = parse_args(["--role", "A,B", "--goal", "finish the task"])
+class SnapshotClient:
+    def __init__(self, snapshots: list[dict[str, Any]]):
+        self.snapshots = list(snapshots)
 
-    assert args.prompt_roles == "A,B"
-    assert args.browser_roles == "A,B"
-    assert args.start_role == "A"
+    def role_snapshot(self, role: str) -> dict[str, Any]:
+        del role
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
 
+    def response_activity(self, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
+        return BridgeClient.response_activity(snapshot, previous_response)
 
-def test_role_shortcut_starts_first_role_and_finishes_highest_precedence_role() -> None:
-    args = parse_args(["--role", "DEV,REVIEW,PLAN", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
+    def is_manual_input_pending(self, activity: ResponseActivity) -> bool:
+        return BridgeClient.is_manual_input_pending(activity)
 
-    assert args.prompt_roles == "DEV,REVIEW,PLAN"
-    assert args.browser_roles == "DEV,REVIEW,PLAN"
-    assert args.start_role == "DEV"
-    assert args.finish_roles == "PLAN"
-    assert coordinator.start_role == "DEV"
-    assert coordinator.finish_roles == {"PLAN"}
+    def is_response_active(self, activity: ResponseActivity) -> bool:
+        return BridgeClient.is_response_active(activity)
 
-
-def test_manager_mode_starts_first_role_and_finishes_manager() -> None:
-    args = parse_args(["--role", "DEV,MANAGER,REVIEW", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-
-    assert coordinator.start_role == "DEV"
-    assert coordinator.finish_roles == {"MANAGER"}
-    assert coordinator.manager_mode
+    def wait_for_current_response(self, role: str, timeout_s: float, **kwargs: Any) -> str:
+        del role, timeout_s, kwargs
+        return str(self.snapshots[-1].get("last_response") or "")
 
 
-def test_resume_repair_requires_non_manager_route_to_manager() -> None:
-    args = parse_args(["--role", "DEV,MANAGER,REVIEW", "--resume", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-    route = coordinator.validate_route("DEV", parse_route('```json\n{"REVIEW":"valid JSON but wrong manager-mode target"}\n```'))
-
-    prompt = coordinator.build_format_repair_prompt(
-        "DEV",
-        "bad route",
-        state,
-        "USER",
-        include_system=True,
-        route_error=route.error,
-    )
-
-    assert not route.ok
-    assert "must route exactly one result to MANAGER" in prompt
-    assert "MANAGER_MODE: MANAGER is active" in prompt
-    assert prompt.startswith("ROUTE_REPAIR_REQUIRED:")
-
-
-def test_plan_role_shortcut_dry_run_routes_through_dev_review_then_plan_finish() -> None:
-    args = parse_args(["--role", "DEV,REVIEW,PLAN", "--dry-run", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-
-    result = coordinator.run("finish the task")
-
-    assert result["status"] == "complete"
-    assert result["approved_by"] == "PLAN"
-    assert result["turns"] == 3
-
-
-def test_runtime_defaults_are_unlimited_and_reload_after_is_enabled() -> None:
-    args = parse_args(["--role", "DEV", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-
-    assert args.max_turns == 0
-    assert args.reload_after == 10.0
-    assert coordinator.max_turns == 0
-    coordinator.turn_count = 999
-    assert coordinator.has_turn_budget()
-
-    finite_args = parse_args(["--role", "DEV", "--goal", "finish the task", "--max-turns", "1", "--reload-after", "0"])
-    finite_coordinator = Coordinator(finite_args)
-    finite_coordinator.turn_count = 1
-    assert finite_args.reload_after == 0.0
-    assert not finite_coordinator.has_turn_budget()
-
-
-def test_missing_role_is_rejected() -> None:
-    with pytest.raises(SystemExit):
-        parse_args(["--goal", "finish the task"])
-
-
-def test_role_flag_dry_run_routes_through_configured_roles() -> None:
-    args = parse_args(["--role", "A,B", "--dry-run", "--max-turns", "3", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-
-    result = coordinator.run("finish the task")
-
-    assert result["status"] == "complete"
-    assert result["approved_by"] == "B"
-
-
-def test_review_route_to_plan_uses_plan_browser_not_dev() -> None:
-    args = parse_args([
-        "--role",
-        "REVIEW,DEV,PLAN",
-        "--finish-roles",
-        "PLAN",
-        "--max-turns",
-        "2",
-        "--goal",
-        "finish the task",
-    ])
-    coordinator = Coordinator(args)
-    calls = []
-
-    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
-        calls.append((prompt_role, browser_role, prompt))
-        if prompt_role == "REVIEW":
-            return 'Reviewed.\n```json\n{"PLAN":"REVIEW PASS for latest DEV pass; no blocker."}\n```'
-        return 'Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: PLAN received REVIEW handoff."}\n```'
-
-    coordinator.call_or_synthetic = fake_call
-
-    result = coordinator.run("finish the task")
-
-    assert result["status"] == "complete"
-    assert [(role, browser) for role, browser, _prompt in calls] == [("REVIEW", "REVIEW"), ("PLAN", "PLAN")]
-    assert "PROMPT_ROLE: PLAN" in calls[1][2]
-    assert "CALLER_ROLE: REVIEW" in calls[1][2]
-
-
-def test_role_shortcut_does_not_cursor_fallback_to_dev_for_unmapped_route() -> None:
-    args = parse_args([
-        "--role",
-        "REVIEW,DEV,PLAN",
-        "--max-turns",
-        "2",
-        "--goal",
-        "finish the task",
-    ])
-    args.browser_roles = "DEV,REVIEW"
-    coordinator = Coordinator(args)
-
-    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
-        return 'Reviewed.\n```json\n{"PLAN":"Send to PLAN, not DEV."}\n```'
-
-    coordinator.call_or_synthetic = fake_call
-
-    with pytest.raises(RuntimeError, match="no browser role is available for PLAN"):
-        coordinator.run("finish the task")
-
-
-def test_single_unknown_role_flag_runs_as_goal_only_finish_role() -> None:
-    args = parse_args(["--role", "ABCD", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-
-    assert coordinator.prompt_roles == ["ABCD"]
-    assert coordinator.browser_roles == ["ABCD"]
-    assert coordinator.start_role == "ABCD"
-    assert coordinator.finish_roles == {"ABCD"}
-
-
-def test_unknown_role_prompt_uses_goal_only_without_role_prompt() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "ABCD"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-
-    prompt = coordinator.build_prompt(
-        "ABCD",
-        "Start from the user goal.",
-        state,
-        "USER",
-        include_system=coordinator.should_include_system("ABCD"),
-    )
-
-    assert "[ROLE PROMPT:" not in prompt
-    assert "[ROLE SKILL:" not in prompt
-    assert "GOAL:\nfinish the task" in prompt
-    assert "Continue working until the goal is fully achieved." in prompt
-    assert '{"FINISH": "TASK COMPLETE. Evidence: ..."}' in prompt
-
-
-def test_numbered_role_uses_base_prompt_when_exact_prompt_is_missing() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "DEV1"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-
-    prompt = coordinator.build_prompt(
-        "DEV1",
-        "Start from the user goal.",
-        state,
-        "USER",
-        include_system=coordinator.should_include_system("DEV1"),
-    )
-
-    assert "[ROLE PROMPT: DEV1]" in prompt
-    assert "You are DEV." in prompt
-    assert "Required loader file" not in prompt
-    assert "Continue working until the goal is fully achieved." not in prompt
-
-
-def test_prefixed_role_type_uses_base_prompt_and_skill_when_exact_prompt_is_missing() -> None:
-    assert role_prompt_path("DEVX").as_posix() == "prompts/DEV.txt"
-    assert role_prompt_path("DEV99").as_posix() == "prompts/DEV.txt"
-    assert role_prompt_path("REVIEW_ALPHA").as_posix() == "prompts/REVIEW.txt"
-    assert role_skill_path("DEVX").as_posix() == "skills/DEV.md"
-    assert role_skill_path("REVIEW_ALPHA").as_posix() == "skills/REVIEW.md"
-
-
-def test_role_flag_keeps_distinct_browser_roles_while_using_prefixed_role_prompt() -> None:
-    args = parse_args(["--role", "dev1,devx,dev99", "--goal", "finish the task"])
-    coordinator = Coordinator(args)
-    state = FlowState("finish the task")
-
-    prompt = coordinator.build_prompt(
-        "DEVX",
-        "Start from the user goal.",
-        state,
-        "USER",
-        include_system=coordinator.should_include_system("DEVX"),
-    )
-
-    assert coordinator.prompt_roles == ["DEV1", "DEVX", "DEV99"]
-    assert coordinator.browser_roles == ["DEV1", "DEVX", "DEV99"]
-    assert coordinator.start_role == "DEV1"
-    assert "[ROLE PROMPT: DEVX]" in prompt
-    assert "You are DEV." in prompt
-    assert "[ROLE SKILL:" not in prompt
-
-
-def test_unknown_single_role_continues_until_finish_when_response_has_no_route() -> None:
-    args = parse_args(["--goal", "finish the task", "--role", "ABCD", "--max-turns", "3"])
-    coordinator = Coordinator(args)
-    sent_instructions = []
-
-    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
-        sent_instructions.append(instruction)
-        if len(sent_instructions) == 1:
-            return "Partial work done, continuing."
-        return 'Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: fallback loop reached completion."}\n```'
-
-    coordinator.call_or_synthetic = fake_call
-
-    result = coordinator.run("finish the task")
-
-    assert result["status"] == "complete"
-    assert result["approved_by"] == "ABCD"
-    assert sent_instructions[0] == "Start from the user goal. Decide the first phase and route work to the right role(s)."
-    assert "Continue working until the goal is fully achieved." in sent_instructions[1]
-
-
-class FakeBridge(BridgeClient):
-    def __init__(self, snapshots: list[dict], command_results: dict[str, list[dict]] | None = None):
+class ScriptedBridge(BridgeClient):
+    def __init__(
+        self,
+        snapshots: list[dict[str, Any]],
+        command_results: dict[str, list[dict[str, Any]]] | None = None,
+    ):
         super().__init__("http://127.0.0.1:8500")
         self.snapshots = list(snapshots)
         self.command_results = {key: list(value) for key, value in (command_results or {}).items()}
-        self.commands: list[str] = []
-        self.sleeps: list[float] = []
+        self.commands: list[tuple[str, dict[str, Any]]] = []
+        self.snapshot_calls = 0
+        self.snapshot_calls_at_click: list[int] = []
 
-    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict:
-        self.commands.append(action)
-        if action == "CLICK_CHOICE_PROMPT":
-            return {"ok": True, "done": True, "status": "CHOICE_PROMPT_CLICKED"}
-        return {"ok": True, "done": True, "status": f"{action}_DONE"}
+    def role_snapshot(self, role: str) -> dict[str, Any]:
+        del role
+        self.snapshot_calls += 1
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
 
-    def run_command(self, role: str, action: str, payload: dict, timeout_s: float) -> dict:
-        self.commands.append(action)
+    def run_command(self, role: str, action: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        del role, timeout_s
+        self.commands.append((action, dict(payload)))
+        if action == "CLICK_SEND":
+            self.snapshot_calls_at_click.append(self.snapshot_calls)
         queued = self.command_results.get(action) or []
         if queued:
             return queued.pop(0)
@@ -442,368 +124,963 @@ class FakeBridge(BridgeClient):
         if action == "CLICK_SEND":
             return {"done": True, "status": "SEND_ACCEPTED"}
         if action == "WAIT_ASSISTANT_DONE":
-            return {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "final route"}}
+            return {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh response"}}
         return {"done": True, "status": f"{action}_DONE"}
 
-    def role_snapshot(self, role: str) -> dict:
-        if len(self.snapshots) > 1:
-            return self.snapshots.pop(0)
-        return self.snapshots[0]
+    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+        del role, timeout_s
+        self.commands.append((action, {}))
+        if action == "CLICK_CHOICE_PROMPT":
+            return {"done": True, "status": "CHOICE_PROMPT_CLICKED"}
+        return {"done": True, "status": f"{action}_DONE"}
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        time.sleep(min(max(seconds, 0.0), 0.01))
+        time.sleep(min(max(seconds, 0.0), 0.002))
 
 
-def response_snapshot(
-    text: str,
-    stop_visible: bool,
-    composer_text: str = "",
-    attachments: list | None = None,
-    composer: bool = True,
-    choice_candidates: list | None = None,
-) -> dict:
-    return {
-        "last_response": text,
-        "dom_info": {
-            "composer": composer,
-            "stop_visible": stop_visible,
-            "composer_text": composer_text,
-            "composer_text_len": len(composer_text),
-            "composer_attachments": attachments or [],
-            "choice_prompt_pending": bool(choice_candidates),
-            "choice_prompt_candidates": choice_candidates or [],
-            "send_enabled": bool(composer_text),
-            "messages": {"counts": {"user": 1, "assistant": 1, "images": 0}},
-        },
-    }
+class LifecycleClient:
+    def __init__(self, reset_results: dict[str, dict[str, Any]] | None = None):
+        self.reset_results = reset_results or {}
+        self.calls: list[tuple[str, str]] = []
+        self.reset_called = threading.Event()
+
+    def role_snapshot(self, role: str) -> dict[str, Any]:
+        self.calls.append((role, "SNAPSHOT"))
+        return response_snapshot("old", page_instance_id=f"before-{role}")
+
+    def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
+        del timeout_s
+        self.calls.append((role, "NEW_CHAT"))
+        self.reset_called.set()
+        return self.reset_results.get(role, {"done": True, "status": "NEW_CHAT_DONE"})
+
+    def wait_new_chat_ready(self, role: str, before_snapshot: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        del before_snapshot, timeout_s
+        self.calls.append((role, "WAIT_NEW_CHAT_READY"))
+        configured = self.reset_results.get(f"{role}:READY")
+        if isinstance(configured, Exception):
+            raise configured
+        return configured or {
+            "done": True,
+            "status": "NEW_CHAT_READY",
+            "page_instance_id": f"after-{role}",
+            "page_path": "/",
+        }
+
+    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+        del timeout_s
+        self.calls.append((role, action))
+        return self.reset_results.get(f"{role}:{action}", {"done": True, "status": f"{action}_DONE"})
 
 
-def test_wait_until_clean_ready_clicks_choice_prompt_when_composer_missing() -> None:
-    bridge = FakeBridge([
-        response_snapshot("old", False, composer=False, choice_candidates=[{"label": "Continue"}]),
-        response_snapshot("old", False),
+def compatible_prompt(coordinator: Coordinator, role: str, goal: str) -> str:
+    state = FlowState(goal)
+    return coordinator.build_prompt(role, "resume", state, "USER", include_system=True)
+
+
+def test_full_loader_contains_all_required_sections_provenance_state_and_exact_route_message() -> None:
+    coordinator = Coordinator(make_args())
+    state = FlowState("finish the task")
+    state.handoffs["DEV"] = "saved implementation state"
+
+    prompt = coordinator.build_prompt(
+        "REVIEW",
+        "Review exact routed message.",
+        state,
+        "DEV",
+        include_system=True,
+    )
+
+    assert "[AGENTS: AGENTS.md]" in prompt
+    assert "[HANDOFF: prompts/HANDOFF.md]" in prompt
+    assert "[ROLE PROMPT: REVIEW]" in prompt
+    assert "[ROLE SKILL: REVIEW]" in prompt
+    assert "RUNTIME_PROVENANCE_JSON:" in prompt
+    assert '"prompt_role": "REVIEW"' in prompt
+    assert "FLOW_STATE_COMPACT:" in prompt
+    assert "saved implementation state" in prompt
+    assert '"DEV": "Review exact routed message."' in prompt
+    assert "ROUTE_JSON_CONTRACT:" in prompt
+
+
+def test_thin_repair_omits_full_loader_goal_and_state() -> None:
+    coordinator = Coordinator(make_args())
+    state = FlowState("finish the task")
+
+    prompt = coordinator.build_format_repair_prompt(
+        "DEV",
+        "bad response",
+        state,
+        "USER",
+        include_system=True,
+        route_error="unknown route target(s): OTHER",
+    )
+
+    assert prompt.startswith("ROUTE_REPAIR_REQUIRED:")
+    assert "unknown route target(s): OTHER" in prompt
+    assert "Allowed route keys: DEV, REVIEW, FINISH." in prompt
+    assert "FINISH authority: REVIEW." in prompt
+    assert "[AGENTS:" not in prompt
+    assert "[ROLE PROMPT:" not in prompt
+    assert "[ROLE SKILL:" not in prompt
+    assert "RUNTIME_PROVENANCE_JSON:" not in prompt
+    assert "FLOW_STATE_COMPACT:" not in prompt
+    assert "GOAL:" not in prompt
+
+
+def test_unconfigured_role_uses_goal_only_prompt_without_loader_error() -> None:
+    args = parse_args(["--role", "TEST1", "--goal", "nói ok", "--reload-after", "0"])
+    coordinator = Coordinator(args)
+    state = FlowState("nói ok")
+
+    assert coordinator.runtime_config.loader_errors() == {}
+    assert coordinator.uses_goal_only_prompt("TEST1")
+
+    prompt = coordinator.build_prompt("TEST1", "Start from the user goal.", state, "USER", include_system=True)
+
+    assert prompt == "nói ok"
+    assert "[AGENTS:" not in prompt
+    assert "[HANDOFF:" not in prompt
+    assert "[ROLE PROMPT:" not in prompt
+    assert "[ROLE SKILL:" not in prompt
+    assert "RUNTIME_PROVENANCE_JSON:" not in prompt
+    assert "PROMPT_ROLE:" not in prompt
+
+
+def test_digit_role_with_prompt_fallback_keeps_full_loader() -> None:
+    args = parse_args(["--role", "REVIEW1", "--goal", "review", "--reload-after", "0"])
+    coordinator = Coordinator(args)
+    state = FlowState("review")
+
+    assert coordinator.runtime_config.loader_errors() == {}
+    assert not coordinator.uses_goal_only_prompt("REVIEW1")
+
+    prompt = coordinator.build_prompt("REVIEW1", "Start from the user goal.", state, "USER", include_system=True)
+
+    assert "[AGENTS: AGENTS.md]" in prompt
+    assert "[ROLE PROMPT: REVIEW1]" in prompt
+    assert "[ROLE SKILL: REVIEW1]" in prompt
+
+
+def test_goal_only_plain_response_finishes_without_format_repair() -> None:
+    args = parse_args(["--role", "TEST1", "--goal", "nói ok", "--max-turns", "2", "--reload-after", "0"])
+    coordinator = Coordinator(args)
+    calls: list[tuple[bool, str]] = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, instruction
+        calls.append((repair, prompt))
+        return "ok"
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("nói ok")
+
+    assert result["status"] == "complete"
+    assert result["last_response"] == "ok"
+    assert calls == [(False, "nói ok")]
+    assert all("[ROLE PROMPT:" not in prompt for _repair, prompt in calls)
+
+
+def test_unknown_target_gets_one_same_role_repair_and_valid_repair_continues() -> None:
+    coordinator = Coordinator(make_args("--max-turns", "2"))
+    calls: list[tuple[str, bool]] = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del browser_role, prompt, instruction
+        calls.append((prompt_role, repair))
+        if prompt_role == "DEV" and not repair:
+            return '```json\n{"OTHER":"invalid"}\n```'
+        if prompt_role == "DEV" and repair:
+            return '```json\n{"REVIEW":"review repaired route"}\n```'
+        return '```json\n{"FINISH":"verified"}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "complete"
+    assert calls == [("DEV", False), ("DEV", True), ("REVIEW", False)]
+
+
+def test_unknown_target_after_repair_stops_without_manager_fallback_or_runtime_error() -> None:
+    args = parse_args([
+        "--role",
+        "DEV,MANAGER,REVIEW",
+        "--goal",
+        "finish",
+        "--reload-after",
+        "0",
     ])
+    coordinator = Coordinator(args)
+    calls: list[tuple[str, bool]] = []
 
-    activity = bridge.wait_until_clean_ready("DEV", timeout_s=2.0, poll_s=0.01)
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del browser_role, prompt, instruction
+        calls.append((prompt_role, repair))
+        return '```json\n{"UNKNOWN":"still invalid"}\n```'
 
-    assert activity.clean_ready
-    assert "CLICK_CHOICE_PROMPT" in bridge.commands
+    coordinator.call_or_synthetic = fake_call
+    result = coordinator.run("finish")
 
-
-def test_response_activity_reports_choice_prompt_labels() -> None:
-    bridge = BridgeClient("http://127.0.0.1:8500")
-
-    activity = bridge.response_activity(response_snapshot(
-        "old",
-        False,
-        composer=False,
-        choice_candidates=[{"meta": {"aria_label": "Continue"}}],
-    ))
-
-    assert activity.blocked_by_choice_prompt
-    assert activity.choice_prompt_labels == ("Continue",)
+    assert result["status"] == "stopped_invalid_route"
+    assert "unknown route target" in result["last_route_error"]
+    assert calls == [("DEV", False), ("DEV", True)]
+    assert all(role != "MANAGER" for role, _repair in calls)
 
 
-def test_wait_for_current_response_waits_until_stop_disappears_without_reload() -> None:
-    bridge = FakeBridge([
-        response_snapshot("partial", True),
-        response_snapshot("partial plus", True),
-        response_snapshot("final route", False),
+def test_validate_route_rejects_unknown_target_before_dispatch() -> None:
+    coordinator = Coordinator(make_args())
+    route = coordinator.validate_route("DEV", parse_route('```json\n{"GHOST":"x"}\n```'))
+
+    assert not route.ok
+    assert "GHOST" in route.error
+
+
+def test_resume_accepts_same_role_current_config_provenance() -> None:
+    coordinator = Coordinator(make_args("--resume"))
+    prompt = compatible_prompt(coordinator, "DEV", "finish the task")
+    response = '```json\n{"REVIEW":"continue"}\n```'
+    coordinator.client = SnapshotClient([response_snapshot(response, last_user_text=prompt)])
+
+    resumed = coordinator.resume_existing_response("DEV", "DEV", 1, FlowState("finish the task"))
+
+    assert resumed == response
+    assert coordinator.validate_route("DEV", parse_route(resumed)).ok
+
+
+def test_resume_same_role_invalid_response_gets_one_thin_repair() -> None:
+    coordinator = Coordinator(make_args("--resume", "--max-turns", "1"))
+    prompt = compatible_prompt(coordinator, "DEV", "finish the task")
+    coordinator.client = SnapshotClient([response_snapshot("plain invalid", last_user_text=prompt)])
+    calls: list[tuple[bool, str]] = []
+
+    def fake_call(prompt_role: str, browser_role: str, sent_prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, instruction
+        calls.append((repair, sent_prompt))
+        return '```json\n{"REVIEW":"fixed"}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "max_turns_reached"
+    assert len(calls) == 1
+    assert calls[0][0] is True
+    assert calls[0][1].startswith("ROUTE_REPAIR_REQUIRED:")
+    assert "[AGENTS:" not in calls[0][1]
+
+
+def test_resume_different_role_provenance_ignores_old_response_and_sends_full_prompt() -> None:
+    coordinator = Coordinator(make_args("--resume", "--max-turns", "1"))
+    wrong_prompt = compatible_prompt(coordinator, "REVIEW", "finish the task")
+    coordinator.client = SnapshotClient([
+        response_snapshot('```json\n{"FINISH":"stale"}\n```', last_user_text=wrong_prompt),
     ])
+    calls: list[tuple[bool, str]] = []
 
-    response = bridge.wait_for_current_response("REVIEW", timeout_s=2.0, active_wait_s=60.0, poll_s=0.01)
+    def fake_call(prompt_role: str, browser_role: str, sent_prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, instruction
+        calls.append((repair, sent_prompt))
+        return '```json\n{"REVIEW":"fresh"}\n```'
 
-    assert response == "final route"
-    assert "RELOAD_PAGE" not in bridge.commands
-    assert bridge.commands.count("SYNC_TRANSCRIPT") >= 3
+    coordinator.call_or_synthetic = fake_call
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "max_turns_reached"
+    assert len(calls) == 1
+    assert calls[0][0] is False
+    assert "[AGENTS: AGENTS.md]" in calls[0][1]
+    assert "RUNTIME_PROVENANCE_JSON:" in calls[0][1]
 
 
-def test_wait_for_current_response_reloads_after_active_window_then_rechecks() -> None:
-    bridge = FakeBridge([
-        response_snapshot("partial", True),
-        response_snapshot("final route", False),
+def test_resume_missing_provenance_ignores_old_response() -> None:
+    coordinator = Coordinator(make_args("--resume", "--max-turns", "1"))
+    coordinator.client = SnapshotClient([
+        response_snapshot('```json\n{"FINISH":"stale"}\n```', last_user_text="old manual prompt"),
     ])
+    calls: list[bool] = []
 
-    response = bridge.wait_for_current_response("REVIEW", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
+    def fake_call(prompt_role: str, browser_role: str, sent_prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, sent_prompt, instruction
+        calls.append(repair)
+        return '```json\n{"REVIEW":"fresh"}\n```'
 
-    assert response == "final route"
-    assert "RELOAD_PAGE" in bridge.commands
-    assert 0.01 in bridge.sleeps
+    coordinator.call_or_synthetic = fake_call
+    coordinator.run("finish the task")
 
-
-def test_wait_for_current_response_does_not_return_until_composer_recovers_after_reload() -> None:
-    bridge = FakeBridge([
-        response_snapshot("partial", True),
-        response_snapshot("stale incomplete", False, composer=False),
-        response_snapshot("final route", False),
-    ])
-
-    response = bridge.wait_for_current_response("DEV", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
-
-    assert response == "final route"
-    assert "RELOAD_PAGE" in bridge.commands
+    assert calls == [False]
 
 
-def test_wait_for_current_response_clicks_choice_prompt_after_reload_before_returning() -> None:
-    bridge = FakeBridge([
-        response_snapshot("partial", True),
-        response_snapshot("stale incomplete", False, composer=False, choice_candidates=[{"label": "Continue"}]),
-        response_snapshot("final route", False),
-    ])
-
-    response = bridge.wait_for_current_response("DEV", timeout_s=2.0, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
-
-    assert response == "final route"
-    assert "CLICK_CHOICE_PROMPT" in bridge.commands
-
-
-def test_wait_for_current_response_blocks_on_manual_composer_text_without_reload() -> None:
-    bridge = FakeBridge([
-        response_snapshot("partial response", False, composer_text="manual steer"),
+def test_resume_manual_composer_is_not_overwritten() -> None:
+    coordinator = Coordinator(make_args("--resume"))
+    prompt = compatible_prompt(coordinator, "DEV", "finish the task")
+    coordinator.client = SnapshotClient([
+        response_snapshot("old", composer_text="manual steer", last_user_text=prompt),
     ])
 
     with pytest.raises(ManualInputPendingError):
-        bridge.wait_for_current_response("REVIEW", timeout_s=0.02, active_wait_s=0.0, page_wait_s=0.01, poll_s=0.01)
-
-    assert "RELOAD_PAGE" not in bridge.commands
+        coordinator.resume_existing_response("DEV", "DEV", 1, FlowState("finish the task"))
 
 
-def test_call_browser_role_waits_and_still_refuses_to_replace_manual_composer_text_after_timeout() -> None:
-    bridge = FakeBridge([
-        response_snapshot("old response", False, composer_text="manual steer"),
+def test_role_binding_is_resolved_once_and_reused() -> None:
+    args = make_args("--role-map", "DEV=SHARED REVIEW=SHARED")
+    coordinator = Coordinator(args)
+    args.role_map = "DEV=OTHER REVIEW=OTHER"
+
+    assert coordinator.pick_browser_role("DEV") == "SHARED"
+    assert coordinator.pick_browser_role("REVIEW") == "SHARED"
+    assert coordinator.runtime_config.physical_roles == ("SHARED",)
+
+
+def test_parallel_targets_on_same_physical_role_are_serialized() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED", "--parallelism", "2"))
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        nonlocal active, max_active
+        del prompt_role, browser_role, prompt, instruction, repair
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with counter_lock:
+            active -= 1
+        return '```json\n{"DEV":"done"}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+    results = coordinator.dispatch_parallel({"DEV": "a", "REVIEW": "b"}, FlowState("goal"), "PLAN", 0)
+
+    assert len(results) == 2
+    assert max_active == 1
+
+
+def test_parallel_targets_on_distinct_physical_roles_remain_concurrent() -> None:
+    coordinator = Coordinator(make_args("--parallelism", "2"))
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        nonlocal active, max_active
+        del prompt_role, browser_role, prompt, instruction, repair
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        barrier.wait(timeout=2.0)
+        time.sleep(0.02)
+        with counter_lock:
+            active -= 1
+        return '```json\n{"DEV":"done"}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+    results = coordinator.dispatch_parallel({"DEV": "a", "REVIEW": "b"}, FlowState("goal"), "PLAN", 0)
+
+    assert len(results) == 2
+    assert max_active == 2
+
+
+def test_reset_cannot_run_during_active_transaction_on_same_physical_role() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
+    client = LifecycleClient()
+    coordinator.client = client
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, prompt, instruction, repair
+        entered.set()
+        release.wait(timeout=2.0)
+        return '```json\n{"DEV":"done"}\n```'
+
+    coordinator.call_or_synthetic = fake_call
+    state = FlowState("goal")
+    dispatch_thread = threading.Thread(
+        target=coordinator.dispatch_role,
+        args=("DEV", "work", state, "USER", 0),
+        kwargs={"follow_routes": False},
+    )
+    dispatch_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    reset_thread = threading.Thread(target=coordinator.reset_browser_for, args=("REVIEW",))
+    reset_thread.start()
+    time.sleep(0.05)
+    assert not client.reset_called.is_set()
+
+    release.set()
+    dispatch_thread.join(timeout=2.0)
+    reset_thread.join(timeout=2.0)
+    assert client.reset_called.is_set()
+
+
+def test_reset_waits_for_terminal_new_chat_readiness_before_phase_or_bootstrap_change() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
+    ready_started = threading.Event()
+    release_ready = threading.Event()
+
+    class DelayedReadyClient(LifecycleClient):
+        def wait_new_chat_ready(self, role: str, before_snapshot: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+            del before_snapshot, timeout_s
+            self.calls.append((role, "WAIT_NEW_CHAT_READY"))
+            ready_started.set()
+            release_ready.wait(timeout=2.0)
+            return {"done": True, "status": "NEW_CHAT_READY", "page_instance_id": "after", "page_path": "/"}
+
+    coordinator.client = DelayedReadyClient()
+    session = coordinator.sessions.get("SHARED")
+    session.mark_bootstrapped("DEV")
+    coordinator.system_sent.add("DEV")
+    state = FlowState("goal")
+    outcome: list[dict[str, Any]] = []
+    thread = threading.Thread(target=lambda: outcome.append(coordinator.reset_roles_for_handoff(["DEV"], state)))
+    thread.start()
+
+    assert ready_started.wait(timeout=1.0)
+    assert state.phase == 1
+    assert session.is_bootstrapped("DEV")
+    assert coordinator.system_sent == {"DEV"}
+
+    release_ready.set()
+    thread.join(timeout=2.0)
+    assert outcome and outcome[0]["done"] is True
+    assert state.phase == 2
+    assert not session.is_bootstrapped("DEV")
+    assert coordinator.system_sent == set()
+
+
+def test_reset_readiness_timeout_preserves_phase_and_bootstrap() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
+    coordinator.client = LifecycleClient({"SHARED:READY": RuntimeError("new chat readiness timeout")})
+    session = coordinator.sessions.get("SHARED")
+    session.mark_bootstrapped("DEV")
+    coordinator.system_sent.add("DEV")
+    state = FlowState("goal")
+
+    with pytest.raises(FlowStopError) as exc_info:
+        coordinator.reset_roles_for_handoff(["DEV"], state)
+
+    assert exc_info.value.status == "reset_failed"
+    assert "readiness timeout" in exc_info.value.details["failed"]["SHARED"]
+    assert state.phase == 1
+    assert session.is_bootstrapped("DEV")
+    assert coordinator.system_sent == {"DEV"}
+
+
+def test_failed_reset_does_not_advance_phase_or_clear_bootstrap() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
+    coordinator.client = LifecycleClient({"SHARED": {"done": False, "status": "NEW_CHAT_FAILED"}})
+    session = coordinator.sessions.get("SHARED")
+    session.mark_bootstrapped("DEV")
+    session.mark_bootstrapped("REVIEW")
+    coordinator.system_sent.update({"DEV", "REVIEW"})
+    state = FlowState("goal")
+
+    with pytest.raises(FlowStopError) as exc_info:
+        coordinator.reset_roles_for_handoff(["DEV", "REVIEW"], state)
+
+    assert exc_info.value.status == "reset_failed"
+    assert state.phase == 1
+    assert session.is_bootstrapped("DEV")
+    assert session.is_bootstrapped("REVIEW")
+    assert coordinator.system_sent == {"DEV", "REVIEW"}
+
+
+def test_partial_reset_stops_with_structured_succeeded_and_failed_targets() -> None:
+    coordinator = Coordinator(make_args())
+    coordinator.client = LifecycleClient({
+        "DEV": {"done": True, "status": "NEW_CHAT_DONE"},
+        "REVIEW": {"done": False, "status": "NEW_CHAT_FAILED"},
+    })
+    coordinator.sessions.get("DEV").mark_bootstrapped("DEV")
+    coordinator.sessions.get("REVIEW").mark_bootstrapped("REVIEW")
+    state = FlowState("goal")
+
+    with pytest.raises(FlowStopError) as exc_info:
+        coordinator.reset_roles_for_handoff(["DEV", "REVIEW"], state)
+
+    assert exc_info.value.status == "reset_failed"
+    assert exc_info.value.details["succeeded"] == ["DEV"]
+    assert "REVIEW" in exc_info.value.details["failed"]
+    assert state.phase == 1
+    assert coordinator.sessions.get("DEV").is_bootstrapped("DEV")
+    assert coordinator.sessions.get("REVIEW").is_bootstrapped("REVIEW")
+
+
+def test_successful_reset_invalidates_all_logical_roles_sharing_physical_tab() -> None:
+    coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
+    coordinator.client = LifecycleClient()
+    session = coordinator.sessions.get("SHARED")
+    session.mark_bootstrapped("DEV")
+    session.mark_bootstrapped("REVIEW")
+    coordinator.system_sent.update({"DEV", "REVIEW"})
+    state = FlowState("goal")
+
+    result = coordinator.reset_roles_for_handoff(["DEV"], state)
+
+    assert result["done"] is True
+    assert state.phase == 2
+    assert session.generation == 1
+    assert not session.is_bootstrapped("DEV")
+    assert not session.is_bootstrapped("REVIEW")
+    assert coordinator.should_include_system("DEV", "SHARED")
+    assert coordinator.should_include_system("REVIEW", "SHARED")
+
+
+def test_preflight_includes_role_map_only_physical_values() -> None:
+    coordinator = Coordinator(make_args("--resume", "--role-map", "DEV=SHARED REVIEW=SHARED"))
+    client = LifecycleClient()
+    coordinator.client = client
+
+    coordinator.preflight()
+
+    assert client.calls == [("SHARED", "PROBE")]
+
+
+def test_preflight_done_false_stops_flow() -> None:
+    coordinator = Coordinator(make_args("--resume"))
+    coordinator.client = LifecycleClient({"DEV:PROBE": {"done": False, "status": "PROBE_FAILED"}})
+
+    with pytest.raises(FlowStopError) as exc_info:
+        coordinator.preflight()
+
+    assert exc_info.value.status == "preflight_failed"
+    assert exc_info.value.details["role"] == "DEV"
+    assert exc_info.value.details["action"] == "PROBE"
+
+
+def test_resume_preflight_is_non_destructive() -> None:
+    coordinator = Coordinator(make_args("--resume"))
+    client = LifecycleClient()
+    coordinator.client = client
+
+    coordinator.preflight()
+
+    assert client.calls == [("DEV", "PROBE"), ("REVIEW", "PROBE")]
+    assert all(action not in {"RELOAD_PAGE", "NEW_CHAT"} for _role, action in client.calls)
+
+
+def test_existing_equal_composer_prompt_is_reused_and_sent() -> None:
+    prompt = "automated prompt"
+    snapshots = [
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+    ]
+    bridge = ScriptedBridge(snapshots)
+
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+
+    assert response == "fresh response"
+    actions = [action for action, _payload in bridge.commands]
+    assert "SET_PROMPT" not in actions
+    assert actions.count("CLICK_SEND") == 1
+
+
+def test_different_existing_composer_text_is_blocked_without_overwrite_or_reload() -> None:
+    bridge = ScriptedBridge([
+        response_snapshot("old", composer_text="manual edit"),
+        response_snapshot("old", composer_text="manual edit"),
     ])
 
     with pytest.raises(ManualInputPendingError):
-        bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=0.02)
+        bridge.call_browser_role("DEV", "automated prompt", timeout_s=1.0)
 
-    assert "SET_PROMPT" not in bridge.commands
-    assert bridge.sleeps
-
-
-def test_set_prompt_and_upload_wait_for_full_timeout_before_replacing_prompt() -> None:
-    class RecordingBridge(FakeBridge):
-        def __init__(self) -> None:
-            super().__init__([response_snapshot("old response", False)])
-            self.ready_timeouts: list[float] = []
-
-        def wait_until_clean_ready(self, role: str, timeout_s: float, poll_s: float = 2.0):
-            self.ready_timeouts.append(timeout_s)
-            return self.response_activity(response_snapshot("old response", False))
-
-    bridge = RecordingBridge()
-
-    bridge.set_prompt("REVIEW", "automated prompt", timeout_s=1800.0)
-    bridge.upload_files("REVIEW", {"files": [], "text": "attached context"}, timeout_s=1800.0)
-
-    assert bridge.ready_timeouts == [1800.0, 1800.0]
+    actions = [action for action, _payload in bridge.commands]
+    assert "SET_PROMPT" not in actions
+    assert "CLICK_SEND" not in actions
+    assert "RELOAD_PAGE" not in actions
 
 
-def test_call_browser_role_does_not_reuse_response_that_finishes_while_waiting_to_send() -> None:
-    bridge = FakeBridge(
+def test_composer_is_verified_stable_and_send_ready_before_click() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge([
+        response_snapshot("old"),
+        response_snapshot("old"),
+        response_snapshot("old", composer_text=prompt, send_enabled=False),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+    ])
+
+    bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+
+    assert bridge.snapshot_calls_at_click
+    assert bridge.snapshot_calls_at_click[0] >= 6
+
+
+def test_unknown_send_enabled_state_times_out_fail_closed() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge([
+        response_snapshot("old", composer_text=prompt, include_send_enabled=False),
+    ])
+
+    with pytest.raises(RuntimeError, match="did not become stable and send-ready"):
+        bridge.wait_for_stable_expected_prompt("DEV", prompt, timeout_s=0.02, poll_s=0.001)
+
+
+def test_unknown_send_enabled_then_two_true_samples_succeeds() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge([
+        response_snapshot("old", composer_text=prompt, include_send_enabled=False),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+    ])
+
+    activity = bridge.wait_for_stable_expected_prompt("DEV", prompt, timeout_s=1.0, poll_s=0.001)
+
+    assert activity.send_enabled is True
+
+
+def test_transient_upload_attachment_waits_until_expected_prompt_is_send_ready() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge([
+        response_snapshot(
+            "old",
+            composer_text=prompt,
+            attachments=[{"label": "uploading"}],
+            send_enabled=False,
+        ),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+        response_snapshot("old", composer_text=prompt, send_enabled=True),
+    ])
+
+    activity = bridge.wait_for_stable_expected_prompt("DEV", prompt, timeout_s=1.0, poll_s=0.001)
+
+    assert activity.send_enabled is True
+    assert activity.composer_attachment_count == 0
+
+
+def test_first_click_failure_with_expected_prompt_retries_once_without_reload() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge(
         [
-            response_snapshot("old response", False, composer_text="queued prompt from interrupted run"),
-            response_snapshot("partial answer", True),
-            response_snapshot("stale routed answer", False),
-        ],
-        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh routed answer"}}]},
-    )
-
-    response = bridge.call_browser_role("B", "new automated prompt", timeout_s=2.0)
-
-    assert response == "fresh routed answer"
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
-
-
-def test_call_browser_role_waits_for_recovered_response_when_assistant_done_text_is_empty() -> None:
-    bridge = FakeBridge(
-        [
-            response_snapshot("old response", False),
-            response_snapshot("old response", False),
-            response_snapshot("", False),
-            response_snapshot('JSON\n{"DEV":"continue"}', False),
-        ],
-        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": ""}}]},
-    )
-
-    response = bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=2.0)
-
-    assert response == 'JSON\n{"DEV":"continue"}'
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
-
-
-def test_call_browser_role_resyncs_when_assistant_done_text_is_incomplete_json() -> None:
-    bridge = FakeBridge(
-        [
-            response_snapshot("old response", False),
-            response_snapshot("old response", False),
-            response_snapshot("JSON\n{", False),
-            response_snapshot('```json\n{"DEV":"continue"}\n```', False),
-        ],
-        command_results={"WAIT_ASSISTANT_DONE": [{"done": True, "status": "ASSISTANT_DONE", "result": {"text": "JSON\n{"}}]},
-    )
-
-    response = bridge.call_browser_role("PLAN", "automated prompt", timeout_s=2.0)
-
-    assert response == '```json\n{"DEV":"continue"}\n```'
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
-
-
-def test_call_browser_role_waits_for_recovered_response_after_assistant_timeout() -> None:
-    bridge = FakeBridge(
-        [
-            response_snapshot("old response", False),
-            response_snapshot("old response", False),
-            response_snapshot("", False),
-            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
-        ],
-        command_results={
-            "WAIT_ASSISTANT_DONE": [
-                {"done": True, "status": "ASSISTANT_TIMEOUT", "result": {}},
-            ],
-        },
-    )
-
-    response = bridge.call_browser_role("DEV", "automated prompt", timeout_s=2.0)
-
-    assert response == '```json\n{"REVIEW":"continue"}\n```'
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert bridge.commands.count("SYNC_TRANSCRIPT") >= 2
-
-
-def test_call_browser_role_recovers_when_wait_command_loses_turn_context() -> None:
-    bridge = FakeBridge(
-        [
-            response_snapshot("old response", False),
-            response_snapshot("old response", False),
-            response_snapshot("partial answer", True),
-            response_snapshot('Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: recovered."}\n```', False),
-        ],
-        command_results={
-            "WAIT_ASSISTANT_DONE": [
-                {"done": True, "status": "ERROR_COMMAND", "result": {"reason": "missing_send_accept_context"}},
-            ],
-        },
-    )
-
-    response = bridge.call_browser_role("REVIEW", "automated prompt", timeout_s=2.0)
-
-    assert "TASK COMPLETE" in response
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
-
-
-def test_call_browser_role_reloads_and_retries_once_when_click_send_fails_without_new_response() -> None:
-    bridge = FakeBridge(
-        [
-            response_snapshot("old invalid response", False),
-            response_snapshot("old invalid response", False),
-            response_snapshot("old invalid response", False),
-            response_snapshot("old invalid response", False),
+            response_snapshot("old"),
+            response_snapshot("old"),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text=prompt),
         ],
         command_results={
             "CLICK_SEND": [
                 {"done": True, "status": "SEND_FAILED"},
-            ],
-            "WAIT_ASSISTANT_DONE": [
-                {"done": True, "status": "ASSISTANT_DONE", "result": {"text": '```json\n{"REVIEW":"continue"}\n```'}},
+                {"done": True, "status": "SEND_ACCEPTED"},
             ],
         },
     )
 
-    response = bridge.call_browser_role("DEV", "repair route json", timeout_s=2.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
 
-    assert response == '```json\n{"REVIEW":"continue"}\n```'
-    assert bridge.commands.count("SET_PROMPT") == 2
-    assert bridge.commands.count("CLICK_SEND") == 2
-    assert "RELOAD_PAGE" in bridge.commands
+    assert response == "fresh response"
+    actions = [action for action, _payload in bridge.commands]
+    assert actions.count("CLICK_SEND") == 2
+    assert actions.count("SET_PROMPT") == 1
+    assert "RELOAD_PAGE" not in actions
 
 
-def test_call_browser_role_rechecks_after_reload_before_retrying_send() -> None:
-    bridge = FakeBridge(
+def test_send_evidence_after_nominal_failure_waits_without_duplicate_send() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge(
         [
-            response_snapshot("old invalid response", False),
-            response_snapshot("old invalid response", False),
-            response_snapshot("old invalid response", False),
-            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
-            response_snapshot('```json\n{"REVIEW":"continue"}\n```', False),
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text="", user_count=2, last_user_text=prompt),
         ],
         command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
     )
 
-    response = bridge.call_browser_role("DEV", "repair route json", timeout_s=2.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
 
-    assert response == '```json\n{"REVIEW":"continue"}\n```'
-    assert bridge.commands.count("SET_PROMPT") == 1
-    assert bridge.commands.count("CLICK_SEND") == 1
-    assert "RELOAD_PAGE" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
+    assert response == "fresh response"
+    actions = [action for action, _payload in bridge.commands]
+    assert actions.count("CLICK_SEND") == 1
+    assert "RELOAD_PAGE" not in actions
 
 
-def test_call_browser_role_recovers_when_click_send_fails_but_response_started() -> None:
-    bridge = FakeBridge(
+def test_stop_visibility_alone_is_not_send_evidence() -> None:
+    prompt = "automated prompt"
+    baseline = BridgeClient.response_activity(
+        response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+    )
+    after = BridgeClient.response_activity(
+        response_snapshot(
+            "old",
+            stop_visible=True,
+            composer_text=prompt,
+            last_user_text="old user",
+        ),
+    )
+
+    assert not BridgeClient.has_send_evidence(after, baseline)
+
+
+def test_wait_assistant_done_passes_wall_clock_timeout_to_browser() -> None:
+    bridge = ScriptedBridge(
+        [response_snapshot("old")],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh response"}},
+            ],
+        },
+    )
+
+    response = bridge.wait_assistant_done("DEV", timeout_s=12.5)
+
+    assert response == "fresh response"
+    payload = next(payload for action, payload in bridge.commands if action == "WAIT_ASSISTANT_DONE")
+    assert payload["timeout_ms"] == 11_500
+
+
+def test_second_nominal_send_failure_with_evidence_recovers_without_third_click() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge(
         [
-            response_snapshot("old response", False),
-            response_snapshot("old response", False),
-            response_snapshot("partial answer", True),
-            response_snapshot("final answer", False),
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text="", user_count=2, last_user_text=prompt),
+        ],
+        command_results={
+            "CLICK_SEND": [
+                {"done": True, "status": "SEND_FAILED"},
+                {"done": True, "status": "SEND_FAILED"},
+            ],
+        },
+    )
+
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+
+    assert response == "fresh response"
+    actions = [action for action, _payload in bridge.commands]
+    assert actions.count("CLICK_SEND") == 2
+    assert actions.count("WAIT_ASSISTANT_DONE") == 1
+    assert "RELOAD_PAGE" not in actions
+
+
+def test_second_nominal_send_failure_without_evidence_propagates_after_two_clicks() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge(
+        [
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+            response_snapshot("old", composer_text=prompt, last_user_text="old user"),
+        ],
+        command_results={
+            "CLICK_SEND": [
+                {"done": True, "status": "SEND_FAILED"},
+                {"done": True, "status": "SEND_FAILED"},
+            ],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="CLICK_SEND failed"):
+        bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+
+    actions = [action for action, _payload in bridge.commands]
+    assert actions.count("CLICK_SEND") == 2
+    assert "WAIT_ASSISTANT_DONE" not in actions
+    assert "RELOAD_PAGE" not in actions
+
+
+def test_changed_composer_after_paste_is_ownership_loss() -> None:
+    prompt = "automated prompt"
+    bridge = ScriptedBridge(
+        [
+            response_snapshot("old"),
+            response_snapshot("old"),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text=prompt),
+            response_snapshot("old", composer_text="manual change"),
         ],
         command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
     )
 
-    response = bridge.call_browser_role("B", "automated prompt", timeout_s=2.0)
+    with pytest.raises(ManualInputPendingError):
+        bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
 
-    assert response == "final answer"
-    assert "SET_PROMPT" in bridge.commands
-    assert "CLICK_SEND" in bridge.commands
-    assert "SYNC_TRANSCRIPT" in bridge.commands
+    actions = [action for action, _payload in bridge.commands]
+    assert actions.count("CLICK_SEND") == 1
+    assert "RELOAD_PAGE" not in actions
 
 
-def test_resume_waits_for_manual_input_to_clear_before_using_current_response() -> None:
-    args = parse_args(["--resume", "--goal", "finish the task", "--role", "A", "--timeout", "1"])
-    coordinator = Coordinator(args)
-    bridge = FakeBridge([
-        response_snapshot("old response", False, composer_text="manual steer"),
-        response_snapshot("old response", False, composer_text="manual steer"),
-        response_snapshot('Done.\n```json\n{"FINISH":"TASK COMPLETE. Evidence: resumed response."}\n```', False),
+def test_recovery_rejects_stale_pre_send_response_until_fresh_output_arrives() -> None:
+    baseline = BridgeClient.response_activity(response_snapshot("stale", assistant_count=1))
+    bridge = ScriptedBridge([
+        response_snapshot("stale", assistant_count=1),
+        response_snapshot("fresh", assistant_count=2),
     ])
-    coordinator.client = bridge
 
-    response = coordinator.resume_existing_response("A", "A", turn=1)
+    response = bridge.wait_for_current_response(
+        "DEV",
+        timeout_s=1.0,
+        active_wait_s=60.0,
+        poll_s=0.001,
+        require_response=True,
+        baseline=baseline,
+        require_fresh=True,
+    )
 
-    assert "TASK COMPLETE" in response
-    assert "SET_PROMPT" not in bridge.commands
-    assert bridge.sleeps
+    assert response == "fresh"
+    assert [action for action, _payload in bridge.commands].count("SYNC_TRANSCRIPT") >= 2
 
 
-def test_response_activity_classifiers_cover_ready_streaming_stuck_and_manual_attachment() -> None:
-    bridge = BridgeClient("http://127.0.0.1:8500")
+def test_composer_normalization_is_conservative() -> None:
+    assert BridgeClient.normalize_composer_text("a\r\nb\u00a0\n") == "a\nb "
+    assert BridgeClient.normalize_composer_text("a\n\n\nb") == "a\n\nb"
+    assert BridgeClient.normalize_composer_text("a\nb") == "a\nb"
+    assert BridgeClient.normalize_composer_text("a  b") != BridgeClient.normalize_composer_text("a b")
 
-    ready = bridge.response_activity(response_snapshot("old", False))
-    assert bridge.is_clean_ready(ready)
-    assert bridge.is_response_done(ready)
 
-    streaming = bridge.response_activity(response_snapshot("new text", True), previous_response="old text")
-    assert bridge.is_response_active(streaming)
-    assert bridge.is_response_streaming(streaming)
-    assert bridge.is_response_stuck(streaming, elapsed_s=301.0, active_wait_s=300.0)
+def test_manual_attachment_blocks_automation() -> None:
+    bridge = ScriptedBridge([
+        response_snapshot("old", attachments=[{"label": "remove file"}]),
+        response_snapshot("old", attachments=[{"label": "remove file"}]),
+    ])
 
-    manual_attachment = bridge.response_activity(response_snapshot("old", False, attachments=[{"label": "remove file"}]))
-    assert bridge.is_manual_input_pending(manual_attachment)
-    assert not bridge.is_clean_ready(manual_attachment)
+    with pytest.raises(ManualInputPendingError):
+        bridge.call_browser_role("DEV", "prompt", timeout_s=1.0)
 
-    plus_button = bridge.response_activity(response_snapshot(
-        "old",
-        False,
-        attachments=[{"aria_label": "Add files and more", "data_testid": "composer-plus-btn"}],
-    ))
-    assert not bridge.is_manual_input_pending(plus_button)
-    assert bridge.is_clean_ready(plus_button)
+
+def test_offline_physical_role_fails_before_creating_browser_command() -> None:
+    snapshot = response_snapshot("")
+    snapshot.update({"status": "OFFLINE", "online": False, "last_seen_age_s": None})
+    bridge = ScriptedBridge([snapshot])
+
+    with pytest.raises(RuntimeError, match="physical role DEV is offline"):
+        bridge.call_browser_role("DEV", "prompt", timeout_s=1.0)
+
+    assert bridge.commands == []
+
+
+def test_cli_prints_structured_flow_result_for_configuration_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = cli_main([
+        "--role",
+        "DEV,REVIEW",
+        "--browser-roles",
+        "DEV",
+        "--goal",
+        "finish",
+        "--reload-after",
+        "0",
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "=== FLOW RESULT ===" in captured.out
+    assert '"status": "runtime_config_error"' in captured.out
+    assert "no browser role is available for REVIEW" in captured.out
+
+
+def test_dry_run_normal_three_role_flow_remains_functional() -> None:
+    args = parse_args([
+        "--role",
+        "DEV,REVIEW,PLAN",
+        "--dry-run",
+        "--goal",
+        "finish",
+        "--reload-after",
+        "0",
+    ])
+    coordinator = Coordinator(args)
+
+    result = coordinator.run("finish")
+
+    assert result["status"] == "complete"
+    assert result["approved_by"] == "PLAN"
+
+
+def test_route_parser_accepts_trailing_fenced_route() -> None:
+    route = parse_route('work completed\n```json\n{"REVIEW":"check it"}\n```')
+    assert route.ok
+    assert route.targets == {"REVIEW": "check it"}
+
+
+@pytest.mark.parametrize(
+    "mutate_payload",
+    [
+        lambda payload: {**payload, "extra": "field"},
+        lambda payload: {**payload, "allowed_roles": "DEV,REVIEW"},
+        lambda payload: {**payload, "finish_roles": ["review"]},
+        lambda payload: {**payload, "prompt_role": "dev"},
+    ],
+)
+def test_prompt_provenance_rejects_non_exact_payloads(mutate_payload: Any) -> None:
+    coordinator = Coordinator(make_args())
+    expected = coordinator.runtime_config.provenance_for("DEV", "finish the task")
+    payload = mutate_payload(expected.as_dict())
+    text = f"RUNTIME_PROVENANCE_JSON:\n{__import__('json').dumps(payload, sort_keys=True)}"
+
+    assert PromptProvenance.extract(text) is None
+
+
+def test_prompt_provenance_rejects_duplicate_identical_and_conflicting_markers() -> None:
+    coordinator = Coordinator(make_args())
+    dev = coordinator.runtime_config.provenance_for("DEV", "finish the task")
+    review = coordinator.runtime_config.provenance_for("REVIEW", "finish the task")
+
+    assert PromptProvenance.extract(f"{dev.render()}\n\n{dev.render()}") is None
+    assert PromptProvenance.extract(f"{dev.render()}\n\n{review.render()}") is None
+
+
+def test_cli_reports_invalid_utf8_loader_as_structured_result(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    invalid = tmp_path / "invalid-role.txt"
+    invalid.write_bytes(b"\xff\xfe\xfa")
+    base = RuntimeRoleConfig.build(
+        prompt_roles=["DEV", "REVIEW"],
+        browser_roles=["DEV", "REVIEW"],
+        finish_roles={"REVIEW"},
+        manager_role="MANAGER",
+        start_role="DEV",
+        role_map_value="",
+        strict_role_tabs=True,
+    )
+    manifests = dict(base.loader_manifests)
+    original = manifests["DEV"]
+    manifests["DEV"] = LoaderManifest(
+        prompt_role="DEV",
+        agents_path=original.agents_path,
+        handoff_path=original.handoff_path,
+        prompt_path=invalid,
+        skill_path=original.skill_path,
+    )
+    bad_config = replace(base, loader_manifests=MappingProxyType(manifests))
+    monkeypatch.setattr(RuntimeRoleConfig, "build", classmethod(lambda cls, **kwargs: bad_config))
+
+    exit_code = cli_main(["--role", "DEV,REVIEW", "--goal", "finish", "--reload-after", "0"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "=== FLOW RESULT ===" in captured.out
+    assert '"status": "loader_error"' in captured.out
+    assert "UnicodeDecodeError" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_prompt_provenance_extract_round_trip() -> None:
+    coordinator = Coordinator(make_args())
+    expected = coordinator.runtime_config.provenance_for("DEV", "finish the task")
+
+    actual = PromptProvenance.extract(expected.render())
+
+    assert actual == expected

@@ -2,8 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import threading
+from typing import Any
 
 from apps.text import compact_text
+
+
+class FlowStopError(RuntimeError):
+    def __init__(self, status: str, message: str, **details: Any):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.details = details
 
 
 @dataclass

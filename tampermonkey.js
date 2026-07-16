@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAuto Diagnostic Bridge Standalone
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Standalone MAuto bridge without unsafe-eval or hot reload.
 // @match        https://chatgpt.com/*
 // @match        https://*.chatgpt.com/*
@@ -15,7 +15,8 @@
     'use strict';
 
     const SERVER_URL = 'http://127.0.0.1:8500';
-    const BRIDGE_VERSION = 'standalone-1.0.0';
+    const BRIDGE_VERSION = 'standalone-1.0.1';
+    const PAGE_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     const DEFAULT_CONFIG = {
         poll_ms: 800,
@@ -210,12 +211,22 @@
             || null;
     }
 
-    function stopElement() {
-        return selectFirst([
-            'button[aria-label*="Stop"]',
-            'button[aria-label*="generation"]',
-            'button[data-testid*="stop"]'
-        ]);
+    function stopElement(dependencies = {}) {
+        const root = dependencies.root || closestComposerRoot();
+        const visibleFn = dependencies.isVisible || isVisible;
+        if (!root || !root.querySelectorAll) {
+            return null;
+        }
+        const selectors = [
+            'button[aria-label="Stop generating"]',
+            'button[aria-label="Stop response"]',
+            'button[data-testid="stop-button"]'
+        ];
+        const candidates = [];
+        for (const selector of selectors) {
+            candidates.push(...Array.from(root.querySelectorAll(selector)));
+        }
+        return uniqueElements(candidates).find((element) => visibleFn(element)) || null;
     }
 
     function chatRootElement() {
@@ -257,6 +268,25 @@
         return String(el.innerText || el.textContent || el.value || '').trim();
     }
 
+    function normalizeComposerText(text) {
+        let value = String(text || '')
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\n{2,}/g, '\n\n');
+        if (value.endsWith('\n')) {
+            value = value.slice(0, -1);
+        }
+        return value;
+    }
+
+    function composerTextOf(el) {
+        if (!el) {
+            return '';
+        }
+        return normalizeComposerText(String(el.innerText || el.textContent || el.value || ''));
+    }
+
     function isRealComposerAttachment(meta) {
         const label = `${meta && meta.label || ''} ${meta && meta.aria_label || ''} ${meta && meta.data_testid || ''}`.toLowerCase();
         if (!label) {
@@ -282,6 +312,18 @@
     function hasManualComposerInput(snapshot) {
         const textLen = Number(snapshot && snapshot.composer_text_len || 0);
         return textLen > 0 || realComposerAttachmentCount(snapshot) > 0;
+    }
+
+    function composerOwnsExpectedPrompt(snapshot, expectedText) {
+        const expected = normalizeComposerText(expectedText);
+        return !!expected
+            && normalizeComposerText(snapshot && snapshot.composer_text || '') === expected
+            && realComposerAttachmentCount(snapshot) === 0;
+    }
+
+    function composerMatchesExpectedPrompt(snapshot, expectedText) {
+        const expected = normalizeComposerText(expectedText);
+        return !!expected && normalizeComposerText(snapshot && snapshot.composer_text || '') === expected;
     }
 
     function clearComposerText(el) {
@@ -313,7 +355,7 @@
         }
 
         const methods = method === 'auto'
-            ? ['execCommand', 'nativeValue', 'directTextContent']
+            ? ['nativeValue', 'directTextContent']
             : [method];
 
         for (const currentMethod of methods) {
@@ -471,11 +513,11 @@
         return { ok: false, input: null };
     }
 
-    function composerAttachmentSummary() {
-        const root = closestComposerRoot() || document;
-        const buttons = root && root.querySelectorAll
-            ? Array.from(root.querySelectorAll('button,[role="button"]'))
-            : [];
+    function composerAttachmentSummary(root = closestComposerRoot()) {
+        if (!root || !root.querySelectorAll) {
+            return [];
+        }
+        const buttons = Array.from(root.querySelectorAll('button,[role="button"]'));
         return buttons.map((button) => buttonMeta(button)).filter((meta) => isRealComposerAttachment(meta));
     }
 
@@ -661,8 +703,7 @@
         });
     }
 
-    function closestComposerRoot() {
-        const composer = composerElement();
+    function closestComposerRoot(composer = composerElement()) {
         if (!composer) {
             return null;
         }
@@ -833,9 +874,9 @@
         const sendButton = sendButtonRef ? sendButtonRef.element : null;
         const stopButton = stopElement();
         const messages = messageSummary();
-        const composerRoot = closestComposerRoot();
-        const composerText = textOf(composer);
-        const composerAttachments = composerAttachmentSummary();
+        const composerRoot = closestComposerRoot(composer);
+        const composerText = composerTextOf(composer);
+        const composerAttachments = composerAttachmentSummary(composerRoot);
         const composerButtons = scopedSendButtonCandidates().slice(0, 12).map((item) => ({
             meta: item.meta,
             scores: item.scores,
@@ -849,9 +890,14 @@
         const choicePrompts = composer ? [] : choicePromptSummary();
 
         return {
+            bridge_version: BRIDGE_VERSION,
+            page_instance_id: PAGE_INSTANCE_ID,
+            page_path: window.location.pathname || '',
+            page_href: window.location.href,
             composer: !!composer,
             composer_text: composerText,
             composer_text_len: composerText.length,
+            composer_prompt_hash: stableHash(normalizeComposerText(composerText)),
             manual_input_pending: hasManualComposerInput({ composer_text_len: composerText.length, composer_attachments: composerAttachments }),
             composer_path: composer ? domPath(composer) : '',
             composer_root_path: composerRoot ? domPath(composerRoot) : '',
@@ -973,8 +1019,7 @@
     function isSendAccepted(reasons) {
         return !!(
             reasons.user_count_increased ||
-            reasons.last_user_changed ||
-            reasons.stop_visible
+            reasons.last_user_changed
         );
     }
 
@@ -1160,32 +1205,54 @@
         const payload = command.payload || {};
         const text = String(payload.text || '');
         const method = String(payload.method || 'auto');
+        const expectedText = normalizeComposerText(String(payload.expected_text || text));
         const snapshotBefore = domSnapshot();
         const composer = composerElement();
-        if (hasManualComposerInput(snapshotBefore) && !payload.force_replace) {
+        const existingText = normalizeComposerText(snapshotBefore.composer_text);
+        const attachmentCount = realComposerAttachmentCount(snapshotBefore);
+
+        if (attachmentCount > 0 || (existingText && existingText !== expectedText)) {
             await report('PASTE_BLOCKED_MANUAL_INPUT', command.command_id, {
                 text: snapshotBefore.composer_text,
                 result: {
-                    reason: 'manual_input_pending',
+                    reason: attachmentCount > 0 ? 'manual_attachment_pending' : 'composer_ownership_mismatch',
                     requested_text_len: text.length,
                     before_len: snapshotBefore.composer_text_len,
-                    attachment_count: (snapshotBefore.composer_attachments || []).length
+                    attachment_count: attachmentCount
                 },
                 dom_info: snapshotBefore
             });
             return;
         }
+        if (existingText === expectedText && expectedText) {
+            await report('PASTE_CONFIRMED', command.command_id, {
+                text: snapshotBefore.composer_text,
+                result: {
+                    method: 'reuse_existing_expected_prompt',
+                    requested_text_len: text.length,
+                    before_len: snapshotBefore.composer_text_len,
+                    after_len: snapshotBefore.composer_text_len,
+                    reused_existing_text: true,
+                    replaced_existing_text: false
+                },
+                dom_info: snapshotBefore
+            });
+            return;
+        }
+
         await sleep(randomBetween(config.action_delay_min_ms, config.action_delay_max_ms));
         const ok = setComposerText(composer, text, method);
         const snapshotAfter = domSnapshot();
+        const verified = normalizeComposerText(snapshotAfter.composer_text) === expectedText;
 
-        await report(ok ? 'PASTE_CONFIRMED' : 'PASTE_FAILED', command.command_id, {
+        await report(ok && verified ? 'PASTE_CONFIRMED' : 'PASTE_FAILED', command.command_id, {
             text: snapshotAfter.composer_text,
             result: {
                 method,
                 requested_text_len: text.length,
                 before_len: snapshotBefore.composer_text_len,
                 after_len: snapshotAfter.composer_text_len,
+                expected_prompt_verified: verified,
                 replaced_existing_text: snapshotBefore.composer_text_len > 0
             },
             dom_info: snapshotAfter
@@ -1335,19 +1402,85 @@
         });
     }
 
+    async function attemptOwnedButtonClick(expectedText, dependencies = {}) {
+        const snapshotFn = dependencies.snapshot || domSnapshot;
+        const findButtonFn = dependencies.findButton || findSendButton;
+        const clickableFn = dependencies.isClickable || isClickableSendButton;
+        const ownsFn = dependencies.owns || composerOwnsExpectedPrompt;
+        const clickFn = dependencies.click || ((button) => {
+            button.focus();
+            button.click();
+        });
+        const buttonRef = findButtonFn();
+        const button = buttonRef ? buttonRef.element : null;
+        const snapshot = snapshotFn();
+        if (expectedText && !ownsFn(snapshot, expectedText)) {
+            return {
+                status: 'SEND_BLOCKED_OWNERSHIP_LOST',
+                reason: 'composer_ownership_lost_immediately_before_click',
+                snapshot,
+                buttonRef,
+                button
+            };
+        }
+        if (!snapshot.composer || snapshot.send_enabled !== true || !clickableFn(button)) {
+            return {
+                status: 'SEND_FAILED',
+                reason: 'send_button_not_clickable_immediately_before_click',
+                snapshot,
+                buttonRef,
+                button
+            };
+        }
+        try {
+            clickFn(button);
+            return { status: 'CLICKED', snapshot, buttonRef, button };
+        } catch (error) {
+            return {
+                status: 'SEND_FAILED',
+                reason: 'send_click_threw',
+                error: String(error && error.message ? error.message : error),
+                snapshot,
+                buttonRef,
+                button
+            };
+        }
+    }
+
     async function handleClickSend(command) {
         lastAcceptedTurnContext = null;
 
+        const payload = command.payload || {};
+        const expectedText = String(payload.expected_text || '');
         const clickWaitStartedAt = Date.now();
         let before = domSnapshot();
         let buttonRef = findSendButton();
         let button = buttonRef ? buttonRef.element : null;
 
-        while (!stopped && !isClickableSendButton(button) && Date.now() - clickWaitStartedAt < config.send_accept_timeout_ms) {
+        while (!stopped && Date.now() - clickWaitStartedAt < config.send_accept_timeout_ms) {
+            if (expectedText && !composerMatchesExpectedPrompt(before, expectedText)) {
+                break;
+            }
+            if (composerOwnsExpectedPrompt(before, expectedText) && before.send_enabled === true && isClickableSendButton(button)) {
+                break;
+            }
             await sleep(config.send_accept_poll_ms);
             before = domSnapshot();
             buttonRef = findSendButton();
             button = buttonRef ? buttonRef.element : null;
+        }
+
+        if (expectedText && !composerMatchesExpectedPrompt(before, expectedText)) {
+            await report('SEND_BLOCKED_OWNERSHIP_LOST', command.command_id, {
+                result: {
+                    reason: 'composer_ownership_lost_before_click',
+                    expected_text_len: normalizeComposerText(expectedText).length,
+                    actual_text_len: before.composer_text_len,
+                    attachment_count: realComposerAttachmentCount(before)
+                },
+                dom_info: before
+            });
+            return;
         }
 
         if (!isClickableSendButton(button)) {
@@ -1367,36 +1500,49 @@
             return;
         }
 
-        const turnContext = buildTurnContext(before, command.command_id);
         await sleep(randomBetween(config.send_delay_min_ms, config.send_delay_max_ms));
-
-        let click_method = 'button.click';
-        try {
-            button.focus();
-            button.click();
-        } catch (error) {
-            const composer = composerElement();
-            const form = composer && composer.closest ? composer.closest('form') : null;
-            if (form && typeof form.requestSubmit === 'function') {
-                form.requestSubmit(button);
-                click_method = 'form.requestSubmit_after_click_error';
-            } else {
-                await report('SEND_FAILED', command.command_id, {
-                    result: {
-                        reason: 'send_click_threw_without_form_fallback',
-                        error: String(error && error.message ? error.message : error),
-                        selected_button: buttonMeta(button),
-                        selection_strategy: buttonRef ? buttonRef.strategy : null,
-                        selected_button_path: domPath(button)
-                    },
-                    dom_info: before
-                });
-                return;
-            }
+        let submitAttempt = await attemptOwnedButtonClick(expectedText);
+        while (
+            !stopped
+            && submitAttempt.status !== 'CLICKED'
+            && composerMatchesExpectedPrompt(submitAttempt.snapshot, expectedText)
+            && Date.now() - clickWaitStartedAt < config.send_accept_timeout_ms
+        ) {
+            await sleep(config.send_accept_poll_ms);
+            submitAttempt = await attemptOwnedButtonClick(expectedText);
+        }
+        before = submitAttempt.snapshot;
+        buttonRef = submitAttempt.buttonRef;
+        button = submitAttempt.button;
+        if (submitAttempt.status === 'SEND_BLOCKED_OWNERSHIP_LOST') {
+            await report('SEND_BLOCKED_OWNERSHIP_LOST', command.command_id, {
+                result: {
+                    reason: submitAttempt.reason,
+                    expected_text_len: normalizeComposerText(expectedText).length,
+                    actual_text_len: before.composer_text_len,
+                    attachment_count: realComposerAttachmentCount(before)
+                },
+                dom_info: before
+            });
+            return;
+        }
+        if (submitAttempt.status !== 'CLICKED') {
+            await report('SEND_FAILED', command.command_id, {
+                result: {
+                    reason: submitAttempt.reason,
+                    error: submitAttempt.error || '',
+                    selected_button: buttonMeta(button),
+                    selection_strategy: buttonRef ? buttonRef.strategy : null,
+                    selected_button_path: button ? domPath(button) : ''
+                },
+                dom_info: before
+            });
+            return;
         }
 
+        const turnContext = buildTurnContext(before, command.command_id);
+        const click_method = 'button.click';
         const startedAt = Date.now();
-        let submitFallbackUsed = false;
         let after = domSnapshot();
         let reasons = sendAcceptanceReasons(turnContext, after, before.composer_text_len);
 
@@ -1404,21 +1550,6 @@
             await sleep(config.send_accept_poll_ms);
             after = domSnapshot();
             reasons = sendAcceptanceReasons(turnContext, after, before.composer_text_len);
-
-            if (!submitFallbackUsed && !isSendAccepted(reasons)) {
-                const composer = composerElement();
-                const form = composer && composer.closest ? composer.closest('form') : null;
-                if (form && typeof form.requestSubmit === 'function' && isClickableSendButton(button)) {
-                    try {
-                        form.requestSubmit(button);
-                        submitFallbackUsed = true;
-                        click_method = `${click_method}+form.requestSubmit_retry`;
-                    } catch (error) {
-                        submitFallbackUsed = true;
-                        console.warn('[MAuto Bridge] requestSubmit retry failed', error);
-                    }
-                }
-            }
         }
 
         const accepted = isSendAccepted(reasons);
@@ -1470,6 +1601,8 @@
             return;
         }
 
+        const payload = command.payload || {};
+        const deadline = Date.now() + Math.max(1000, Number(payload.timeout_ms || 120000));
         const currentSnapshot = domSnapshot();
         const initialAssistantText = turnContext.before_last_assistant_text || '';
         const initialAssistantCount = turnContext.before_assistant_count || 0;
@@ -1489,6 +1622,21 @@
             const hasNewAssistantTurn = assistantCount > initialAssistantCount;
             const hasFreshAssistantText = assistantText && assistantText !== initialAssistantText;
             const hasFreshAssistantOutput = hasNewAssistantTurn || hasFreshAssistantText;
+
+            if (Date.now() >= deadline) {
+                await report('ASSISTANT_TIMEOUT', command.command_id, {
+                    text: assistantText,
+                    result: {
+                        reason: 'command_deadline_exceeded',
+                        timeout_ms: Math.max(1000, Number(payload.timeout_ms || 120000)),
+                        assistant_len: assistantText.length,
+                        stop_visible: snapshot.stop_visible
+                    },
+                    dom_info: snapshot
+                });
+                lastAcceptedTurnContext = null;
+                return;
+            }
 
             if (textChanged || countChanged || stopChanged) {
                 lastText = assistantText;

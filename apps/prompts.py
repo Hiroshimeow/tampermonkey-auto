@@ -10,7 +10,10 @@ def load_text_file(relative_path: str, required: bool = True) -> str:
         if required:
             raise FileNotFoundError(f"Missing required runtime instruction file: {relative_path}")
         return ""
-    return path.read_text(encoding="utf-8").strip()
+    text = path.read_text(encoding="utf-8").strip()
+    if required and not text:
+        raise FileNotFoundError(f"Required runtime instruction file is empty: {relative_path}")
+    return text
 
 
 def role_type_path(role: str, directory: str, suffix: str) -> Path | None:
@@ -56,13 +59,7 @@ def goal_only_continue_text() -> str:
 
 
 def goal_only_prompt(goal: str) -> str:
-    return "\n\n".join(
-        [
-            f"GOAL:\n{goal}",
-            goal_only_continue_text(),
-        ],
-    )
-
+    return str(goal or "").strip()
 
 
 def system_prompt(role: str, prompt_roles: list[str], finish_roles: set[str]) -> str:
@@ -71,6 +68,7 @@ def system_prompt(role: str, prompt_roles: list[str], finish_roles: set[str]) ->
     if not role_prompt:
         return ""
     return f"[ROLE PROMPT: {role}]\n{role_prompt}"
+
 
 def route_contract(prompt_roles: list[str], finish_roles: set[str], manager_role: str = "MANAGER") -> str:
     lines = [
@@ -103,4 +101,18 @@ def route_contract(prompt_roles: list[str], finish_roles: set[str], manager_role
             "Do not use keys named target, reason, message. Do not put JSON arrays at the top level.",
         ],
     )
+    return "\n".join(lines)
+
+
+def route_repair_contract(prompt_roles: list[str], finish_roles: set[str], manager_role: str = "MANAGER") -> str:
+    lines = [
+        "Reply with exactly one fenced JSON route object and nothing after it.",
+        f"Allowed route keys: {', '.join(prompt_roles)}, FINISH.",
+        f"FINISH authority: {', '.join(sorted(finish_roles))}.",
+        "Do not combine FINISH with another route key or with command.",
+        "Reserved metadata key command may be omitted or set to none/handoff.",
+    ]
+    if manager_role in prompt_roles:
+        lines.append(f"When MANAGER mode is active, non-MANAGER roles must route exactly once to {manager_role}.")
+    lines.extend(["```json", '{"ROLE": "self-contained handoff"}', "```"])
     return "\n".join(lines)

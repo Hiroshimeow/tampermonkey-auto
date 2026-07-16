@@ -2,32 +2,14 @@ from __future__ import annotations
 
 import concurrent.futures
 
-from apps.models import FlowState, Route, TurnResult
+from apps.models import FlowState, FlowStopError, Route, TurnResult
 from apps.routing import format_child_results
 from apps.text import normalize_role
 
 
 class RouteExecutorMixin:
     def dispatch_route(self, route: Route, result: TurnResult, state: FlowState, depth: int) -> TurnResult:
-        if self.should_continue_goal_only_role(route, result):
-            self.dispatch_role(
-                result.prompt_role,
-                self.goal_only_continue_instruction(),
-                state,
-                result.prompt_role,
-                depth + 1,
-            )
-            return result
-
         if not route.ok:
-            if result.prompt_role != self.manager_role and self.manager_role in self.prompt_roles:
-                self.dispatch_role(
-                    self.manager_role,
-                    f"{result.prompt_role} failed to return valid route JSON. Decide recovery. Raw response:\n{result.response}",
-                    state,
-                    result.prompt_role,
-                    depth + 1,
-                )
             return result
 
         if "FINISH" in route.targets:
@@ -77,14 +59,18 @@ class RouteExecutorMixin:
         return result
 
     def should_continue_goal_only_role(self, route: Route, result: TurnResult) -> bool:
-        if not self.uses_goal_only_prompt(result.prompt_role):
-            return False
-        if route.targets:
-            return False
-        return "FINISH" not in route.targets
+        del route, result
+        return False
 
     def validate_route(self, prompt_role: str, route: Route) -> Route:
         if not route.ok:
+            return route
+        unknown = sorted(set(route.targets) - self.runtime_config.allowed_route_keys)
+        if unknown:
+            route.error = (
+                f"unknown route target(s): {', '.join(unknown)}; "
+                f"allowed route keys: {', '.join(self.prompt_roles)}, FINISH"
+            )
             return route
         if "FINISH" in route.targets and len(route.targets) > 1:
             route.error = "FINISH cannot be combined with role routes"
@@ -168,14 +154,16 @@ class RouteExecutorMixin:
             for future in concurrent.futures.as_completed(future_map):
                 role = future_map[future]
                 try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
+                    child = future.result()
+                    if child:
+                        results.append(child)
+                except FlowStopError:
+                    raise
                 except RuntimeError as exc:
                     fake = TurnResult(
                         turn=self.turn_count,
                         prompt_role=role,
-                        browser_role="",
+                        browser_role=self.pick_browser_role(role),
                         caller_role=caller_role,
                         instruction=targets[role],
                         response=f"PARALLEL ERROR: {exc}",

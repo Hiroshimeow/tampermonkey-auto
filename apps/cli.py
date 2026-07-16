@@ -101,7 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     if not goal:
         print("error: goal is required", file=sys.stderr)
         return 2
-    result = Coordinator(args).run(goal)
+    try:
+        result = Coordinator(args).run(goal)
+    except (RuntimeError, OSError, UnicodeError) as exc:
+        result = {
+            "status": "runtime_config_error",
+            "message": str(exc),
+            "turns": 0,
+            "phase": 1,
+            "handoffs": {},
+        }
     print("\n=== FLOW RESULT ===")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") == "complete" else 2

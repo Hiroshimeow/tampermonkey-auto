@@ -77,7 +77,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Write failing role lifecycle tests**
 
-Extend the fake bridge to capture flow updates. Assert a direct TEST1 request publishes only TEST1 as `RUNNING / From: User` and clears only TEST1 on both success and runtime failure.
+Extend the fake bridge to capture flow updates. Assert a direct TEST1 request publishes only TEST1 as `RUNNING`, with no route detail, and clears only TEST1 on both success and runtime failure.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -149,3 +149,31 @@ Run a bounded TEST1/TEST2 flow and verify TEST1 starts `RUNNING / From: User`, T
 - [ ] **Step 4: Recheck nonparticipant isolation and commit**
 
 Confirm `DEV`, `PLAN`, and `REVIEW` command/state records were not changed by the live test. Stage only intended feature/test/plan files and commit the implementation.
+
+### Task 6: Send readiness and independent stale-composer watchdog
+
+**Files:**
+- Modify: `tampermonkey.js`
+- Modify: `tests/test_tampermonkey_contract.mjs`
+
+- [ ] **Step 1: Write failing contract and behavior tests**
+
+Test that route submission observes a missing/disabled Send button without clicking and succeeds only after the same owned prompt exposes a visible enabled button. Test the watchdog state machine: clean resets, unchanged dirty content clears at 60 seconds, and changed content restarts the full 60-second window.
+
+- [ ] **Step 2: Run JavaScript tests and verify RED**
+
+Run: `node tests/test_tampermonkey_contract.mjs`
+
+Expected: FAIL because the independent watchdog and testable send-readiness wait do not exist.
+
+- [ ] **Step 3: Implement the minimal independent watchdog**
+
+Add one one-second interval and a small pure state transition helper. Signature normalized text and real attachment metadata. On stale unchanged input, clear composer text and click only composer-scoped remove-file/remove-attachment controls. Reset timer state after cleanup or whenever composer is clean.
+
+- [ ] **Step 4: Reuse a testable readiness wait in CLICK_SEND**
+
+Poll ownership, attachments, and the current Send button until it is visible and enabled or the existing send-accept deadline expires. Refresh all evidence immediately before clicking.
+
+- [ ] **Step 5: Verify, live-test only TEST1/TEST2, and send to DEBATE**
+
+Run JS checks and the full Python suite, F5 only `TEST1`, `TEST2`, and `DEBATE` after userscript changes, exercise only TEST1/TEST2 for live transport, then call `role.py --role DEBATE --timeout 3600` repeatedly until review returns PASS.

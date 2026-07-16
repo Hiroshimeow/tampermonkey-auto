@@ -4,6 +4,7 @@ import argparse
 import json
 import threading
 import time
+import uuid
 from typing import Any
 
 from apps.bridge import BridgeClient, ManualInputPendingError
@@ -55,6 +56,8 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.background_tasks: list[threading.Thread] = []
         self.reload_generation: dict[str, int] = {}
         self.current_goal = ""
+        self.flow_run_id = f"main-{uuid.uuid4()}"
+        self.flow_status_active = False
 
     def has_turn_budget(self) -> bool:
         return self.max_turns <= 0 or self.turn_count < self.max_turns
@@ -70,6 +73,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                     "required route-mode loader files are missing, empty, unreadable, or invalidly encoded",
                     loader_errors=loader_errors,
                 )
+            self.begin_flow_status()
             if self.args.preflight and not self.dry_run:
                 self.preflight()
             first_instruction = "Start from the user goal. Decide the first phase and route work to the right role(s)."
@@ -79,10 +83,83 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             self.finished = self.flow_stop_result(state, exc.status, exc.message, **exc.details)
         except RuntimeError as exc:
             self.finished = self.flow_stop_result(state, "runtime_error", str(exc))
+        finally:
+            self.clear_flow_status()
 
         if self.finished:
             return self.finished
         return self.unfinished_result(state)
+
+    def publish_flow_statuses(self, updates: dict[str, dict[str, Any] | None]) -> None:
+        if self.dry_run or not updates:
+            return
+        update = getattr(self.client, "update_flow_statuses", None)
+        if not callable(update):
+            return
+        try:
+            update(self.flow_run_id, updates)
+        except Exception as exc:
+            print(f"[flow-ui] status update failed: {exc}", flush=True)
+
+    def begin_flow_status(self) -> None:
+        self.flow_status_active = True
+        updates: dict[str, dict[str, Any] | None] = {
+            physical: {"state": "WAITING"}
+            for physical in self.runtime_config.physical_roles
+        }
+        start_physical = self.pick_browser_role(self.start_role)
+        updates[start_physical] = {
+            "state": "RUNNING",
+            "detail_label": "From",
+            "detail_role": "User",
+        }
+        self.publish_flow_statuses(updates)
+
+    def publish_flow_route(self, source_role: str, target_roles: list[str]) -> None:
+        if not self.flow_status_active or not target_roles:
+            return
+        source = normalize_role(source_role)
+        targets = [normalize_role(role) for role in target_roles if normalize_role(role)]
+        if not source or not targets:
+            return
+        updates: dict[str, dict[str, Any] | None] = {
+            self.pick_browser_role(source): {
+                "state": "WAITING",
+                "detail_label": "Routed",
+                "detail_role": ", ".join(targets),
+            }
+        }
+        for target in targets:
+            updates[self.pick_browser_role(target)] = {
+                "state": "RUNNING",
+                "detail_label": "From",
+                "detail_role": source,
+            }
+        self.publish_flow_statuses(updates)
+
+    def publish_flow_fan_in(self, target_role: str, source_roles: list[str]) -> None:
+        if not self.flow_status_active:
+            return
+        target = normalize_role(target_role)
+        sources = [normalize_role(role) for role in source_roles if normalize_role(role)]
+        if not target or not sources:
+            return
+        updates: dict[str, dict[str, Any] | None] = {
+            self.pick_browser_role(source): {"state": "WAITING"}
+            for source in sources
+        }
+        updates[self.pick_browser_role(target)] = {
+            "state": "RUNNING",
+            "detail_label": "From",
+            "detail_role": ", ".join(sources),
+        }
+        self.publish_flow_statuses(updates)
+
+    def clear_flow_status(self) -> None:
+        if not self.flow_status_active:
+            return
+        self.flow_status_active = False
+        self.publish_flow_statuses({physical: None for physical in self.runtime_config.physical_roles})
 
     def flow_stop_result(self, state: FlowState, status: str, message: str, **details: Any) -> dict[str, Any]:
         result: dict[str, Any] = {

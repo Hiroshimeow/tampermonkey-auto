@@ -8,7 +8,30 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 const metadataVersion = source.match(/\/\/ @version\s+([^\s]+)/)?.[1];
 const bridgeVersion = source.match(/const BRIDGE_VERSION = 'standalone-([^']+)'/)?.[1];
 assert.equal(bridgeVersion, metadataVersion, 'userscript metadata and bridge runtime versions must stay in sync');
+assert.equal(metadataVersion, '1.0.2', 'flow-status UI release must identify itself as version 1.0.2');
 assert.match(source, /bridge_version:\s*BRIDGE_VERSION/, 'domSnapshot must expose the active userscript version');
+assert.match(source, /let flowStatus = null;/, 'browser poll state must retain only this tab flow status');
+assert.match(source, /flowStatus = response\.flow_status \|\| null;/, 'status poll must update flow UI state from backend');
+assert.match(source, /function flowStatusMarkup\(status\)/, 'flow status rendering must be isolated in a small helper');
+assert.doesNotMatch(source, />QUEUED</, 'flow UI must never render a QUEUED state');
+assert.match(source, /composer_watchdog_ms:\s*60000/, 'stale composer watchdog must use a 60 second window');
+assert.match(source, /let composerWatchdogTimer = null;/, 'watchdog must run independently from command polling');
+assert.match(source, /setInterval\(checkComposerWatchdog,\s*1000\)/, 'watchdog must sample independently once per second');
+assert.match(source, /composer_watchdog_enabled:\s*!!composerWatchdogTimer/, 'DOM snapshot must prove the active tab loaded the watchdog build');
+assert.match(source, /composer_watchdog_age_ms:/, 'DOM snapshot must expose watchdog progress for live verification');
+assert.match(source, /function composerWatchdogTransition\(/, 'watchdog timing must use a testable state transition');
+assert.match(source, /function watchdogComposerElement\(/, 'watchdog must use a strict ChatGPT-composer locator');
+assert.match(source, /function isComposerTransportActive\(/, 'watchdog must recognize active composer transport commands');
+assert.match(source, /isComposerTransportActive\(activeCommandAction\)/, 'watchdog must not clear while composer transport owns the command');
+assert.match(source, /function rebaseComposerWatchdogDuringTransport\(/, 'transport deferral must restart the full watchdog window');
+assert.match(source, /selectorButtonCandidates\(selectors, root\)/, 'direct Send selectors must remain inside the strict composer root');
+assert.doesNotMatch(source, /const directCandidates = selectorButtonCandidates\(selectors\);/, 'Send lookup must not use page-wide direct selectors');
+assert.match(source, /function clearStaleComposer\(/, 'watchdog must have a composer-scoped cleanup helper');
+assert.match(source, /function waitForOwnedSendButton\(/, 'CLICK_SEND must use a testable send readiness wait');
+assert.match(source, /function isStopButtonMeta\(meta\)/, 'send selection must explicitly reject stop-generation controls');
+assert.match(source, /function isSemanticSendButtonMeta\(meta\)/, 'send selection must require an explicit Send semantic');
+assert.match(source, /if \(isStopButtonMeta\(meta\)\) \{\s*return null;/, 'composer-scoped send candidates must discard stop controls before scoring');
+assert.match(source, /if \(!isSemanticSendButtonMeta\(meta\)\) \{\s*return null;/, 'composer-scoped candidates must discard unrelated submit buttons');
 
 assert.match(source, /action_delay_min_ms:\s*\d+/, 'tampermonkey.js must expose action_delay_min_ms');
 assert.match(source, /action_delay_max_ms:\s*\d+/, 'tampermonkey.js must expose action_delay_max_ms');
@@ -145,6 +168,204 @@ context.uniqueElements = (elements) => Array.from(new Set(elements.filter(Boolea
 assert.equal(normalizeComposerText('a\n\n\nb'), 'a\n\nb', 'contenteditable-expanded paragraph breaks must canonicalize');
 assert.equal(normalizeComposerText('a\nb'), 'a\nb', 'single line breaks must remain significant');
 assert.notEqual(normalizeComposerText('a  b'), normalizeComposerText('a b'), 'ordinary spaces must remain significant');
+
+const sendCandidateContext = {};
+vm.runInNewContext(
+    `${extractFunction('isStopButtonMeta')}; ${extractFunction('isSemanticSendButtonMeta')}; globalThis.isStopButtonMeta = isStopButtonMeta; globalThis.isSemanticSendButtonMeta = isSemanticSendButtonMeta;`,
+    sendCandidateContext,
+);
+const isStopButtonMeta = sendCandidateContext.isStopButtonMeta;
+const isSemanticSendButtonMeta = sendCandidateContext.isSemanticSendButtonMeta;
+assert.equal(
+    isStopButtonMeta({ aria_label: 'Stop answering', data_testid: 'stop-button', label: '', type: 'submit' }),
+    true,
+    'visible enabled type=submit Stop answering must never count as Send',
+);
+assert.equal(
+    isStopButtonMeta({ aria_label: 'Send prompt', data_testid: 'send-button', label: '', type: 'submit' }),
+    false,
+    'real Send prompt must remain eligible',
+);
+assert.equal(
+    isSemanticSendButtonMeta({ aria_label: 'Submit feedback', data_testid: '', label: '', type: 'submit' }),
+    false,
+    'an unrelated composer submit control must not count as Send',
+);
+assert.equal(
+    isSemanticSendButtonMeta({ aria_label: 'Send prompt', data_testid: 'send-button', label: '', type: 'submit' }),
+    true,
+    'the real ChatGPT Send control must count as Send',
+);
+
+const flowUiContext = {};
+vm.runInNewContext(
+    `${extractFunction('flowStatusMarkup')}; globalThis.flowStatusMarkup = flowStatusMarkup;`,
+    flowUiContext,
+);
+const flowStatusMarkup = flowUiContext.flowStatusMarkup;
+const runningMarkup = flowStatusMarkup({
+    state: 'RUNNING',
+    detail_label: 'From',
+    detail_role: 'User',
+});
+assert.match(runningMarkup, /id="mauto-flow-state"/, 'running state must use a dedicated compact UI element');
+assert.match(runningMarkup, /color:#ff5c5c/, 'RUNNING must render red');
+assert.match(runningMarkup, />RUNNING</, 'running state label must be visible');
+assert.match(runningMarkup, /From: User/, 'turn 1 must show From: User');
+
+const waitingMarkup = flowStatusMarkup({ state: 'WAITING' });
+assert.match(waitingMarkup, /color:#d6a84b/, 'WAITING must render amber');
+assert.match(waitingMarkup, />WAITING</, 'waiting state label must be visible');
+assert.doesNotMatch(waitingMarkup, /mauto-flow-detail/, 'unreached waiting roles must not show predictive detail');
+assert.equal(flowStatusMarkup(null), '', 'nonparticipant role must retain the old UI without a flow block');
+assert.equal(flowStatusMarkup({ state: 'QUEUED' }), '', 'unknown states must not render');
+const hostileMarkup = flowStatusMarkup({
+    state: 'RUNNING',
+    detail_label: 'From',
+    detail_role: '</div><style>textarea{display:none}</style><div>',
+});
+assert.doesNotMatch(hostileMarkup, /<style>/, 'flow detail must not inject markup into the ChatGPT page');
+assert.match(hostileMarkup, /&lt;style&gt;/, 'flow detail must be HTML escaped');
+
+const watchdogContext = {};
+vm.runInNewContext(
+    `${extractFunction('composerWatchdogTransition')}; ${extractFunction('isComposerTransportActive')}; ${extractFunction('rebaseComposerWatchdogDuringTransport')}; ${extractFunction('watchdogComposerElement')}; globalThis.composerWatchdogTransition = composerWatchdogTransition; globalThis.isComposerTransportActive = isComposerTransportActive; globalThis.rebaseComposerWatchdogDuringTransport = rebaseComposerWatchdogDuringTransport; globalThis.watchdogComposerElement = watchdogComposerElement;`,
+    watchdogContext,
+);
+const composerWatchdogTransition = watchdogContext.composerWatchdogTransition;
+const isComposerTransportActive = watchdogContext.isComposerTransportActive;
+const rebaseComposerWatchdogDuringTransport = watchdogContext.rebaseComposerWatchdogDuringTransport;
+const watchdogComposerElement = watchdogContext.watchdogComposerElement;
+let watchdogState = composerWatchdogTransition(null, '', false, 0, 30000);
+assert.equal(watchdogState.action, 'RESET', 'clean composer must reset watchdog state');
+watchdogState = composerWatchdogTransition(watchdogState, 'draft-a', true, 1000, 60000);
+assert.equal(watchdogState.action, 'WAIT');
+assert.equal(watchdogState.started_at, 1000);
+watchdogState = composerWatchdogTransition(watchdogState, 'draft-a', true, 60999, 60000);
+assert.equal(watchdogState.action, 'WAIT', 'unchanged draft must survive until the full 60 seconds');
+watchdogState = composerWatchdogTransition(watchdogState, 'draft-b', true, 61000, 60000);
+assert.equal(watchdogState.action, 'WAIT', 'changed draft means user activity and must not be cleared');
+assert.equal(watchdogState.started_at, 61000, 'user activity must restart the full window');
+watchdogState = composerWatchdogTransition(watchdogState, 'draft-b', true, 120999, 60000);
+assert.equal(watchdogState.action, 'WAIT');
+watchdogState = composerWatchdogTransition(watchdogState, 'draft-b', true, 121000, 60000);
+assert.equal(watchdogState.action, 'CLEAR', 'unchanged dirty composer must clear after 60 seconds');
+assert.equal(isComposerTransportActive('CLICK_SEND'), true, 'watchdog must defer a 60-second clear through the final send delay');
+assert.equal(isComposerTransportActive('SET_PROMPT'), true);
+assert.equal(isComposerTransportActive('UPLOAD_FILES'), true);
+assert.equal(isComposerTransportActive('WAIT'), false);
+const rebasedWatchdog = rebaseComposerWatchdogDuringTransport(
+    { signature: 'automation-prompt', started_at: 1000, action: 'CLEAR' },
+    'automation-prompt',
+    61000,
+);
+assert.equal(rebasedWatchdog.action, 'WAIT', 'active transport must cancel the expired CLEAR action');
+assert.equal(rebasedWatchdog.started_at, 61000, 'active transport must start a fresh full watchdog window');
+assert.equal(
+    composerWatchdogTransition(rebasedWatchdog, 'automation-prompt', true, 61001, 60000).action,
+    'WAIT',
+    'the first tick after transport ends must not clear the composer',
+);
+
+const watchdogBoundaryContext = {};
+vm.runInNewContext(
+    `let stopped = false;
+     let activeCommandAction = 'UPLOAD_FILES';
+     let composerWatchdogState = { signature: 'automation-prompt', started_at: 1000, action: 'WAIT' };
+     const config = { composer_watchdog_ms: 60000 };
+     function scheduleSync() {}
+     ${extractFunction('composerWatchdogTransition')};
+     ${extractFunction('isComposerTransportActive')};
+     ${extractFunction('rebaseComposerWatchdogDuringTransport')};
+     ${extractFunction('checkComposerWatchdog')};
+     globalThis.checkComposerWatchdog = checkComposerWatchdog;
+     globalThis.getComposerWatchdogState = () => composerWatchdogState;
+     globalThis.finishTransport = () => { activeCommandAction = ''; };`,
+    watchdogBoundaryContext,
+);
+let boundaryClears = 0;
+const boundaryDependencies = {
+    allowStopped: true,
+    composer: () => ({}),
+    snapshot: () => ({}),
+    signature: () => 'automation-prompt',
+    dirty: () => true,
+    now: () => 60000,
+    timeout_ms: 60000,
+    clear: () => { boundaryClears += 1; },
+};
+watchdogBoundaryContext.checkComposerWatchdog(boundaryDependencies);
+assert.equal(watchdogBoundaryContext.getComposerWatchdogState().started_at, 60000, 'transport at age 59 seconds must rebase immediately');
+watchdogBoundaryContext.finishTransport();
+watchdogBoundaryContext.checkComposerWatchdog({ ...boundaryDependencies, now: () => 61000 });
+assert.equal(boundaryClears, 0, 'the first tick after the transport boundary must retain the composer');
+
+const unrelatedTextarea = { id: 'feedback' };
+const strictRootWithoutComposer = {
+    querySelectorAll(selector) {
+        return selector === 'textarea' ? [unrelatedTextarea] : [];
+    },
+};
+assert.equal(
+    watchdogComposerElement({ root: strictRootWithoutComposer, isVisible: () => true, isDisabled: () => false }),
+    null,
+    'watchdog must ignore a page containing only an unrelated textarea',
+);
+const realComposer = { id: 'prompt-textarea' };
+const strictRootWithComposer = {
+    querySelectorAll(selector) {
+        return selector === 'div#prompt-textarea' ? [realComposer] : [];
+    },
+};
+assert.equal(
+    watchdogComposerElement({ root: strictRootWithComposer, isVisible: () => true, isDisabled: () => false }),
+    realComposer,
+    'watchdog must recognize the actual ChatGPT prompt textarea',
+);
+
+const buttonMetaContext = {};
+vm.runInNewContext(`${extractFunction('buttonMeta')}; globalThis.buttonMeta = buttonMeta;`, buttonMetaContext);
+const missingButtonMeta = buttonMetaContext.buttonMeta(null);
+assert.equal(missingButtonMeta.label, '');
+assert.equal(missingButtonMeta.aria_label, null);
+assert.equal(missingButtonMeta.data_testid, null);
+
+const readinessContext = {};
+vm.runInNewContext(
+    `${extractFunction('waitForOwnedSendButton')}; globalThis.waitForOwnedSendButton = waitForOwnedSendButton;`,
+    readinessContext,
+);
+const waitForOwnedSendButton = readinessContext.waitForOwnedSendButton;
+let readinessClock = 0;
+let readinessRead = 0;
+const readinessStates = [
+    { snapshot: { composer_text: 'expected', send_enabled: null, attachments: 0 }, button: null },
+    { snapshot: { composer_text: 'expected', send_enabled: false, attachments: 0 }, button: { disabled: true } },
+    { snapshot: { composer_text: 'expected', send_enabled: true, attachments: 0 }, button: { disabled: false } },
+];
+const readiness = await waitForOwnedSendButton('expected', 1000, {
+    now: () => readinessClock,
+    sleep: async (ms) => { readinessClock += ms; },
+    poll_ms: 100,
+    stopped: () => false,
+    read: () => readinessStates[Math.min(readinessRead++, readinessStates.length - 1)],
+    matches: (snapshot, expected) => snapshot.composer_text === expected,
+    owns: (snapshot, expected) => snapshot.composer_text === expected && snapshot.attachments === 0,
+    clickable: (button) => !!button && !button.disabled,
+});
+assert.equal(readiness.status, 'READY', 'send readiness must wait through missing and disabled button states');
+assert.equal(readinessRead, 3, 'send readiness must re-read the live button before proceeding');
+const uploadReadiness = await waitForOwnedSendButton('', 1000, {
+    now: () => 0,
+    sleep: async () => {},
+    poll_ms: 100,
+    stopped: () => false,
+    read: () => ({ snapshot: { composer_text: 'upload prompt', send_enabled: true }, button: { disabled: false } }),
+    matches: () => false,
+    owns: () => false,
+    clickable: (button) => !!button && !button.disabled,
+});
+assert.equal(uploadReadiness.status, 'READY', 'upload flow without expected_text must still proceed once Send is ready');
 
 const sidebarStop = { id: 'sidebar-conversation-stop-title' };
 context.selectFirst = () => sidebarStop;

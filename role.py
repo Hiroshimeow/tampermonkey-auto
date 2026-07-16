@@ -450,6 +450,23 @@ def run_role_request(client: BridgeClient, role: str, final_prompt: str, uploads
     return client.send_current_prompt_and_wait(role, timeout_s)
 
 
+def publish_role_flow_status(
+    client: BridgeClient,
+    run_id: str,
+    role: str,
+    running: bool,
+) -> bool:
+    update = getattr(client, "update_flow_statuses", None)
+    if not callable(update):
+        return False
+    updates = {role: {"state": "RUNNING"} if running else None}
+    try:
+        update(run_id, updates)
+    except Exception as exc:
+        print(f"[flow-ui] status update failed: {exc}", file=sys.stderr, flush=True)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_stdio_utf8()
     args = parse_args(argv)
@@ -508,10 +525,17 @@ def main(argv: list[str] | None = None) -> int:
         emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
         return 0
 
+    flow_status_started = False
     try:
         with redirect_stdout(sys.stderr):
             if client is None:
                 client = BridgeClient(args.base_url, args.request_timeout)
+            flow_status_started = publish_role_flow_status(
+                client,
+                run_id,
+                role,
+                running=True,
+            )
             if ledger.get("status") in {"sent", "waiting", "prompt_set", "uploaded", "failed_retryable"}:
                 recovered_response, recovery_state = recover_existing_response(client, role, request_id, args.timeout)
                 if recovered_response:
@@ -555,6 +579,9 @@ def main(argv: list[str] | None = None) -> int:
         save_ledger(ledger)
         emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error=exc, message=f"runtime failed for {role}"))
         return 3
+    finally:
+        if client is not None and flow_status_started:
+            publish_role_flow_status(client, run_id, role, running=False)
 
     response = str(response or "").strip()
     if response:

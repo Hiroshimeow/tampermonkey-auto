@@ -101,6 +101,90 @@ def test_main_without_resp_from_outputs_response_path(monkeypatch, tmp_path, cap
     assert "bridge log should go to stderr" in captured.err
 
 
+def test_role_flow_status_marks_and_clears_only_the_target_role(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    flow_updates = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
+            flow_updates.append((run_id, updates))
+            return {"status": "OK"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            return "ok"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "TEST1", "--prompt", "hello"])
+    payload = stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["role"] == "TEST1"
+    assert len(flow_updates) == 2
+    assert flow_updates[0][1] == {"TEST1": {"state": "RUNNING"}}
+    assert flow_updates[1][0] == flow_updates[0][0]
+    assert flow_updates[1][1] == {"TEST1": None}
+
+
+def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    flow_updates = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
+            flow_updates.append((run_id, updates))
+            return {"status": "OK"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            raise RuntimeError("browser failed")
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "TEST2", "--prompt", "hello"])
+    payload = stdout_json(capsys.readouterr().out)
+
+    assert code == 3
+    assert payload["status"] == "failed_retryable"
+    assert [updates for _run_id, updates in flow_updates] == [
+        {"TEST2": {"state": "RUNNING"}},
+        {"TEST2": None},
+    ]
+
+
+def test_role_flow_status_does_not_render_route_detail_for_single_role(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    flow_updates = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
+            flow_updates.append(updates)
+            return {"status": "OK"}
+
+        def role_snapshot(self, role_name: str) -> dict:
+            assert role_name == "A"
+            return {"last_response": "source answer"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            return "reviewed"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "B", "--resp-from", "A", "--prompt", "review"])
+    stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert flow_updates[0] == {"B": {"state": "RUNNING"}}
+
+
 def test_main_uses_resp_from_and_outputs_source_count(monkeypatch, tmp_path, capsys) -> None:
     isolate_role_state(monkeypatch, tmp_path)
     seen = {}

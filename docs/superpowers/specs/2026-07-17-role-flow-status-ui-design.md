@@ -74,3 +74,15 @@ Automated tests cover:
 - `role.py` setting and clearing only its requested role.
 
 Live verification is limited to `TEST1` and `TEST2`. It must not dispatch commands or flow-state mutations to currently running `DEV`, `PLAN`, or `REVIEW` tabs.
+
+## Send readiness and stale-composer watchdog
+
+Route submission waits until the exact expected prompt is still present, real composer attachments are gone, and a visible enabled Send button exists. The button and ownership are read again immediately before the single click.
+
+An independent userscript watchdog samples a dirty composer once per second. Its signature contains normalized composer text and real attachment metadata. After 60 seconds:
+
+- an unchanged signature is stale and the watchdog clears text plus removable attachments;
+- a changed signature means the user is editing, so the watchdog stores the new signature and starts another 60-second window;
+- a clean composer resets the watchdog.
+
+The watchdog is independent from command polling and never sends a prompt. Its only side effect is restoring a stale, unchanged composer to a clean state so the existing Python flow can acquire it and retry normally.

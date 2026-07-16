@@ -357,6 +357,17 @@ class BridgeClient:
         data = self.json_request("POST", "/api/admin/command", {"role": role, "action": action, "payload": payload or {}})
         return str((data.get("command") or {}).get("command_id") or "")
 
+    def update_flow_statuses(
+        self,
+        run_id: str,
+        updates: dict[str, dict[str, Any] | None],
+    ) -> dict[str, Any]:
+        return self.json_request(
+            "POST",
+            "/api/admin/flow-status",
+            {"run_id": run_id, "updates": updates},
+        )
+
     def wait_command(self, command_id: str, timeout_s: float) -> dict[str, Any]:
         deadline = time.time() + timeout_s
         last = {}

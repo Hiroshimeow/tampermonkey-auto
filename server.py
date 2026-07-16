@@ -89,6 +89,11 @@ class RoleClaimRequest(BaseModel):
     session_id: str = ""
 
 
+class FlowStatusRequest(BaseModel):
+    run_id: str
+    updates: Dict[str, Optional[Dict[str, Any]]] = Field(default_factory=dict)
+
+
 class DiagnosticState:
     def __init__(self):
         self.lock = threading.RLock()
@@ -103,6 +108,10 @@ class DiagnosticState:
         self.last_response = defaultdict(str)
         self.events = deque(maxlen=10000)
         self.role_seen_at = defaultdict(float)
+        self.flow_statuses = {}
+        self.flow_run_order = {}
+        self.flow_role_order = {}
+        self.next_flow_run_order = 0
         self.auto_open_roles = {}
         self.auto_role_inflight = defaultdict(int)
         self.config = {
@@ -117,8 +126,9 @@ class DiagnosticState:
             "role_switch_delay_max_s": 5,
             "composer_stable_samples": 6,
             "composer_stable_sample_ms": 300,
+            "composer_watchdog_ms": 60000,
             "assistant_quiet_ms": 2500,
-            "send_accept_timeout_ms": 10000,
+            "send_accept_timeout_ms": 60000,
             "send_accept_poll_ms": 400,
             "assistant_force_sync_quiet_ms": 5000,
             "assistant_post_stop_timeout_ms": 15000,
@@ -136,6 +146,48 @@ class DiagnosticState:
         with self.lock:
             self.config.update(updates)
             return dict(self.config)
+
+    def update_flow_statuses(
+        self,
+        run_id: str,
+        updates: Dict[str, Optional[Dict[str, Any]]],
+    ) -> Dict[str, Dict[str, Any]]:
+        owner = str(run_id or "").strip()
+        if not owner:
+            return {}
+        changed = {}
+        with self.lock:
+            owner_order = self.flow_run_order.get(owner)
+            if owner_order is None:
+                self.next_flow_run_order += 1
+                owner_order = self.next_flow_run_order
+                self.flow_run_order[owner] = owner_order
+            for raw_role, raw_status in updates.items():
+                role = str(raw_role or "").strip().upper()
+                if not role:
+                    continue
+                if owner_order < self.flow_role_order.get(role, 0):
+                    continue
+                if raw_status is None:
+                    current = self.flow_statuses.get(role)
+                    if current and current.get("run_id") == owner:
+                        self.flow_statuses.pop(role, None)
+                        self.flow_role_order[role] = owner_order
+                    changed[role] = dict(self.flow_statuses.get(role) or {})
+                    continue
+                state_name = str(raw_status.get("state") or "").strip().upper()
+                if state_name not in {"RUNNING", "WAITING"}:
+                    continue
+                record = {"run_id": owner, "state": state_name}
+                detail_label = str(raw_status.get("detail_label") or "").strip()
+                detail_role = str(raw_status.get("detail_role") or "").strip()[:80]
+                if detail_label in {"From", "Routed"} and detail_role:
+                    record["detail_label"] = detail_label
+                    record["detail_role"] = detail_role
+                self.flow_statuses[role] = record
+                self.flow_role_order[role] = owner_order
+                changed[role] = dict(record)
+        return changed
 
     def queue_auto_open_role(self, role: str, url: str = "") -> None:
         normalized = str(role or "").strip().upper()
@@ -399,7 +451,9 @@ def api_status(req: StatusRequest):
         return {"command": {"action": "WAIT"}, "config": state.config}
 
     cmd = state.get_command_for_role(role)
-    return {"command": cmd, "config": state.config}
+    with state.lock:
+        flow_status = dict(state.flow_statuses.get(str(role or "").strip().upper()) or {}) or None
+    return {"command": cmd, "config": state.config, "flow_status": flow_status}
 
 
 @app.post("/api/claim-role")
@@ -422,6 +476,11 @@ def api_sync(req: SyncRequest):
 def api_admin_command(req: AdminCommandRequest):
     cmd = state.create_command(req.role, req.action, req.payload)
     return {"command": cmd}
+
+
+@app.post("/api/admin/flow-status")
+def api_admin_flow_status(req: FlowStatusRequest):
+    return {"status": "OK", "flow_statuses": state.update_flow_statuses(req.run_id, req.updates)}
 
 
 @app.get("/api/admin/config")
@@ -453,6 +512,7 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
+        item("admin", "POST", "/api/admin/flow-status", "Update run-scoped browser role flow status."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
         item("admin", "GET", "/api/admin/events", "Read recent event log.", "/api/admin/events?role=A&limit=20"),

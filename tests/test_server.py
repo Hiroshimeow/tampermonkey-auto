@@ -63,6 +63,100 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.last_user_message["A"], "hi")
         self.assertEqual(controller.state.last_response["A"], "hello")
 
+    def test_flow_status_is_returned_only_to_the_polling_role(self):
+        response = self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": "run-test",
+                "updates": {
+                    "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
+                    "TEST2": {"state": "WAITING"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        test1 = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        test2 = self.client.post("/api/status", json={"role": "TEST2", "session_id": "/c/2"}).json()
+        dev = self.client.post("/api/status", json={"role": "DEV", "session_id": "/c/dev"}).json()
+
+        self.assertEqual(
+            test1["flow_status"],
+            {
+                "run_id": "run-test",
+                "state": "RUNNING",
+                "detail_label": "From",
+                "detail_role": "User",
+            },
+        )
+        self.assertEqual(test2["flow_status"], {"run_id": "run-test", "state": "WAITING"})
+        self.assertIsNone(dev["flow_status"])
+
+    def test_flow_status_cleanup_cannot_clear_a_newer_run(self):
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "old-run", "updates": {"TEST1": {"state": "RUNNING"}}},
+        )
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "new-run", "updates": {"TEST1": {"state": "WAITING"}}},
+        )
+
+        stale_cleanup = self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "old-run", "updates": {"TEST1": None}},
+        )
+
+        self.assertEqual(stale_cleanup.status_code, 200)
+        payload = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING"})
+
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "new-run", "updates": {"TEST1": None}},
+        )
+        cleared = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        self.assertIsNone(cleared["flow_status"])
+
+    def test_flow_status_stale_update_cannot_replace_a_newer_run(self):
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "old-run", "updates": {"TEST1": {"state": "RUNNING"}}},
+        )
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "new-run", "updates": {"TEST1": {"state": "WAITING"}}},
+        )
+
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": "old-run",
+                "updates": {
+                    "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "OLD"}
+                },
+            },
+        )
+
+        payload = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING"})
+
+    def test_flow_status_rejects_invalid_state_without_touching_other_roles(self):
+        response = self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": "run-test",
+                "updates": {
+                    "TEST1": {"state": "QUEUED"},
+                    "TEST2": {"state": "WAITING"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("TEST1", controller.state.flow_statuses)
+        self.assertEqual(controller.state.flow_statuses["TEST2"]["state"], "WAITING")
+
     def test_admin_command_and_result_endpoints(self):
         create_response = self.client.post(
             "/api/admin/command",

@@ -173,9 +173,120 @@ class LifecycleClient:
         return self.reset_results.get(f"{role}:{action}", {"done": True, "status": f"{action}_DONE"})
 
 
+class FlowStatusClient:
+    def __init__(self):
+        self.updates: list[tuple[str, dict[str, dict[str, Any] | None]]] = []
+
+    def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+        self.updates.append((run_id, updates))
+        return {"status": "OK"}
+
+
 def compatible_prompt(coordinator: Coordinator, role: str, goal: str) -> str:
     state = FlowState(goal)
     return coordinator.build_prompt(role, "resume", state, "USER", include_system=True)
+
+
+def flow_ui_coordinator() -> tuple[Coordinator, FlowStatusClient]:
+    args = parse_args(
+        [
+            "--role",
+            "A,B,C",
+            "--browser-roles",
+            "TEST1,TEST2,TEST3",
+            "--role-map",
+            "A=TEST1 B=TEST2 C=TEST3",
+            "--goal",
+            "debate",
+            "--reload-after",
+            "0",
+        ]
+    )
+    coordinator = Coordinator(args)
+    client = FlowStatusClient()
+    coordinator.client = client  # type: ignore[assignment]
+    return coordinator, client
+
+
+def test_flow_ui_initial_turn_marks_start_running_and_all_other_members_waiting() -> None:
+    coordinator, client = flow_ui_coordinator()
+
+    coordinator.begin_flow_status()
+
+    _run_id, updates = client.updates[-1]
+    assert updates == {
+        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
+        "TEST2": {"state": "WAITING"},
+        "TEST3": {"state": "WAITING"},
+    }
+    assert "DEV" not in updates
+
+
+def test_flow_ui_route_marks_only_actual_source_and_target_without_predicting_c() -> None:
+    coordinator, client = flow_ui_coordinator()
+    coordinator.begin_flow_status()
+
+    coordinator.publish_flow_route("A", ["B"])
+
+    _run_id, updates = client.updates[-1]
+    assert updates == {
+        "TEST1": {"state": "WAITING", "detail_label": "Routed", "detail_role": "B"},
+        "TEST2": {"state": "RUNNING", "detail_label": "From", "detail_role": "A"},
+    }
+    assert "TEST3" not in updates
+
+
+def test_flow_ui_repeated_debate_updates_the_real_direction() -> None:
+    coordinator, client = flow_ui_coordinator()
+    coordinator.begin_flow_status()
+
+    coordinator.publish_flow_route("B", ["A"])
+
+    _run_id, updates = client.updates[-1]
+    assert updates == {
+        "TEST2": {"state": "WAITING", "detail_label": "Routed", "detail_role": "A"},
+        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "B"},
+    }
+
+
+def test_flow_ui_cleanup_names_only_this_coordinators_physical_roles() -> None:
+    coordinator, client = flow_ui_coordinator()
+    coordinator.begin_flow_status()
+
+    coordinator.clear_flow_status()
+
+    run_id, updates = client.updates[-1]
+    assert run_id == coordinator.flow_run_id
+    assert updates == {"TEST1": None, "TEST2": None, "TEST3": None}
+
+
+def test_flow_ui_diagnostic_parse_failure_never_breaks_core_flow() -> None:
+    coordinator, _client = flow_ui_coordinator()
+
+    class BrokenDiagnosticClient:
+        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+            raise ValueError("invalid diagnostic JSON")
+
+    coordinator.client = BrokenDiagnosticClient()  # type: ignore[assignment]
+
+    coordinator.begin_flow_status()
+    coordinator.publish_flow_route("A", ["B"])
+    coordinator.clear_flow_status()
+
+
+def test_flow_ui_parallel_fan_in_marks_children_waiting_and_parent_running() -> None:
+    coordinator, client = flow_ui_coordinator()
+    coordinator.begin_flow_status()
+    coordinator.publish_flow_route("A", ["B", "C"])
+
+    coordinator.publish_flow_fan_in("A", ["B", "C"])
+
+    _run_id, updates = client.updates[-1]
+    assert updates == {
+        "TEST2": {"state": "WAITING"},
+        "TEST3": {"state": "WAITING"},
+        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "B, C"},
+    }
 
 
 def test_full_loader_contains_all_required_sections_provenance_state_and_exact_route_message() -> None:
@@ -201,6 +312,40 @@ def test_full_loader_contains_all_required_sections_provenance_state_and_exact_r
     assert "saved implementation state" in prompt
     assert '"DEV": "Review exact routed message."' in prompt
     assert "ROUTE_JSON_CONTRACT:" in prompt
+
+
+def test_bridge_flow_status_publisher_uses_one_scoped_backend_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = BridgeClient("http://127.0.0.1:8500")
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_json_request(method: str, path: str, payload: dict[str, Any] | None = None, timeout_s: float | None = None):
+        del timeout_s
+        calls.append((method, path, payload or {}))
+        return {"status": "OK"}
+
+    monkeypatch.setattr(client, "json_request", fake_json_request)
+
+    client.update_flow_statuses(
+        "run-test",
+        {
+            "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
+            "TEST2": None,
+        },
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/admin/flow-status",
+            {
+                "run_id": "run-test",
+                "updates": {
+                    "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
+                    "TEST2": None,
+                },
+            },
+        )
+    ]
 
 
 def test_thin_repair_omits_full_loader_goal_and_state() -> None:

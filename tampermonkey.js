@@ -1177,6 +1177,9 @@
             return true;
         }
         const withoutLanguageLabel = value.replace(/^json\s*/i, '').trim();
+        if (!withoutLanguageLabel) {
+            return true;
+        }
         if (/^(?:json\s*)?\{\s*$/i.test(value)) {
             return true;
         }
@@ -2276,10 +2279,15 @@
 
     function flowStatusMarkup(status) {
         const state = String(status && status.state || '').trim().toUpperCase();
-        if (state !== 'RUNNING' && state !== 'WAITING') {
+        if (state !== 'RUNNING' && state !== 'WAITING' && state !== 'DONE') {
             return '';
         }
-        const color = state === 'RUNNING' ? '#ff5c5c' : '#d6a84b';
+        let color = '#d6a84b';
+        if (state === 'RUNNING') {
+            color = '#ff5c5c';
+        } else if (state === 'DONE') {
+            color = '#10a37f';
+        }
         const escapeText = (value) => String(value || '').replace(/[&<>\x22\x27]/g, (char) => ({
             '&': '&amp;',
             '<': '&lt;',

@@ -124,9 +124,9 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             return
         updates: dict[str, dict[str, Any] | None] = {
             self.pick_browser_role(source): {
-                "state": "WAITING",
-                "detail_label": "Routed",
-                "detail_role": ", ".join(targets),
+                "state": "DONE",
+                "detail_label": "From",
+                "detail_role": source,
             }
         }
         for target in targets:
@@ -145,7 +145,11 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         if not target or not sources:
             return
         updates: dict[str, dict[str, Any] | None] = {
-            self.pick_browser_role(source): {"state": "WAITING"}
+            self.pick_browser_role(source): {
+                "state": "DONE",
+                "detail_label": "From",
+                "detail_role": source,
+            }
             for source in sources
         }
         updates[self.pick_browser_role(target)] = {
@@ -268,10 +272,11 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 self.system_sent.add(prompt_role)
 
             route = parse_route(response)
-            if self.uses_goal_only_prompt(prompt_role) and not route.ok and response.strip():
-                route = Route(targets={"FINISH": response.strip()}, raw=response)
             route = self.validate_route(prompt_role, route)
-            if not route.ok and not self.uses_goal_only_prompt(prompt_role):
+            if not route.ok:
+                response = self.resync_invalid_route(browser_role, response)
+                route = self.validate_route(prompt_role, parse_route(response))
+            if not route.ok:
                 print(f"[format] invalid route from {prompt_role}: {route.error or 'missing route'}", flush=True)
                 repaired = True
                 repair_prompt = self.build_format_repair_prompt(
@@ -339,6 +344,28 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             return synthetic_response(prompt_role, instruction, repair, self.prompt_roles)
         return self.client.call_browser_role(browser_role, prompt, timeout_s=self.args.timeout)
 
+    def resync_invalid_route(self, browser_role: str, current_response: str) -> str:
+        if self.dry_run:
+            return current_response
+        try:
+            self.client.command_roundtrip(
+                browser_role,
+                "SYNC_TRANSCRIPT",
+                timeout_s=min(10.0, max(1.0, float(self.args.timeout))),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[format-resync] role={browser_role} sync failed: {exc}", flush=True)
+        try:
+            snapshot = self.client.role_snapshot(browser_role)
+            refreshed = self.client.response_activity(snapshot).response.strip()
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[format-resync] role={browser_role} snapshot failed: {exc}", flush=True)
+            return current_response
+        if refreshed and refreshed != current_response.strip():
+            print(f"[format-resync] role={browser_role} using refreshed response", flush=True)
+            return refreshed
+        return current_response
+
     def resume_existing_response(self, prompt_role: str, browser_role: str, turn: int, state: FlowState | None = None) -> str:
         if not self.args.resume or self.dry_run or turn != 1:
             return ""
@@ -383,7 +410,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             prompt_roles=self.prompt_roles,
             finish_roles=self.finish_roles,
             manager_role=self.manager_role,
-            state_text=state.compact(self.args.max_state_chars),
+            state_text=state.route_context(self.args.max_state_chars),
             provenance=self.runtime_config.provenance_for(prompt_role, state.goal),
             loader_manifest=self.runtime_config.loader_manifest(prompt_role),
             goal_only=self.uses_goal_only_prompt(prompt_role),

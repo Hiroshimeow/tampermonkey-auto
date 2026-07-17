@@ -63,6 +63,39 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.last_user_message["A"], "hi")
         self.assertEqual(controller.state.last_response["A"], "hello")
 
+    def test_report_and_sync_refresh_liveness_during_long_browser_command(self):
+        controller.state.role_seen_at["A"] = time.time() - 460
+        command = controller.state.create_command("A", "WAIT_ASSISTANT_DONE", {})
+
+        report_response = self.client.post(
+            "/api/report",
+            json={
+                "role": "A",
+                "session_id": "sess-1",
+                "command_id": command["command_id"],
+                "state": "ASSISTANT_TEXT_CHANGED",
+                "text": "JSON",
+                "result": {},
+                "dom_info": {},
+            },
+        )
+        self.assertEqual(report_response.status_code, 200)
+        self.assertTrue(self.client.get("/api/admin/role/A").json()["online"])
+
+        controller.state.role_seen_at["A"] = time.time() - 460
+        sync_response = self.client.post(
+            "/api/sync",
+            json={
+                "role": "A",
+                "session_id": "sess-1",
+                "reason": "mutation",
+                "transcript": {"messages": [], "counts": {}},
+                "snapshot": {},
+            },
+        )
+        self.assertEqual(sync_response.status_code, 200)
+        self.assertTrue(self.client.get("/api/admin/role/A").json()["online"])
+
     def test_flow_status_is_returned_only_to_the_polling_role(self):
         response = self.client.post(
             "/api/admin/flow-status",
@@ -91,6 +124,24 @@ class DiagnosticControllerTests(unittest.TestCase):
         )
         self.assertEqual(test2["flow_status"], {"run_id": "run-test", "state": "WAITING"})
         self.assertIsNone(dev["flow_status"])
+
+    def test_flow_status_accepts_done_with_from_detail(self):
+        response = self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": "run-test",
+                "updates": {
+                    "TEST1": {"state": "DONE", "detail_label": "From", "detail_role": "A"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        status = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        self.assertEqual(
+            status["flow_status"],
+            {"run_id": "run-test", "state": "DONE", "detail_label": "From", "detail_role": "A"},
+        )
 
     def test_flow_status_cleanup_cannot_clear_a_newer_run(self):
         self.client.post(

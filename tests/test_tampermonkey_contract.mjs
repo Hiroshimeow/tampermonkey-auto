@@ -217,6 +217,10 @@ const waitingMarkup = flowStatusMarkup({ state: 'WAITING' });
 assert.match(waitingMarkup, /color:#d6a84b/, 'WAITING must render amber');
 assert.match(waitingMarkup, />WAITING</, 'waiting state label must be visible');
 assert.doesNotMatch(waitingMarkup, /mauto-flow-detail/, 'unreached waiting roles must not show predictive detail');
+const doneMarkup = flowStatusMarkup({ state: 'DONE', detail_label: 'From', detail_role: 'A' });
+assert.match(doneMarkup, /color:#10a37f/, 'DONE must render green');
+assert.match(doneMarkup, />DONE</, 'completed role must render DONE');
+assert.match(doneMarkup, /From: A/, 'completed role must identify itself');
 assert.equal(flowStatusMarkup(null), '', 'nonparticipant role must retain the old UI without a flow block');
 assert.equal(flowStatusMarkup({ state: 'QUEUED' }), '', 'unknown states must not render');
 const hostileMarkup = flowStatusMarkup({
@@ -226,6 +230,16 @@ const hostileMarkup = flowStatusMarkup({
 });
 assert.doesNotMatch(hostileMarkup, /<style>/, 'flow detail must not inject markup into the ChatGPT page');
 assert.match(hostileMarkup, /&lt;style&gt;/, 'flow detail must be HTML escaped');
+
+const completionContext = {};
+vm.runInNewContext(
+    `${extractFunction('jsonBraceDepth')}; ${extractFunction('looksIncompleteAssistantText')}; globalThis.looksIncompleteAssistantText = looksIncompleteAssistantText;`,
+    completionContext,
+);
+const looksIncompleteAssistantText = completionContext.looksIncompleteAssistantText;
+assert.equal(looksIncompleteAssistantText('JSON'), true, 'a bare renderer language label must not finish a turn');
+assert.equal(looksIncompleteAssistantText('json\n  '), true, 'an empty renderer language block must remain incomplete');
+assert.equal(looksIncompleteAssistantText('JSON\n{"PLAN":"continue"}'), false, 'complete route JSON may finish browser waiting');
 
 const watchdogContext = {};
 vm.runInNewContext(

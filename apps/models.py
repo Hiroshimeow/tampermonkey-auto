@@ -86,3 +86,15 @@ class FlowState:
                     f"response: {compact_text(item.response, 2200)}"
                 )
         return compact_text("\n\n".join(parts), max_chars)
+
+    def route_context(self, max_chars: int) -> str:
+        with self._lock:
+            goal = self.goal
+            handoffs = dict(self.handoffs)
+
+        parts = [f"GOAL:\n{goal.strip()}"]
+        if handoffs:
+            parts.append("SAVED_HANDOFFS:")
+            for role, handoff in sorted(handoffs.items()):
+                parts.append(f"[{role}]\n{handoff}")
+        return compact_text("\n\n".join(parts), max_chars)

@@ -176,7 +176,7 @@ class DiagnosticState:
                     changed[role] = dict(self.flow_statuses.get(role) or {})
                     continue
                 state_name = str(raw_status.get("state") or "").strip().upper()
-                if state_name not in {"RUNNING", "WAITING"}:
+                if state_name not in {"RUNNING", "WAITING", "DONE"}:
                     continue
                 record = {"run_id": owner, "state": state_name}
                 detail_label = str(raw_status.get("detail_label") or "").strip()
@@ -336,6 +336,7 @@ class DiagnosticState:
         with self.lock:
             if not ignored_session:
                 self.status[role] = report_state
+                self.role_seen_at[role] = time.time()
 
             if report.session_id:
                 self.sessions[role].add(report.session_id)
@@ -389,6 +390,9 @@ class DiagnosticState:
         snapshot_applied = False
 
         with self.lock:
+            if not ignored_session:
+                self.role_seen_at[role] = time.time()
+
             if req.session_id:
                 self.sessions[role].add(req.session_id)
 

@@ -504,6 +504,8 @@ class BridgeClient:
         if value.count("```") % 2 == 1:
             return True
         without_language_label = re.sub(r"(?is)^json\s*", "", value).strip()
+        if not without_language_label:
+            return True
         if re.match(r"(?is)^(?:json\s*)?\{\s*$", value):
             return True
         if without_language_label.startswith("{") or re.search(r"(?is)```json", value):

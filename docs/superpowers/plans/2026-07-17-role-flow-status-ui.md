@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Show compact `RUNNING`/`WAITING` state and `From`/`Routed` context only on browser roles participating in the current launcher run.
+**Goal:** Show compact `RUNNING`/`WAITING`/`DONE` state only on participating roles and prevent premature flow termination on incomplete route rendering.
 
 **Architecture:** Add one run-scoped in-memory status map to the existing backend and expose it through the existing browser poll response. `BridgeClient` publishes bounded role updates; `Coordinator` publishes flow start/route/cleanup transitions, while `role.py` publishes one-role running/cleanup transitions. The userscript only renders the returned record and never derives orchestration state itself.
 
@@ -20,7 +20,7 @@
 
 - [ ] **Step 1: Write failing backend tests**
 
-Add tests proving that a bulk update stores only named roles, `/api/status` returns only the polling role's record, and `{role: null}` clears a record only when `run_id` still owns it.
+Add tests proving that a bulk update stores only named roles, including `DONE`, `/api/status` returns only the polling role's record, and `{role: null}` clears a record only when `run_id` still owns it.
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
@@ -30,7 +30,7 @@ Expected: FAIL because the flow-status endpoint and poll field do not exist.
 
 - [ ] **Step 3: Implement the minimal backend map**
 
-Add a `FlowStatusRequest` containing `run_id` and `updates: Dict[str, Optional[Dict[str, Any]]]`, plus `DiagnosticState.update_flow_statuses()`. Normalize role keys, accept only `RUNNING` and `WAITING`, store `run_id`, and compare the stored owner before a null update clears it. Add one `POST /api/admin/flow-status` endpoint and return `flow_status` from `/api/status`.
+Add a `FlowStatusRequest` containing `run_id` and `updates: Dict[str, Optional[Dict[str, Any]]]`, plus `DiagnosticState.update_flow_statuses()`. Normalize role keys, accept only `RUNNING`, `WAITING`, and `DONE`, store `run_id`, and compare the stored owner before a null update clears it. Add one `POST /api/admin/flow-status` endpoint and return `flow_status` from `/api/status`.
 
 - [ ] **Step 4: Add and test the bridge publisher**
 
@@ -51,7 +51,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Write failing transition tests**
 
-Add tests with roles `A,B,C` mapped to physical tabs. Assert initial A is `RUNNING / From: User`, B/C are `WAITING`, A-to-B produces `A WAITING / Routed: B` and `B RUNNING / From: A`, an unreached C remains plain `WAITING`, and no update names a nonparticipant such as `DEV`.
+Add tests with roles `A,B,C` mapped to physical tabs. Assert initial A is `RUNNING / From: User`, B/C are `WAITING`, A-to-B produces `A DONE / From: A` and `B RUNNING / From: A`, an unreached C remains plain `WAITING`, and no update names a nonparticipant such as `DEV`.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -61,7 +61,7 @@ Expected: FAIL because `Coordinator` does not publish flow state.
 
 - [ ] **Step 3: Implement run-scoped lifecycle helpers**
 
-Create one `flow_run_id` per coordinator. At `run()` entry publish initial membership, before dispatch publish the target as running, and when a valid route is known publish the source as waiting with `Routed` plus each actual target as running with `From`. In `finally`, publish null only for physical roles registered by this coordinator and this `run_id`. Publication errors are logged and do not alter orchestration.
+Create one `flow_run_id` per coordinator. At `run()` entry publish initial membership, before dispatch publish the target as running, and when a valid route is known publish the source as done with `From: source` plus each actual target as running with `From: source`. In `finally`, publish null only for physical roles registered by this coordinator and this `run_id`. Publication errors are logged and do not alter orchestration.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -103,7 +103,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Write failing userscript contract tests**
 
-Assert the poll response stores `flow_status`, `updateUI()` renders `RUNNING`, `WAITING`, `From:` and `Routed:` using dedicated compact elements, and absent status removes/hides the block. Assert the literal `QUEUED` is absent.
+Assert the poll response stores `flow_status`, `updateUI()` renders `RUNNING`, `WAITING`, `DONE`, and `From:` using dedicated compact elements, and absent status removes/hides the block. Assert the literal `QUEUED` is absent.
 
 - [ ] **Step 2: Run the contract test and verify RED**
 
@@ -113,7 +113,7 @@ Expected: FAIL because flow-status rendering is absent.
 
 - [ ] **Step 3: Implement the two-line UI**
 
-Keep one local `flowStatus` value from `/api/status`. Add a tight block below the role line: small bold red `RUNNING` or amber `WAITING`, followed only when present by a smaller muted `From: X` or `Routed: X`. A missing/invalid record renders the original two-line panel only.
+Keep one local `flowStatus` value from `/api/status`. Add a tight block below the role line: small bold red `RUNNING`, amber `WAITING`, or green `DONE`, followed only when present by a smaller muted `From: X`. A missing/invalid record renders the original two-line panel only.
 
 - [ ] **Step 4: Run JavaScript checks and verify GREEN**
 
@@ -177,3 +177,34 @@ Poll ownership, attachments, and the current Send button until it is visible and
 - [ ] **Step 5: Verify, live-test only TEST1/TEST2, and send to DEBATE**
 
 Run JS checks and the full Python suite, F5 only `TEST1`, `TEST2`, and `DEBATE` after userscript changes, exercise only TEST1/TEST2 for live transport, then call `role.py --role DEBATE --timeout 3600` repeatedly until review returns PASS.
+
+### Task 7: JSON-gated completion and long-command liveness
+
+**Files:**
+- Modify: `tampermonkey.js`
+- Modify: `server.py`
+- Modify: `apps/bridge.py`
+- Modify: `apps/coordinator.py`
+- Test: `tests/test_tampermonkey_contract.mjs`
+- Test: `tests/test_server.py`
+- Test: `tests/test_main_flow.py`
+
+- [ ] **Step 1: Reproduce the observed premature completion**
+
+Add tests proving bare `JSON` remains incomplete, an initially invalid response can become a valid route during bounded re-sync, and recent sync/report activity keeps a long-command tab live even when `/api/status` heartbeat is old.
+
+- [ ] **Step 2: Verify RED**
+
+Run the focused JavaScript, server, and coordinator tests. Expected: fail on bare-language completion, false-offline repair, and missing re-sync recovery.
+
+- [ ] **Step 3: Implement the minimal completion guards**
+
+Reject empty language-only placeholders in `looksIncompleteAssistantText`. Track recent browser activity on status, sync, and report endpoints. Before format repair, perform a bounded latest-response re-sync and re-parse; only send repair if the stable response is still invalid.
+
+- [ ] **Step 4: Verify flow authority**
+
+Add assertions that valid role JSON routes normally and only authorized valid `FINISH` JSON completes the overall flow. Invalid/prose output must remain non-terminal.
+
+- [ ] **Step 5: Run live regression and review**
+
+F5 only TEST1, TEST2, and DEBATE; reproduce a routed TEST1-to-TEST2 flow; run DEBATE until `VERDICT: PASS`; then commit and push only intended files.

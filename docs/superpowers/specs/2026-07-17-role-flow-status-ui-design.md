@@ -10,7 +10,7 @@ The existing version and role lines stay unchanged. Participating tabs get a com
 
 - The active role shows `RUNNING` in red and a smaller second line such as `From: User` or `From: A`.
 - Every other role configured for the same `main.py --role` flow shows `WAITING`.
-- A role that just handed work off shows `WAITING` and a smaller second line such as `Routed: B`.
+- A role that just completed its turn shows `DONE` and a smaller second line `From: <that role>`.
 - A configured role that has not been reached yet shows only `WAITING`; the UI never predicts a future route.
 - A role outside the flow shows the existing panel with no flow block.
 - When a flow finishes or stops with an error, its flow block is removed and the existing panel remains.
@@ -26,14 +26,14 @@ C  WAITING
 After A routes to B:
 
 ```text
-A  WAITING   Routed: B
+A  DONE      From: A
 B  RUNNING   From: A
 C  WAITING
 ```
 
 ## Minimal architecture
 
-The backend stores a small, in-memory status record per physical browser role. Each record contains a run identifier, `RUNNING` or `WAITING`, and optional `From` or `Routed` detail. Browser polling already uses `/api/status`, so that response will include only the status record for the polling role.
+The backend stores a small, in-memory status record per physical browser role. Each record contains a run identifier, `RUNNING`, `WAITING`, or `DONE`, plus optional `From` detail. Browser polling already uses `/api/status`, so that response will include only the status record for the polling role.
 
 Python launchers publish state through a small bridge API:
 
@@ -43,17 +43,17 @@ Python launchers publish state through a small bridge API:
 
 Cleanup is scoped by both role and run identifier. A run may remove only records it created. Starting, transitioning, or cleaning a `TEST1,TEST2` flow must not modify records or browser commands for `DEV`, `PLAN`, `REVIEW`, or any other role.
 
-Logical routing labels remain human-readable (`From: A`, `Routed: B`), while storage and browser delivery are keyed by the mapped physical role so the correct tab renders the state.
+Logical routing labels remain human-readable (`From: A`), while storage and browser delivery are keyed by the mapped physical role so the correct tab renders the state.
 
 ## State transitions
 
-At flow start, `main.py` writes one bounded snapshot for its configured roles: the start role is running and all other roles are waiting. A sequential route changes only the source and target records. A parallel route may mark multiple actual targets running, but it still does not mark an unreached role as anything other than waiting.
+At flow start, `main.py` writes one bounded snapshot for its configured roles: the start role is running and all other roles are waiting. A sequential route marks the completed source `DONE / From: source` and the target `RUNNING / From: source`. A parallel route may mark multiple actual targets running; completed child roles become `DONE / From: child`, while an unreached role remains waiting.
 
 Updates replace the status record for the same role and run. Cleanup uses compare-and-clear semantics: if another run has since replaced a role record, an older run cannot erase it.
 
 ## UI layout
 
-The status block uses two tight lines below `Role: ...`. The state line is small and bold; `RUNNING` is red and `WAITING` is amber. The optional detail line is smaller, muted, and has minimal top margin. No `QUEUED` label is used.
+The status block uses two tight lines below `Role: ...`. The state line is small and bold; `RUNNING` is red, `WAITING` is amber, and `DONE` is green. The optional detail line is smaller, muted, and has minimal top margin. No `QUEUED` label is used.
 
 ## Failure handling
 
@@ -72,6 +72,14 @@ Automated tests cover:
 - cleanup on normal and error exits;
 - compact userscript rendering and missing-state fallback;
 - `role.py` setting and clearing only its requested role.
+
+## Route completion safety
+
+Browser completion is transport evidence, not flow completion authority. A transient renderer placeholder such as `JSON`, an empty language label, an open JSON object, or an otherwise incomplete route response must not produce `ASSISTANT_DONE`. For routed `main.py` roles, Python re-syncs the latest cached response and accepts the turn only after route JSON parses and validates.
+
+An invalid or temporarily incomplete route does not end the flow. Format repair may run only after a bounded re-sync grace period confirms that the response is still invalid. Recent sync/report activity from a tab executing a long command is treated as liveness, so the repair attempt cannot fail solely because `/api/status` polling was paused by `WAIT_ASSISTANT_DONE`.
+
+The overall flow completes only when an authorized finish role returns valid JSON containing `FINISH`. Valid role-to-role JSON continues routing normally; prose, bare `JSON`, malformed JSON, and unauthorized `FINISH` never count as completion.
 
 Live verification is limited to `TEST1` and `TEST2`. It must not dispatch commands or flow-state mutations to currently running `DEV`, `PLAN`, or `REVIEW` tabs.
 

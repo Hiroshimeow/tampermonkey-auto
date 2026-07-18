@@ -1176,6 +1176,479 @@ class DiagnosticControllerTests(unittest.TestCase):
             ],
         )
 
+    def test_observation_sequence_rejects_out_of_order_same_page(self):
+        newer = self.client.post(
+            "/api/status",
+            json={
+                "role": "DEV",
+                "session_id": "/c/current",
+                "page_instance_id": "page-current",
+                "observation_seq": 2,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "new"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "new"},
+                    }
+                },
+            },
+        ).json()
+        stale = self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/current",
+                "page_instance_id": "page-current",
+                "observation_seq": 1,
+                "snapshot": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "old"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "old"},
+                    }
+                },
+            },
+        ).json()
+
+        self.assertTrue(newer["observation_accepted"])
+        self.assertFalse(stale["observation_accepted"])
+        self.assertEqual(stale["observation_reason"], "stale_observation_seq")
+        self.assertEqual(controller.state.last_response["DEV"], "new")
+
+    def test_replaced_page_rejects_delayed_old_observation(self):
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "claim_role": True,
+                "observation_seq": 8,
+                "dom_info": {"messages": {"messages": [], "counts": {}}},
+            },
+        )
+        current = self.client.post(
+            "/api/status",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/new",
+                "page_instance_id": "page-new",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "observation_seq": 1,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "current"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "current"},
+                    }
+                },
+            },
+        ).json()
+        delayed = self.client.post(
+            "/api/sync",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "observation_seq": 9,
+                "snapshot": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "stale"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "stale"},
+                    }
+                },
+            },
+        ).json()
+
+        self.assertTrue(current["observation_accepted"])
+        self.assertFalse(delayed["observation_accepted"])
+        self.assertEqual(delayed["observation_reason"], "stale_page_instance_id")
+        snapshot = self.client.get("/api/admin/role/PLAN").json()
+        self.assertEqual(snapshot["observation"]["page_instance_id"], "page-new")
+        self.assertEqual(snapshot["last_response"], "current")
+
+    def test_retired_claiming_page_is_cleared_without_state_mutation(self):
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "claim_role": True,
+                "observation_seq": 8,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "old"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "old"},
+                    }
+                },
+            },
+        )
+        current = self.client.post(
+            "/api/status",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/new",
+                "page_instance_id": "page-new",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "claim_role": True,
+                "observation_seq": 1,
+                "dom_info": {
+                    "messages": {
+                        "messages": [
+                            {"role": "user", "text": "current prompt"},
+                            {"role": "assistant", "text": "current answer"},
+                        ],
+                        "counts": {"user": 1, "assistant": 1},
+                        "last_user": {"text": "current prompt"},
+                        "last_assistant": {"text": "current answer"},
+                    }
+                },
+            },
+        ).json()
+        controller.state.flow_statuses["PLAN"] = {"state": "RUNNING", "detail": "phase-01"}
+
+        before = {
+            "owner": dict(controller.state.role_owners["PLAN"]),
+            "sessions": set(controller.state.sessions["PLAN"]),
+            "current_session": controller.state.current_sessions["PLAN"],
+            "status": controller.state.status["PLAN"],
+            "seen_at": controller.state.role_seen_at["PLAN"],
+            "observation": dict(controller.state.observation_pages["PLAN"]),
+            "retired_pages": set(controller.state.retired_observation_pages["PLAN"]),
+            "dom": dict(controller.state.dom_info["PLAN"]),
+            "transcript": list(controller.state.transcripts["PLAN"]),
+            "last_user": controller.state.last_user_message["PLAN"],
+            "last_response": controller.state.last_response["PLAN"],
+            "commands": dict(controller.state.commands),
+            "command_status": dict(controller.state.command_status),
+            "command_results": dict(controller.state.command_results),
+            "flow": dict(controller.state.flow_statuses["PLAN"]),
+        }
+
+        retired = self.client.post(
+            "/api/status",
+            json={
+                "role": "PLAN",
+                "session_id": "/c/old-returned",
+                "page_instance_id": "page-old",
+                "role_owner_id": "tab-1",
+                "role_claim_id": "g-1-claim",
+                "claim_role": True,
+                "observation_seq": 99,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "conflicting stale"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "conflicting stale"},
+                    }
+                },
+            },
+        ).json()
+
+        self.assertTrue(current["observation_accepted"])
+        self.assertTrue(retired["clear_role"])
+        self.assertEqual(retired["command"]["action"], "WAIT")
+        self.assertFalse(retired["observation_accepted"])
+        self.assertEqual(retired["observation_reason"], "stale_page_instance_id")
+        self.assertIsNone(retired["flow_status"])
+        self.assertEqual(controller.state.role_owners["PLAN"]["page_instance_id"], "page-new")
+        self.assertEqual(controller.state.role_owners["PLAN"]["session_id"], "/c/new")
+        self.assertEqual(controller.state.role_owners["PLAN"], before["owner"])
+        self.assertEqual(controller.state.sessions["PLAN"], before["sessions"])
+        self.assertEqual(controller.state.current_sessions["PLAN"], before["current_session"])
+        self.assertEqual(controller.state.status["PLAN"], before["status"])
+        self.assertEqual(controller.state.role_seen_at["PLAN"], before["seen_at"])
+        self.assertEqual(controller.state.observation_pages["PLAN"], before["observation"])
+        self.assertEqual(controller.state.retired_observation_pages["PLAN"], before["retired_pages"])
+        self.assertEqual(controller.state.dom_info["PLAN"], before["dom"])
+        self.assertEqual(controller.state.transcripts["PLAN"], before["transcript"])
+        self.assertEqual(controller.state.last_user_message["PLAN"], before["last_user"])
+        self.assertEqual(controller.state.last_response["PLAN"], before["last_response"])
+        self.assertEqual(controller.state.commands, before["commands"])
+        self.assertEqual(controller.state.command_status, before["command_status"])
+        self.assertEqual(controller.state.command_results, before["command_results"])
+        self.assertEqual(controller.state.flow_statuses["PLAN"], before["flow"])
+        admin = self.client.get("/api/admin/role/PLAN").json()
+        self.assertEqual(admin["observation"]["page_instance_id"], "page-new")
+        self.assertEqual(admin["observation"]["observation_seq"], 1)
+        self.assertEqual(admin["last_user"], "current prompt")
+        self.assertEqual(admin["last_response"], "current answer")
+
+    def test_stale_current_session_sync_refreshes_only_presence(self):
+        accepted_snapshot = {
+            "messages": {
+                "messages": [
+                    {"role": "user", "text": "accepted prompt"},
+                    {"role": "assistant", "text": "accepted answer"},
+                ],
+                "counts": {"user": 1, "assistant": 1},
+                "last_user": {"text": "accepted prompt"},
+                "last_assistant": {"text": "accepted answer"},
+            }
+        }
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "role_owner_id": "tab-dev",
+                "role_claim_id": "g-2-claim",
+                "claim_role": True,
+                "observation_seq": 5,
+                "dom_info": accepted_snapshot,
+            },
+        )
+        stale_seen_at = time.time() - 460
+        controller.state.role_seen_at["DEV"] = stale_seen_at
+        before = {
+            "observation": dict(controller.state.observation_pages["DEV"]),
+            "dom": dict(controller.state.dom_info["DEV"]),
+            "transcript": list(controller.state.transcripts["DEV"]),
+            "last_user": controller.state.last_user_message["DEV"],
+            "last_response": controller.state.last_response["DEV"],
+        }
+
+        stale = self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "role_owner_id": "tab-dev",
+                "role_claim_id": "g-2-claim",
+                "observation_seq": 5,
+                "reason": "periodic",
+                "snapshot": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "conflicting snapshot"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "conflicting snapshot"},
+                    }
+                },
+                "transcript": {
+                    "messages": [{"role": "assistant", "text": "conflicting transcript"}],
+                    "last_user": {"text": "conflicting user"},
+                    "last_assistant": {"text": "conflicting transcript"},
+                },
+            },
+        ).json()
+
+        self.assertEqual(stale["status"], "OK")
+        self.assertFalse(stale["observation_accepted"])
+        self.assertEqual(stale["observation_reason"], "stale_observation_seq")
+        admin = self.client.get("/api/admin/role/DEV").json()
+        self.assertTrue(admin["presence"]["online"])
+        self.assertEqual(admin["presence"]["status"], "ONLINE")
+        self.assertLess(admin["presence"]["last_seen_age_s"], 2)
+        self.assertGreater(controller.state.role_seen_at["DEV"], stale_seen_at)
+        self.assertEqual(controller.state.observation_pages["DEV"], before["observation"])
+        self.assertEqual(controller.state.dom_info["DEV"], before["dom"])
+        self.assertEqual(controller.state.transcripts["DEV"], before["transcript"])
+        self.assertEqual(controller.state.last_user_message["DEV"], before["last_user"])
+        self.assertEqual(controller.state.last_response["DEV"], before["last_response"])
+
+    def test_terminal_command_accepts_result_when_observation_is_stale(self):
+        command = controller.state.create_command("A", "WAIT_ASSISTANT_DONE", {})
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "A",
+                "session_id": "/c/a",
+                "page_instance_id": "page-a",
+                "observation_seq": 5,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "fresh"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "fresh"},
+                    }
+                },
+            },
+        )
+        terminal = self.client.post(
+            "/api/report",
+            json={
+                "role": "A",
+                "session_id": "/c/a",
+                "page_instance_id": "page-a",
+                "command_id": command["command_id"],
+                "state": "ASSISTANT_DONE",
+                "text": "done",
+                "observation_seq": 4,
+                "dom_info": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "stale"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "stale"},
+                    }
+                },
+            },
+        ).json()
+
+        self.assertEqual(terminal["status"], "OK")
+        self.assertFalse(terminal["observation_accepted"])
+        result = controller.state.command_results[command["command_id"]]
+        self.assertEqual(result["state"], "ASSISTANT_DONE")
+        self.assertFalse(result["observation_accepted"])
+        self.assertEqual(result["dom_info"], {})
+        self.assertEqual(controller.state.last_response["A"], "fresh")
+
+    def test_newer_empty_observation_clears_and_stale_empty_does_not(self):
+        populated = {
+            "messages": {
+                "messages": [{"role": "assistant", "text": "old"}],
+                "counts": {"assistant": 1},
+                "last_assistant": {"text": "old"},
+            }
+        }
+        empty = {"messages": {"messages": [], "counts": {"user": 0, "assistant": 0}}}
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "observation_seq": 1,
+                "dom_info": populated,
+            },
+        )
+        cleared = self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "observation_seq": 2,
+                "snapshot": empty,
+                "transcript": {"messages": [], "last_user": None, "last_assistant": None},
+            },
+        ).json()
+        self.assertTrue(cleared["observation_accepted"])
+        self.assertEqual(controller.state.last_response["DEV"], "")
+
+        self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "observation_seq": 3,
+                "snapshot": {
+                    "messages": {
+                        "messages": [{"role": "assistant", "text": "new"}],
+                        "counts": {"assistant": 1},
+                        "last_assistant": {"text": "new"},
+                    }
+                },
+            },
+        )
+        stale_empty = self.client.post(
+            "/api/sync",
+            json={
+                "role": "DEV",
+                "session_id": "/c/dev",
+                "page_instance_id": "page-dev",
+                "observation_seq": 2,
+                "snapshot": empty,
+                "transcript": {"messages": [], "last_user": None, "last_assistant": None},
+            },
+        ).json()
+        self.assertFalse(stale_empty["observation_accepted"])
+        self.assertEqual(controller.state.last_response["DEV"], "new")
+
+    def test_all_observation_ingress_uses_shared_mutation_helper(self):
+        command = controller.state.create_command("A", "WAIT_ASSISTANT_DONE", {})
+        with patch.object(
+            controller.state,
+            "apply_role_observation",
+            wraps=controller.state.apply_role_observation,
+        ) as apply_observation:
+            self.client.post(
+                "/api/status",
+                json={
+                    "role": "A",
+                    "session_id": "/c/a",
+                    "page_instance_id": "page-a",
+                    "observation_seq": 1,
+                    "dom_info": {"composer": True},
+                },
+            )
+            self.client.post(
+                "/api/report",
+                json={
+                    "role": "A",
+                    "session_id": "/c/a",
+                    "page_instance_id": "page-a",
+                    "command_id": command["command_id"],
+                    "state": "ASSISTANT_PROGRESS",
+                    "observation_seq": 2,
+                    "dom_info": {"composer": True},
+                },
+            )
+            self.client.post(
+                "/api/sync",
+                json={
+                    "role": "A",
+                    "session_id": "/c/a",
+                    "page_instance_id": "page-a",
+                    "observation_seq": 3,
+                    "snapshot": {"composer": True},
+                    "transcript": {"messages": []},
+                },
+            )
+
+        self.assertEqual(apply_observation.call_count, 3)
+
+    def test_admin_role_separates_presence_observation_and_command_state(self):
+        command = controller.state.create_command("A", "WAIT_ASSISTANT_DONE", {})
+        self.client.post(
+            "/api/status",
+            json={
+                "role": "A",
+                "session_id": "/c/a",
+                "page_instance_id": "page-a",
+                "observation_seq": 1,
+                "dom_info": {"composer": True},
+            },
+        )
+        self.client.post(
+            "/api/report",
+            json={
+                "role": "A",
+                "session_id": "/c/a",
+                "page_instance_id": "page-a",
+                "command_id": command["command_id"],
+                "state": "ASSISTANT_PROGRESS",
+                "observation_seq": 2,
+                "dom_info": {"composer": True},
+            },
+        )
+
+        online = self.client.get("/api/admin/role/A").json()
+        self.assertEqual(online["status"], "ONLINE")
+        self.assertTrue(online["presence"]["online"])
+        self.assertEqual(online["observation"]["observation_seq"], 2)
+        self.assertEqual(online["active_command"]["state"], "ASSISTANT_PROGRESS")
+        self.assertEqual(online["dom_info"], online["observation"]["dom_info"])
+
+        controller.state.role_seen_at["A"] = time.time() - 460
+        offline = self.client.get("/api/admin/role/A").json()
+        self.assertEqual(offline["status"], "OFFLINE")
+        self.assertFalse(offline["presence"]["online"])
+        self.assertEqual(offline["active_command"]["state"], "ASSISTANT_PROGRESS")
+
     @patch("server.time.sleep")
     @patch("server.os.kill")
     @patch("server.find_pid_on_port")

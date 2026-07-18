@@ -17,6 +17,8 @@
     const SERVER_URL = 'http://127.0.0.1:8500';
     const BRIDGE_VERSION = 'standalone-1.0.4';
     const PAGE_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let observationSeq = 0;
+    function nextObservationSeq() { observationSeq += 1; return observationSeq; }
     const ROLE_OWNER_ID = sessionStorage.getItem('mauto_role_owner_id') || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     sessionStorage.setItem('mauto_role_owner_id', ROLE_OWNER_ID);
     function roleClaimKey(role) { return `mauto_role_claim_id:${String(role || '').trim().toUpperCase()}`; }
@@ -1376,6 +1378,7 @@
             state,
             text: extra.text || '',
             result: extra.result || {},
+            observation_seq: typeof nextObservationSeq === 'function' ? nextObservationSeq() : 0,
             dom_info: extra.dom_info || domSnapshot()
         };
         const response = await request('POST', `${SERVER_URL}/api/report`, payload);
@@ -1405,6 +1408,7 @@
             role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
             role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
             reason,
+            observation_seq: typeof nextObservationSeq === 'function' ? nextObservationSeq() : 0,
             transcript,
             snapshot
         });
@@ -2392,6 +2396,7 @@
                 role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
                 role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
                 claim_role: typeof roleClaimPending !== 'undefined' && roleClaimPending,
+                observation_seq: typeof nextObservationSeq === 'function' ? nextObservationSeq() : 0,
                 dom_info: domSnapshot()
             });
             if ((typeof roleAssignmentGeneration !== 'undefined' && requestGeneration !== roleAssignmentGeneration) || nextRole() !== requestRole) {

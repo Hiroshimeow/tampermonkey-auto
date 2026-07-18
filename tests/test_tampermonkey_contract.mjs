@@ -69,8 +69,12 @@ assert.match(source, /api\/release-role[\s\S]*?role_claim_id:/, 'role release mu
 assert.match(source, /await report\(reload \? 'ROLE_TAKEOVER_RELOADING' : 'ROLE_SET'[\s\S]*?api\/release-role/, 'A-to-B replacement must report under A before releasing A');
 assert.match(source, /if \(\(typeof roleAssignmentGeneration[^}]+\) \|\| nextRole\(\) !== requestRole\) \{\s*return;\s*\}/, 'a stale assignment response must return before applying state');
 assert.doesNotMatch(source, /roleAssignmentGeneration[^}]+schedulePoll\(\);\s*return;/, 'stale assignment response must rely on pollOnce finally for its single next poll');
+assert.match(source, /let observationSeq = 0;/, 'observation sequencing must restart for each page instance');
+assert.match(source, /function nextObservationSeq\(\)[\s\S]*?observationSeq \+= 1/, 'observation sequence must increase monotonically within one page');
 assert.match(source, /const payload = \{[\s\S]*?page_instance_id:\s*PAGE_INSTANCE_ID,[\s\S]*?command_id:/, 'report payload must identify the exact page instance');
+assert.match(source, /api\/report[\s\S]*?observation_seq:\s*typeof nextObservationSeq/, 'report observations must carry the page-scoped sequence');
 assert.match(source, /api\/sync[\s\S]*?page_instance_id:\s*PAGE_INSTANCE_ID/, 'sync payload must identify the exact page instance');
+assert.match(source, /api\/sync[\s\S]*?observation_seq:\s*typeof nextObservationSeq/, 'sync observations must carry the page-scoped sequence');
 assert.match(source, /api\/sync[\s\S]*?role_owner_id:[\s\S]*?role_claim_id:/, 'the real sync payload must carry stable owner and claim identity');
 assert.match(source, /function handleRoleAssignmentMessage\(event\)/, 'the real MAUTO_SET_ROLE callback must be testable as a named handler');
 assert.match(source, /api\/reserve-role-claim/, 'a new explicit assignment must reserve a server-issued monotonic claim before polling');
@@ -78,6 +82,7 @@ assert.match(source, /async function assignRole\(role\)/, 'role assignment must 
 assert.match(source, /let roleAssignmentIntentGeneration = 0;/, 'reservation responses must be guarded by a separate assignment-intent generation');
 assert.match(source, /intentGeneration !== roleAssignmentIntentGeneration/, 'stale reservation responses must be discarded before mutating local ownership');
 assert.match(source, /api\/status[\s\S]*?page_instance_id:\s*PAGE_INSTANCE_ID/, 'status payload must identify the exact page instance');
+assert.match(source, /api\/status[\s\S]*?observation_seq:\s*typeof nextObservationSeq/, 'status observations must carry the page-scoped sequence');
 assert.match(source, /page_path:\s*window\.location\.pathname/, 'domSnapshot must expose the current page path');
 assert.match(source, /function isRealComposerAttachment\(meta\)/, 'tampermonkey.js must filter composer controls out of attachment detection');
 assert.match(source, /composer-plus-btn/, 'composer attachment detection must ignore the Add files button');

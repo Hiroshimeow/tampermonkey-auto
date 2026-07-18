@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+import re
 
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional
@@ -46,6 +47,9 @@ TERMINAL_STATES = {
     "CHOICE_PROMPT_CLICKED",
     "CHOICE_PROMPT_CLICK_FAILED",
     "CHOICE_PROMPT_NOT_FOUND",
+    "ROLE_SET",
+    "ROLE_TAKEOVER_RELOADING",
+    "ROLE_TAKEOVER_FAILED",
     "UNKNOWN_COMMAND",
     "ERROR_COMMAND",
 }
@@ -54,12 +58,19 @@ TERMINAL_STATES = {
 class StatusRequest(BaseModel):
     role: str
     session_id: str = ""
+    page_instance_id: str = ""
+    role_owner_id: str = ""
+    role_claim_id: str = ""
+    claim_role: bool = False
     dom_info: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportRequest(BaseModel):
     role: str
     session_id: str = ""
+    page_instance_id: str = ""
+    role_owner_id: str = ""
+    role_claim_id: str = ""
     command_id: str = ""
     state: str
     text: str = ""
@@ -70,6 +81,9 @@ class ReportRequest(BaseModel):
 class SyncRequest(BaseModel):
     role: str
     session_id: str = ""
+    page_instance_id: str = ""
+    role_owner_id: str = ""
+    role_claim_id: str = ""
     reason: str = ""
     transcript: Dict[str, Any] = Field(default_factory=dict)
     snapshot: Dict[str, Any] = Field(default_factory=dict)
@@ -89,6 +103,18 @@ class RoleClaimRequest(BaseModel):
     session_id: str = ""
 
 
+class RoleClaimReservationRequest(BaseModel):
+    role: str
+
+
+class RoleReleaseRequest(BaseModel):
+    role: str
+    session_id: str = ""
+    page_instance_id: str = ""
+    role_owner_id: str = ""
+    role_claim_id: str = ""
+
+
 class FlowStatusRequest(BaseModel):
     run_id: str
     updates: Dict[str, Optional[Dict[str, Any]]] = Field(default_factory=dict)
@@ -102,12 +128,15 @@ class DiagnosticState:
         self.command_status = {}
         self.status = defaultdict(lambda: "OFFLINE")
         self.sessions = defaultdict(set)
+        self.current_sessions = defaultdict(str)
         self.dom_info = defaultdict(dict)
         self.transcripts = defaultdict(list)
         self.last_user_message = defaultdict(str)
         self.last_response = defaultdict(str)
         self.events = deque(maxlen=10000)
         self.role_seen_at = defaultdict(float)
+        self.role_owners = {}
+        self.next_role_claim_generation = 0
         self.flow_statuses = {}
         self.flow_run_order = {}
         self.flow_role_order = {}
@@ -115,6 +144,7 @@ class DiagnosticState:
         self.auto_open_roles = {}
         self.auto_role_inflight = defaultdict(int)
         self.config = {
+
             "poll_ms": 800,
             "sync_debounce_ms": 1200,
             "wait_loop_interval_ms": 500,
@@ -141,6 +171,41 @@ class DiagnosticState:
             "auto_open_wait_s": 45,
             "auto_close_after_s": 600,
         }
+
+    @staticmethod
+    def role_owner_matches(owner: Dict[str, Any] | None, owner_id: str, claim_id: str, page_instance_id: str) -> bool:
+        if not owner:
+            return True
+        if owner.get("role_owner_id") or owner.get("role_claim_id"):
+            return bool(owner_id and claim_id and owner.get("role_owner_id") == owner_id and owner.get("role_claim_id") == claim_id)
+        return bool(page_instance_id and owner.get("page_instance_id") == page_instance_id)
+
+    @staticmethod
+    def claim_is_newer(candidate: str, current: str) -> bool:
+        """Compare client claim generations without letting delayed work reclaim a role."""
+        candidate_text = str(candidate or "")
+        current_text = str(current or "")
+        if not current_text:
+            return bool(candidate_text)
+        if not candidate_text:
+            return False
+        candidate_match = re.match(r"^g-(\d+)-", candidate_text)
+        current_match = re.match(r"^g-(\d+)-", current_text)
+        if candidate_match and current_match:
+            return int(candidate_match.group(1)) > int(current_match.group(1))
+        # Compatibility with claims made before the reservation endpoint. Equal
+        # generations are never ordered by their random suffix.
+        try:
+            candidate_generation = int(candidate_text.split("-", 1)[0])
+            current_generation = int(current_text.split("-", 1)[0])
+            return candidate_generation > current_generation
+        except ValueError:
+            return False
+
+    def reserve_role_claim(self, role: str) -> str:
+        with self.lock:
+            self.next_role_claim_generation += 1
+            return f"g-{self.next_role_claim_generation}-{uuid.uuid4().hex}"
 
     def update_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
@@ -179,11 +244,23 @@ class DiagnosticState:
                 if state_name not in {"RUNNING", "WAITING", "DONE"}:
                     continue
                 record = {"run_id": owner, "state": state_name}
-                detail_label = str(raw_status.get("detail_label") or "").strip()
-                detail_role = str(raw_status.get("detail_role") or "").strip()[:80]
-                if detail_label in {"From", "Routed"} and detail_role:
-                    record["detail_label"] = detail_label
-                    record["detail_role"] = detail_role
+                from_role = str(raw_status.get("from_role") or "").strip()[:80]
+                done_from = str(raw_status.get("done_from") or "").strip()[:80]
+                sent_to = str(raw_status.get("sent_to") or "").strip()[:80]
+                if state_name == "RUNNING" and from_role:
+                    record["from_role"] = from_role
+                if state_name == "DONE":
+                    if done_from:
+                        record["done_from"] = done_from
+                    if sent_to:
+                        record["sent_to"] = sent_to
+                if state_name == "WAITING":
+                    if sent_to:
+                        record["sent_to"] = sent_to
+                    else:
+                        previous = self.flow_statuses.get(role) or {}
+                        if previous.get("run_id") == owner and previous.get("sent_to"):
+                            record["sent_to"] = previous["sent_to"]
                 self.flow_statuses[role] = record
                 self.flow_role_order[role] = owner_order
                 changed[role] = dict(record)
@@ -215,6 +292,9 @@ class DiagnosticState:
     @staticmethod
     def is_ignored_session(session_id: str) -> bool:
         return session_id.startswith("/backend-api/sentinel/")
+
+    def is_current_session(self, role: str, session_id: str) -> bool:
+        return bool(session_id) and session_id == self.current_sessions.get(role, "")
 
     def log(self, role: str, event: str, **data):
         rec = {
@@ -291,6 +371,8 @@ class DiagnosticState:
             "status": "PENDING",
             "created_at": time.time(),
             "delivered_at": None,
+            "owner_page_instance_id": "",
+            "owner_session_id": "",
         }
         with self.lock:
             self.commands[role] = cmd
@@ -308,23 +390,41 @@ class DiagnosticState:
             time.sleep(max(0.05, poll_s))
         return None
 
-    def get_command_for_role(self, role: str):
+    def active_command(self, role: str) -> Optional[Dict[str, Any]]:
+        cmd = self.commands.get(role)
+        if not cmd or cmd["command_id"] in self.command_results:
+            return None
+        return cmd
+
+    @staticmethod
+    def command_owner_matches(cmd: Dict[str, Any], page_instance_id: str) -> bool:
+        return bool(page_instance_id) and cmd.get("owner_page_instance_id") == page_instance_id
+
+    def get_command_for_role(self, role: str, session_id: str = "", page_instance_id: str = ""):
         with self.lock:
-            cmd = self.commands.get(role)
-            if not cmd:
+            cmd = self.active_command(role)
+            if not cmd or not page_instance_id:
                 return {"action": "WAIT"}
 
             command_id = cmd["command_id"]
-            if command_id in self.command_results:
-                return {"action": "WAIT"}
-
-            if cmd["status"] == "PENDING":
+            if cmd["status"] == "PENDING" and not cmd.get("owner_page_instance_id"):
+                cmd["owner_page_instance_id"] = page_instance_id
+                cmd["owner_session_id"] = session_id
                 cmd["status"] = "DELIVERED"
                 cmd["delivered_at"] = time.time()
                 self.command_status[command_id] = "DELIVERED"
-                self.log(role, "COMMAND_DELIVERED", command_id=command_id, action=cmd["action"])
+                self.log(
+                    role,
+                    "COMMAND_DELIVERED",
+                    command_id=command_id,
+                    action=cmd["action"],
+                    page_instance_id=page_instance_id,
+                    session_id=session_id,
+                )
 
-            return cmd
+            if cmd["status"] == "DELIVERED" and self.command_owner_matches(cmd, page_instance_id):
+                return cmd
+            return {"action": "WAIT"}
 
     def save_report(self, report: ReportRequest):
         role = report.role
@@ -334,14 +434,50 @@ class DiagnosticState:
         empty_dom = self.dom_has_no_messages(report.dom_info)
 
         with self.lock:
-            if not ignored_session:
-                self.status[role] = report_state
-                self.role_seen_at[role] = time.time()
-
+            owner = self.role_owners.get(str(role or "").strip().upper())
+            if not self.role_owner_matches(owner, report.role_owner_id, report.role_claim_id, report.page_instance_id):
+                return {"status": "IGNORED", "reason": "role_owner_mismatch", "config": self.config}
             if report.session_id:
                 self.sessions[role].add(report.session_id)
 
-            if report.dom_info and not ignored_session:
+            active = self.active_command(role)
+            ignore_reason = ""
+            if ignored_session:
+                ignore_reason = "ignored_session"
+            elif command_id:
+                if not report.page_instance_id:
+                    ignore_reason = "missing_page_instance_id"
+                elif not active or active.get("command_id") != command_id:
+                    ignore_reason = "stale_command"
+                elif not self.command_owner_matches(active, report.page_instance_id):
+                    ignore_reason = "command_owner_mismatch"
+            elif active:
+                ignore_reason = "missing_command_id"
+
+            if ignore_reason:
+                self.log(
+                    role,
+                    "REPORT_IGNORED",
+                    reason=ignore_reason,
+                    session_id=report.session_id,
+                    page_instance_id=report.page_instance_id,
+                    command_id=command_id,
+                    state=report_state,
+                )
+                return {"status": "IGNORED", "reason": ignore_reason, "config": self.config}
+
+            command_owned = bool(command_id and active)
+            current_session = self.is_current_session(role, report.session_id)
+            if command_owned:
+                if report.session_id:
+                    self.current_sessions[role] = report.session_id
+                current_session = True
+
+            self.status[role] = report_state
+            if current_session:
+                self.role_seen_at[role] = time.time()
+
+            if report.dom_info:
                 self.dom_info[role] = report.dom_info
                 self.apply_dom_transcript_cache(role, report.dom_info)
 
@@ -349,8 +485,7 @@ class DiagnosticState:
                 self.command_status[command_id] = report_state
 
             if (
-                not ignored_session
-                and not empty_dom
+                not empty_dom
                 and report_state in {"ASSISTANT_DONE", "TRANSCRIPT_SAVE_ACK", "TRANSCRIPT_SAVED"}
                 and report.text
             ):
@@ -360,6 +495,7 @@ class DiagnosticState:
                 role,
                 report_state,
                 session_id=report.session_id,
+                page_instance_id=report.page_instance_id,
                 command_id=command_id,
                 text_preview=(report.text or "")[:500],
                 result=report.result,
@@ -390,29 +526,54 @@ class DiagnosticState:
         snapshot_applied = False
 
         with self.lock:
-            if not ignored_session:
-                self.role_seen_at[role] = time.time()
-
+            owner = self.role_owners.get(str(role or "").strip().upper())
+            if not self.role_owner_matches(owner, req.role_owner_id, req.role_claim_id, req.page_instance_id):
+                return {"status": "IGNORED", "reason": "role_owner_mismatch", "config": self.config}
             if req.session_id:
                 self.sessions[role].add(req.session_id)
 
-            if snapshot and not ignored_session:
+            active = self.active_command(role)
+            ignore_reason = ""
+            if ignored_session:
+                ignore_reason = "ignored_session"
+            elif active and not req.page_instance_id:
+                ignore_reason = "missing_page_instance_id"
+            elif active and not self.command_owner_matches(active, req.page_instance_id):
+                ignore_reason = "command_owner_mismatch"
+
+            if ignore_reason:
+                self.log(
+                    role,
+                    "SYNC_IGNORED",
+                    reason=ignore_reason,
+                    session_id=req.session_id,
+                    page_instance_id=req.page_instance_id,
+                )
+                return {"status": "IGNORED", "reason": ignore_reason, "config": self.config}
+
+            if active:
+                if req.session_id:
+                    self.current_sessions[role] = req.session_id
+                self.role_seen_at[role] = time.time()
+            elif self.is_current_session(role, req.session_id):
+                self.role_seen_at[role] = time.time()
+
+            if snapshot:
                 self.dom_info[role] = snapshot
                 snapshot_applied = self.apply_dom_transcript_cache(role, snapshot)
 
-            if isinstance(messages, list) and not ignored_session and not empty_snapshot and not snapshot_applied:
+            if isinstance(messages, list) and not empty_snapshot and not snapshot_applied:
                 self.transcripts[role] = messages
 
-            if not ignored_session and not empty_snapshot and not snapshot_applied:
+            if not empty_snapshot and not snapshot_applied:
                 self.last_user_message[role] = last_user.get("text", "") if isinstance(last_user, dict) else ""
-
-            if not ignored_session and not empty_snapshot and not snapshot_applied:
                 self.last_response[role] = last_assistant.get("text", "") if isinstance(last_assistant, dict) else ""
 
             self.log(
                 role,
                 "SYNC",
                 session_id=req.session_id,
+                page_instance_id=req.page_instance_id,
                 reason=req.reason,
                 counts=transcript.get("counts", {}),
                 last_user_preview=self.last_user_message[role][:300],
@@ -442,28 +603,57 @@ app.add_middleware(
 def api_status(req: StatusRequest):
     role = req.role
     with state.lock:
-        if req.session_id:
+        if state.is_ignored_session(req.session_id):
+            return {"command": {"action": "WAIT"}, "config": state.config}
+
+        normalized_role = str(role or "").strip().upper()
+        owner = state.role_owners.get(normalized_role)
+        if req.claim_role and normalized_role and req.page_instance_id:
+            same_claim = state.role_owner_matches(owner, req.role_owner_id, req.role_claim_id, req.page_instance_id)
+            if not owner or same_claim or state.claim_is_newer(req.role_claim_id, owner.get("role_claim_id", "")):
+                state.role_owners[normalized_role] = {"page_instance_id": req.page_instance_id, "session_id": req.session_id, "role_owner_id": req.role_owner_id, "role_claim_id": req.role_claim_id}
+                owner = state.role_owners[normalized_role]
+        clear_role = not state.role_owner_matches(owner, req.role_owner_id, req.role_claim_id, req.page_instance_id)
+        if not clear_role and req.session_id:
             state.sessions[role].add(req.session_id)
-        if req.dom_info and not state.is_ignored_session(req.session_id):
-            state.dom_info[role] = req.dom_info
-            state.apply_dom_transcript_cache(role, req.dom_info)
-        if not state.is_ignored_session(req.session_id):
+        cmd = {"action": "WAIT"} if clear_role else state.get_command_for_role(role, req.session_id, req.page_instance_id)
+        active = state.active_command(role)
+        owner_only = bool(active and active.get("status") == "DELIVERED")
+        may_update = not clear_role and (not owner_only or state.command_owner_matches(active, req.page_instance_id))
+
+        if may_update:
+            if req.session_id:
+                state.current_sessions[role] = req.session_id
+            if req.dom_info:
+                state.dom_info[role] = req.dom_info
+                state.apply_dom_transcript_cache(role, req.dom_info)
             state.status[role] = "ONLINE"
             state.role_seen_at[role] = time.time()
 
-    if state.is_ignored_session(req.session_id):
-        return {"command": {"action": "WAIT"}, "config": state.config}
-
-    cmd = state.get_command_for_role(role)
-    with state.lock:
-        flow_status = dict(state.flow_statuses.get(str(role or "").strip().upper()) or {}) or None
-    return {"command": cmd, "config": state.config, "flow_status": flow_status}
+        flow_status = None if clear_role else (dict(state.flow_statuses.get(normalized_role) or {}) or None)
+    return {"command": cmd, "config": state.config, "flow_status": flow_status, "clear_role": clear_role}
 
 
 @app.post("/api/claim-role")
 def api_claim_role(req: RoleClaimRequest):
     role = state.claim_auto_open_role(req.session_id)
     return {"role": role, "config": state.config}
+
+
+@app.post("/api/reserve-role-claim")
+def api_reserve_role_claim(req: RoleClaimReservationRequest):
+    return {"role_claim_id": state.reserve_role_claim(req.role), "config": state.config}
+
+
+@app.post("/api/release-role")
+def api_release_role(req: RoleReleaseRequest):
+    role = str(req.role or "").strip().upper()
+    with state.lock:
+        owner = state.role_owners.get(role)
+        released = bool(owner and state.role_owner_matches(owner, req.role_owner_id, req.role_claim_id, req.page_instance_id))
+        if released:
+            state.role_owners.pop(role, None)
+    return {"released": released}
 
 
 @app.post("/api/report")
@@ -650,10 +840,3 @@ def run_server():
 
 if __name__ == "__main__":
     run_server()
-
-
-
-
-
-
-

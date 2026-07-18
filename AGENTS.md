@@ -20,7 +20,7 @@ For each logical role, inject only:
 4. the role skill listed below,
 5. the current goal/state/handoff from the caller.
 
-If a required prompt or skill file is missing, route to `MANAGER` with a loader error instead of guessing.
+If any required loader file is missing or empty, the runtime stops before browser dispatch with a structured `loader_error`. It must not guess, downgrade to goal-only mode, or recursively route to `MANAGER`.
 
 ## Role Loader Map
 
@@ -72,7 +72,7 @@ Only `MANAGER` may return multiple route keys.
 
 Parallel tasks must be independent. Every parallel message must explicitly say that the role should report back to `MANAGER`.
 
-The orchestrator must wait for all called roles before continuing.
+The orchestrator must wait for all called roles before continuing. Composer submission is fail-closed: exact prompt ownership, zero real attachments, and an explicitly enabled send button are checked immediately before each click. The userscript performs one click per command; Python may issue at most one additional CLICK_SEND command when the exact owned prompt remains, for a total retry budget of two submit attempts.
 
 Example:
 
@@ -104,7 +104,7 @@ A role requests reset/new-chat by including both:
 1. a `HANDOFF:` section in the response,
 2. `"command":"handoff"` in the final route JSON.
 
-The runtime treats this as a request. Default policy is conditional, not absolute: reset happens only when `HANDOFF:` exists and the configured thresholds allow it.
+The runtime treats this as a request. Default policy is conditional, not absolute: reset happens only when `HANDOFF:` exists and the configured thresholds allow it. A reset is complete only after NEW_CHAT navigation is acknowledged, the tab reloads with a new page-instance generation, reclaims the physical role, and exposes a clean composer at `/`; the physical-role lock remains held through that terminal readiness check.
 
 Example:
 

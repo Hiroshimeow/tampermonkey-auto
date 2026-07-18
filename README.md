@@ -83,9 +83,9 @@ Use `--resume` only when the current browser tab already has a response you want
 uv run python main.py --role DEV,REVIEW,PLAN --resume --goal "your task here"
 ```
 
-`--resume` reads the existing browser response only on the first dispatched turn. Later turns do not reuse old responses.
+`--resume` considers the existing browser response only on the first dispatched turn. The last user prompt must contain exactly one provenance marker with the exact key set and types for the current logical role, allowed-role configuration, finish authority, route-mode version, and goal hash. Duplicate, extra-field, malformed, missing, or mismatched provenance causes the old response to be ignored and a current full loader prompt to be sent instead.
 
-If manager mode is active and the resumed route JSON does not route to `MANAGER`, the runner sends a repair prompt asking the role to route to `MANAGER`.
+A compatible but invalid resumed route gets exactly one thin repair prompt on the same role. A second invalid route stops with `stopped_invalid_route`; it is not redirected to `MANAGER` or another fallback role. `--resume --preflight` uses non-destructive `PROBE` checks only.
 
 ## Route JSON Contract
 
@@ -257,9 +257,9 @@ prompts/DEV.txt
 prompts/REVIEW.txt
 ```
 
-Custom roles may use exact prompt files such as `prompts/DEV2.txt`. If no exact prompt exists, the runner may fall back to a known role type such as `DEV`, depending on the role name.
+Custom roles may use exact prompt and skill files such as `prompts/DEV2.txt` and `skills/DEV2.md`. If no exact files exist, the runtime may resolve both from a known role type such as `DEV`, depending on the role name.
 
-If no prompt is available for a role, the runner still works in goal-only mode, but the role must be given self-contained instructions.
+Route mode is fail-closed. Every configured logical role must resolve all required loader inputs: `AGENTS.md`, `prompts/HANDOFF.md`, a role prompt, and a role skill. Missing or empty loader files return a structured `loader_error` before browser dispatch; there is no goal-only downgrade.
 
 ## Advanced Overrides
 
@@ -285,6 +285,10 @@ uv run python main.py `
   --finish-roles REVIEW `
   --goal "your task here"
 ```
+
+The logical-to-physical binding is resolved once at startup. Logical roles sharing one physical tab are serialized, including prompt/send/response transactions and reset/reload operations. This prevents concurrent mutation of the tab, but it does not create separate browser chat histories for those logical roles. A NEW_CHAT reset holds the physical lock until navigation is acknowledged, the page-instance generation changes, the role re-registers, and a clean empty composer is confirmed at `/`; only then are bootstrap state and phase advanced. Preflight targets every resolved physical role, including values that appear only in `--role-map`, and stops on command failure or `done=false`.
+
+Composer sending requires exact normalized prompt ownership, zero real attachments, composer presence, and `send_enabled=true` immediately before the click. The userscript performs one click per `CLICK_SEND` command and has no hidden `requestSubmit` fallback; Python may retry the command once only when the exact owned prompt remains, so the total submit budget is two attempts.
 
 ## Verification
 

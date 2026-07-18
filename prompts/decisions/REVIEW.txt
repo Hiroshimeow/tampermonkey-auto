@@ -1,4 +1,4 @@
 [DECISION: REVIEW]
-Use REVIEW when DEV has produced work that needs engineering judgment.
-Use REVIEW for correctness, architecture, maintainability, UX, security, edge cases, product fit, and evidence quality.
-Do not use REVIEW while the required implementation is still missing.
+Use REVIEW when the active caller flow requires engineering judgment on implemented work.
+Use REVIEW for correctness, architecture, regression risk, failure paths, security, maintainability, and evidence quality.
+A REVIEW pass does not override remaining roles required by the active caller flow.

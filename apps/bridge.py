@@ -105,8 +105,9 @@ class BridgeClient:
         self.set_prompt(browser_role, prompt, timeout_s)
         return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt, baseline=baseline)
 
-    @staticmethod
-    def ensure_role_online(browser_role: str, snapshot: dict[str, Any]) -> None:
+    @classmethod
+    def ensure_role_online(cls, browser_role: str, snapshot: dict[str, Any]) -> None:
+        snapshot = cls._mapping(snapshot, "snapshot")
         status = str(snapshot.get("status") or "").upper()
         if snapshot.get("online") is False or status == "OFFLINE":
             age = snapshot.get("last_seen_age_s")
@@ -393,6 +394,27 @@ class BridgeClient:
         time.sleep(seconds)
 
     @staticmethod
+    def _mapping(value: Any, field: str) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        return value
+
+    @classmethod
+    def _mapping_field(cls, parent: dict[str, Any], field: str, parent_name: str) -> dict[str, Any]:
+        if field not in parent:
+            return {}
+        return cls._mapping(parent[field], f"{parent_name}.{field}")
+
+    @staticmethod
+    def _list_field(parent: dict[str, Any], field: str, parent_name: str) -> list[Any]:
+        if field not in parent:
+            return []
+        value = parent[field]
+        if not isinstance(value, list):
+            raise ValueError(f"{parent_name}.{field} must be a list")
+        return value
+
+    @staticmethod
     def _int_value(value: Any, default: int = 0) -> int:
         try:
             return int(value or default)
@@ -431,16 +453,17 @@ class BridgeClient:
 
     @classmethod
     def response_activity(cls, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
-        dom_info = snapshot.get("dom_info") or {}
-        messages = dom_info.get("messages") or {}
-        counts = messages.get("counts") or {}
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
+        messages = cls._mapping_field(dom_info, "messages", "snapshot.dom_info")
+        counts = cls._mapping_field(messages, "counts", "snapshot.dom_info.messages")
         last_user = messages.get("last_user") or {}
         last_user_text = str(last_user.get("text") or "") if isinstance(last_user, dict) else ""
         response = str(snapshot.get("last_response") or "").strip()
         composer_text = str(dom_info.get("composer_text") or "")
         composer_text_len = cls._int_value(dom_info.get("composer_text_len"), len(composer_text))
-        attachments = dom_info.get("composer_attachments") or []
-        choice_candidates = dom_info.get("choice_prompt_candidates") or []
+        attachments = cls._list_field(dom_info, "composer_attachments", "snapshot.dom_info")
+        choice_candidates = cls._list_field(dom_info, "choice_prompt_candidates", "snapshot.dom_info")
         choice_labels = tuple(
             label
             for label in (
@@ -501,14 +524,16 @@ class BridgeClient:
         value = str(text or "").strip()
         if not value:
             return True
-        if value.count("```") % 2 == 1:
-            return True
-        without_language_label = re.sub(r"(?is)^json\s*", "", value).strip()
+        without_language_label = re.sub(r"(?is)^json\b\s*", "", value, count=1).strip()
         if not without_language_label:
             return True
-        if re.match(r"(?is)^(?:json\s*)?\{\s*$", value):
+        if without_language_label.count("```") % 2 == 1:
             return True
-        if without_language_label.startswith("{") or re.search(r"(?is)```json", value):
+        if re.fullmatch(r"(?is)```\s*(?:json)?\s*```", without_language_label):
+            return True
+        if re.match(r"(?is)^\{\s*$", without_language_label):
+            return True
+        if without_language_label.startswith("{") or re.search(r"(?is)```\s*json", without_language_label):
             depth = 0
             in_string = False
             escape = False
@@ -745,21 +770,24 @@ class BridgeClient:
             require_fresh=require_fresh,
         )
 
-    @staticmethod
-    def _snapshot_page_generation(snapshot: dict[str, Any]) -> str:
-        dom_info = snapshot.get("dom_info") or {}
+    @classmethod
+    def _snapshot_page_generation(cls, snapshot: dict[str, Any]) -> str:
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
         return str(dom_info.get("page_instance_id") or "")
 
-    @staticmethod
-    def _snapshot_page_path(snapshot: dict[str, Any]) -> str:
-        dom_info = snapshot.get("dom_info") or {}
+    @classmethod
+    def _snapshot_page_path(cls, snapshot: dict[str, Any]) -> str:
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
         return str(dom_info.get("page_path") or "")
 
     @classmethod
     def is_clean_new_chat_snapshot(cls, snapshot: dict[str, Any], previous_generation: str) -> bool:
-        dom_info = snapshot.get("dom_info") or {}
-        messages = dom_info.get("messages") or {}
-        counts = messages.get("counts") or {}
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
+        messages = cls._mapping_field(dom_info, "messages", "snapshot.dom_info")
+        counts = cls._mapping_field(messages, "counts", "snapshot.dom_info.messages")
         generation = cls._snapshot_page_generation(snapshot)
         path = cls._snapshot_page_path(snapshot)
         activity = cls.response_activity(snapshot)

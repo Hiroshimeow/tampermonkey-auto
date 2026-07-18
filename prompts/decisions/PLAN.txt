@@ -1,4 +1,4 @@
 [DECISION: PLAN]
-Use PLAN when the task is broad, conflicting, looping, or needs decomposition before implementation.
-Use PLAN after REVIEW accepts one step but the larger goal needs another.
-Do not use PLAN for straightforward fixes DEV can make now.
+Use PLAN when the active caller flow requires planning, decomposition, blocker incorporation, or revised implementation instructions.
+Respect the role order and planning requirements defined by the active caller flow.
+Do not use PLAN to implement or approve work.

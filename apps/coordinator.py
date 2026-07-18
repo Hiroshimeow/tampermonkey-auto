@@ -110,30 +110,29 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         start_physical = self.pick_browser_role(self.start_role)
         updates[start_physical] = {
             "state": "RUNNING",
-            "detail_label": "From",
-            "detail_role": "User",
+            "from_role": "User",
         }
         self.publish_flow_statuses(updates)
 
-    def publish_flow_route(self, source_role: str, target_roles: list[str]) -> None:
+    def publish_flow_route(self, source_role: str, target_roles: list[str], *, caller_role: str) -> None:
         if not self.flow_status_active or not target_roles:
             return
         source = normalize_role(source_role)
         targets = [normalize_role(role) for role in target_roles if normalize_role(role)]
         if not source or not targets:
             return
+        caller = "User" if str(caller_role).strip().upper() == "USER" else normalize_role(caller_role)
         updates: dict[str, dict[str, Any] | None] = {
             self.pick_browser_role(source): {
                 "state": "DONE",
-                "detail_label": "From",
-                "detail_role": source,
+                "done_from": caller or "User",
+                "sent_to": ", ".join(targets),
             }
         }
         for target in targets:
             updates[self.pick_browser_role(target)] = {
                 "state": "RUNNING",
-                "detail_label": "From",
-                "detail_role": source,
+                "from_role": source,
             }
         self.publish_flow_statuses(updates)
 
@@ -147,15 +146,14 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         updates: dict[str, dict[str, Any] | None] = {
             self.pick_browser_role(source): {
                 "state": "DONE",
-                "detail_label": "From",
-                "detail_role": source,
+                "done_from": target,
+                "sent_to": target,
             }
             for source in sources
         }
         updates[self.pick_browser_role(target)] = {
             "state": "RUNNING",
-            "detail_label": "From",
-            "detail_role": ", ".join(sources),
+            "from_role": ", ".join(sources),
         }
         self.publish_flow_statuses(updates)
 

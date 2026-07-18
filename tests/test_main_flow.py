@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import replace
@@ -215,7 +216,7 @@ def test_flow_ui_initial_turn_marks_start_running_and_all_other_members_waiting(
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
+        "TEST1": {"state": "RUNNING", "from_role": "User"},
         "TEST2": {"state": "WAITING"},
         "TEST3": {"state": "WAITING"},
     }
@@ -226,12 +227,12 @@ def test_flow_ui_route_marks_only_actual_source_and_target_without_predicting_c(
     coordinator, client = flow_ui_coordinator()
     coordinator.begin_flow_status()
 
-    coordinator.publish_flow_route("A", ["B"])
+    coordinator.publish_flow_route("A", ["B"], caller_role="User")
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST1": {"state": "DONE", "detail_label": "From", "detail_role": "A"},
-        "TEST2": {"state": "RUNNING", "detail_label": "From", "detail_role": "A"},
+        "TEST1": {"state": "DONE", "done_from": "User", "sent_to": "B"},
+        "TEST2": {"state": "RUNNING", "from_role": "A"},
     }
     assert "TEST3" not in updates
 
@@ -240,12 +241,12 @@ def test_flow_ui_repeated_debate_updates_the_real_direction() -> None:
     coordinator, client = flow_ui_coordinator()
     coordinator.begin_flow_status()
 
-    coordinator.publish_flow_route("B", ["A"])
+    coordinator.publish_flow_route("B", ["A"], caller_role="A")
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST2": {"state": "DONE", "detail_label": "From", "detail_role": "B"},
-        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "B"},
+        "TEST2": {"state": "DONE", "done_from": "A", "sent_to": "A"},
+        "TEST1": {"state": "RUNNING", "from_role": "B"},
     }
 
 
@@ -270,22 +271,22 @@ def test_flow_ui_diagnostic_parse_failure_never_breaks_core_flow() -> None:
     coordinator.client = BrokenDiagnosticClient()  # type: ignore[assignment]
 
     coordinator.begin_flow_status()
-    coordinator.publish_flow_route("A", ["B"])
+    coordinator.publish_flow_route("A", ["B"], caller_role="User")
     coordinator.clear_flow_status()
 
 
 def test_flow_ui_parallel_fan_in_marks_children_waiting_and_parent_running() -> None:
     coordinator, client = flow_ui_coordinator()
     coordinator.begin_flow_status()
-    coordinator.publish_flow_route("A", ["B", "C"])
+    coordinator.publish_flow_route("A", ["B", "C"], caller_role="User")
 
     coordinator.publish_flow_fan_in("A", ["B", "C"])
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST2": {"state": "DONE", "detail_label": "From", "detail_role": "B"},
-        "TEST3": {"state": "DONE", "detail_label": "From", "detail_role": "C"},
-        "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "B, C"},
+        "TEST2": {"state": "DONE", "done_from": "A", "sent_to": "A"},
+        "TEST3": {"state": "DONE", "done_from": "A", "sent_to": "A"},
+        "TEST1": {"state": "RUNNING", "from_role": "B, C"},
     }
 
 
@@ -388,6 +389,48 @@ def test_bridge_flow_status_publisher_uses_one_scoped_backend_request(monkeypatc
             },
         )
     ]
+
+
+@pytest.mark.parametrize("role", ["REVIEW", "FINISH"])
+@pytest.mark.parametrize("value", [None, False, True, 0, 1.5, ["check"], {"evidence": "x"}, "", "   "])
+def test_route_value_must_be_a_non_empty_json_string(role: str, value: Any) -> None:
+    route = parse_route(json.dumps({role: value}))
+
+    assert not route.ok
+    assert f"{role}" in route.error
+    assert "string" in route.error or "empty" in route.error
+
+
+def test_route_command_value_must_be_a_json_string() -> None:
+    route = parse_route('{"REVIEW":"check","command":false}')
+
+    assert not route.ok
+    assert "command" in route.error
+    assert "string" in route.error
+
+
+def test_valid_string_route_and_finish_remain_accepted() -> None:
+    assert parse_route('{"REVIEW":"check"}').targets == {"REVIEW": "check"}
+    assert parse_route('{"FINISH":"done"}').targets == {"FINISH": "done"}
+
+
+def test_non_string_route_after_repair_stops_as_invalid_route() -> None:
+    coordinator = Coordinator(make_args())
+    coordinator.resync_invalid_route = lambda _role, response: response
+    calls: list[bool] = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, prompt, instruction
+        calls.append(repair)
+        return '{"REVIEW":["not a string"]}'
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "stopped_invalid_route"
+    assert calls == [False, True]
+    assert "string" in result["last_route_error"]
 
 
 def test_thin_repair_omits_full_loader_goal_and_state() -> None:
@@ -494,6 +537,26 @@ def test_goal_only_plain_response_requires_valid_finish_json_before_completion()
     assert "ROUTE_REPAIR_REQUIRED:" in calls[1][1]
 
 
+def test_goal_only_plain_response_after_repair_stops_as_invalid_route() -> None:
+    args = parse_args(["--role", "TEST1", "--goal", "say ok", "--reload-after", "0"])
+    coordinator = Coordinator(args)
+    coordinator.resync_invalid_route = lambda _role, response: response
+    calls: list[bool] = []
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, prompt, instruction
+        calls.append(repair)
+        return "still plain prose"
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("say ok")
+
+    assert result["status"] == "stopped_invalid_route"
+    assert result["last_response"] == "still plain prose"
+    assert calls == [False, True]
+
+
 def test_unknown_target_gets_one_same_role_repair_and_valid_repair_continues() -> None:
     coordinator = Coordinator(make_args("--max-turns", "2"))
     coordinator.resync_invalid_route = lambda _role, response: response
@@ -581,6 +644,60 @@ def test_invalid_route_reads_latest_snapshot_after_nonterminal_sync() -> None:
 
     assert client.snapshot_calls == 1
     assert coordinator.validate_route("DEV", parse_route(refreshed)).ok
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        [],
+        None,
+        "bad",
+        7,
+        {"dom_info": []},
+        {"dom_info": {"messages": []}},
+        {"dom_info": {"messages": {"counts": []}}},
+        {"dom_info": {"composer_attachments": {}}},
+        {"dom_info": {"choice_prompt_candidates": "bad"}},
+    ],
+)
+def test_response_activity_rejects_malformed_snapshot_shapes(snapshot: Any) -> None:
+    with pytest.raises(ValueError, match="snapshot|dom_info|messages|counts|composer_attachments|choice_prompt_candidates"):
+        BridgeClient.response_activity(snapshot)
+
+
+def test_malformed_snapshot_resync_retains_original_and_reaches_structured_stop() -> None:
+    coordinator = Coordinator(make_args())
+    calls: list[bool] = []
+
+    class MalformedSnapshotClient:
+        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+            del run_id, updates
+            return {"status": "OK"}
+
+        def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
+            del role, action, timeout_s
+            return {"done": True, "status": "TRANSCRIPT_SAVED"}
+
+        def role_snapshot(self, role: str) -> Any:
+            del role
+            return []
+
+        response_activity = staticmethod(BridgeClient.response_activity)
+
+    coordinator.client = MalformedSnapshotClient()  # type: ignore[assignment]
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del prompt_role, browser_role, prompt, instruction
+        calls.append(repair)
+        return "plain invalid"
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "stopped_invalid_route"
+    assert result["last_response"] == "plain invalid"
+    assert calls == [False, True]
 
 
 @pytest.mark.parametrize("failure_stage", ["sync", "snapshot"])
@@ -1156,6 +1273,13 @@ def test_bare_json_completion_waits_for_hydrated_route_response() -> None:
     response = bridge.wait_assistant_done("REVIEW", timeout_s=1.0)
 
     assert BridgeClient.looks_incomplete_response("JSON")
+    assert BridgeClient.looks_incomplete_response("```json\n```")
+    assert BridgeClient.looks_incomplete_response("```\n```")
+    assert BridgeClient.looks_incomplete_response("JSON\n```json\n```")
+    assert BridgeClient.looks_incomplete_response("json\n```\n```")
+    assert BridgeClient.looks_incomplete_response("``` json\n   \n```")
+    assert not BridgeClient.looks_incomplete_response('```json\n{"PLAN":"continue"}\n```')
+    assert not BridgeClient.looks_incomplete_response('{"PLAN":"continue"}')
     assert response == complete_route
 
 

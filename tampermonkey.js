@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAuto Diagnostic Bridge Standalone
 // @namespace    http://tampermonkey.net/
-// @version      1.0.2
+// @version      1.0.4
 // @description  Standalone MAuto bridge without unsafe-eval or hot reload.
 // @match        https://chatgpt.com/*
 // @match        https://*.chatgpt.com/*
@@ -15,8 +15,16 @@
     'use strict';
 
     const SERVER_URL = 'http://127.0.0.1:8500';
-    const BRIDGE_VERSION = 'standalone-1.0.2';
+    const BRIDGE_VERSION = 'standalone-1.0.4';
     const PAGE_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const ROLE_OWNER_ID = sessionStorage.getItem('mauto_role_owner_id') || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    sessionStorage.setItem('mauto_role_owner_id', ROLE_OWNER_ID);
+    function roleClaimKey(role) { return `mauto_role_claim_id:${String(role || '').trim().toUpperCase()}`; }
+    function roleClaimId(role = nextRole()) { return sessionStorage.getItem(roleClaimKey(role)) || ''; }
+    function beginRoleClaim(role, claimId) { sessionStorage.setItem(roleClaimKey(role), claimId); return claimId; }
+    let roleClaimPending = false;
+    let roleAssignmentGeneration = 0;
+    let roleAssignmentIntentGeneration = 0;
 
     const DEFAULT_CONFIG = {
         poll_ms: 800,
@@ -29,6 +37,7 @@
         composer_stable_samples: 6,
         composer_stable_sample_ms: 300,
         composer_watchdog_ms: 60000,
+        composer_watchdog_poll_ms: 20000,
         assistant_quiet_ms: 2500,
         report_wait_every_ms: 1500,
         max_button_dump: 80,
@@ -50,6 +59,7 @@
     let config = { ...DEFAULT_CONFIG };
     let activeCommandId = '';
     let activeCommandAction = '';
+    let activeCommandRole = '';
     let lastSyncHash = '';
     let lastAcceptedTurnContext = null;
     let flowStatus = null;
@@ -79,9 +89,13 @@
     }
 
     function clearRole() {
+        const previousRole = nextRole();
+        roleAssignmentGeneration += 1;
         sessionStorage.removeItem('chatgpt_agent_role');
+        sessionStorage.removeItem(roleClaimKey(previousRole));
         localStorage.removeItem('chatgpt_agent_role');
         flowStatus = null;
+        roleClaimPending = false;
         return '';
     }
 
@@ -91,9 +105,65 @@
             return clearRole();
         }
         flowStatus = null;
+        const alreadyAssigned = nextRole() === normalized && !!roleClaimId(normalized);
+        if (!alreadyAssigned && !roleClaimId(normalized)) return '';
+        roleClaimPending = !alreadyAssigned;
+        if (!alreadyAssigned) roleAssignmentGeneration += 1;
         sessionStorage.setItem('chatgpt_agent_role', normalized);
         localStorage.removeItem('chatgpt_agent_role');
         return normalized;
+    }
+
+    async function assignRole(role) {
+        const normalized = String(role || '').trim().toUpperCase();
+        const intentGeneration = ++roleAssignmentIntentGeneration;
+        if (!normalized || normalized === 'NONE') return setRole(normalized);
+        if (nextRole() === normalized && roleClaimId(normalized)) return setRole(normalized);
+        let reservation;
+        try {
+            reservation = await request('POST', `${SERVER_URL}/api/reserve-role-claim`, { role: normalized });
+        } catch (error) {
+            console.warn('[MAuto Bridge] role claim reservation failed', error);
+            return '';
+        }
+        if (intentGeneration !== roleAssignmentIntentGeneration) return '';
+        updateConfig(reservation);
+        const claimId = String(reservation && reservation.role_claim_id || '');
+        if (!claimId) return '';
+        beginRoleClaim(normalized, claimId);
+        return setRole(normalized);
+    }
+
+    function releaseRoleClaim(role) {
+        const normalized = String(role || '').trim().toUpperCase();
+        if (!normalized || normalized === 'NONE') return Promise.resolve(null);
+        return request('POST', `${SERVER_URL}/api/release-role`, {
+            role: normalized,
+            session_id: window.location.pathname || '',
+            page_instance_id: PAGE_INSTANCE_ID,
+            role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+            role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(normalized) : ''
+        });
+    }
+
+    async function handleClearRole() {
+        const role = nextRole();
+        await releaseRoleClaim(role).catch(() => {});
+        await assignRole('None');
+        updateUI();
+    }
+
+    async function handleManualSetRole() {
+        const current = nextRole();
+        const value = prompt('Role:', current === 'NONE' ? '' : current);
+        if (value === null) return;
+        const normalized = value.trim().toUpperCase() || 'None';
+        const assigned = await assignRole(normalized);
+        if (assigned) {
+            if (current !== 'NONE' && current !== normalized) releaseRoleClaim(current).catch(() => {});
+            updateUI();
+            scheduleSync('role_changed');
+        }
     }
 
     function cleanNavigationUrl(targetPath = '') {
@@ -131,7 +201,7 @@
         }, 500);
     }
 
-    window.addEventListener('message', (event) => {
+    async function handleRoleAssignmentMessage(event) {
         if (event.origin !== window.location.origin) {
             return;
         }
@@ -139,12 +209,17 @@
         if (!data || data.type !== 'MAUTO_SET_ROLE') {
             return;
         }
-        const assignedRole = setRole(data.role);
+        const previousRole = nextRole();
+        const targetRole = String(data.role || '').trim().toUpperCase();
+        const assignedRole = await assignRole(data.role);
+        if (previousRole !== 'NONE' && previousRole !== targetRole && assignedRole) releaseRoleClaim(previousRole).catch(() => {});
         if (assignedRole) {
             updateUI();
             schedulePoll();
         }
-    });
+    }
+
+    window.addEventListener('message', handleRoleAssignmentMessage);
 
     function isVisible(el) {
         if (!el) {
@@ -1086,6 +1161,8 @@
         return {
             bridge_version: BRIDGE_VERSION,
             page_instance_id: PAGE_INSTANCE_ID,
+            role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+            role_claim_id: typeof roleClaimId === 'function' ? roleClaimId() : '',
             page_path: window.location.pathname || '',
             page_href: window.location.href,
             composer: !!composer,
@@ -1172,18 +1249,21 @@
         if (!value) {
             return true;
         }
-        const fenceCount = (value.match(/```/g) || []).length;
-        if (fenceCount % 2 === 1) {
-            return true;
-        }
-        const withoutLanguageLabel = value.replace(/^json\s*/i, '').trim();
+        const withoutLanguageLabel = value.replace(/^json\b\s*/i, '').trim();
         if (!withoutLanguageLabel) {
             return true;
         }
-        if (/^(?:json\s*)?\{\s*$/i.test(value)) {
+        const fenceCount = (withoutLanguageLabel.match(/```/g) || []).length;
+        if (fenceCount % 2 === 1) {
             return true;
         }
-        if ((withoutLanguageLabel.startsWith('{') || /```json/i.test(value)) && jsonBraceDepth(withoutLanguageLabel) > 0) {
+        if (/^```\s*(?:json)?\s*```$/i.test(withoutLanguageLabel)) {
+            return true;
+        }
+        if (/^\{\s*$/i.test(withoutLanguageLabel)) {
+            return true;
+        }
+        if ((withoutLanguageLabel.startsWith('{') || /```\s*json/i.test(withoutLanguageLabel)) && jsonBraceDepth(withoutLanguageLabel) > 0) {
             return true;
         }
         return false;
@@ -1268,20 +1348,30 @@
         });
         updateConfig(response);
         const claimedRole = String((response && response.role) || '').trim().toUpperCase();
-        return claimedRole ? setRole(claimedRole) : 'NONE';
+        return claimedRole ? await assignRole(claimedRole) : 'NONE';
+    }
+
+    function requestRole(commandId = '') {
+        if (activeCommandRole && (!commandId || commandId === activeCommandId)) {
+            return activeCommandRole;
+        }
+        return nextRole();
     }
 
     async function report(state, commandId, extra = {}) {
         if (stopped) {
             return null;
         }
-        const role = nextRole();
+        const role = requestRole(commandId);
         if (role === 'NONE') {
             return null;
         }
         const payload = {
             role,
             session_id: window.location.pathname || '',
+            page_instance_id: PAGE_INSTANCE_ID,
+            role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+            role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
             command_id: commandId || '',
             state,
             text: extra.text || '',
@@ -1297,7 +1387,7 @@
         if (stopped) {
             return null;
         }
-        const role = nextRole();
+        const role = requestRole();
         if (role === 'NONE') {
             return null;
         }
@@ -1311,6 +1401,9 @@
         const response = await request('POST', `${SERVER_URL}/api/sync`, {
             role,
             session_id: window.location.pathname || '',
+            page_instance_id: PAGE_INSTANCE_ID,
+            role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+            role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
             reason,
             transcript,
             snapshot
@@ -1835,6 +1928,11 @@
         let lastStopVisible = currentSnapshot.stop_visible;
         let quietSince = Date.now();
         let postStopSince = currentSnapshot.stop_visible ? 0 : Date.now();
+        const heartbeatEveryMs = Math.min(
+            5000,
+            Math.max(1000, Number(config.report_wait_every_ms) || 1500)
+        );
+        let lastActivityAt = Date.now();
 
         while (!stopped) {
             const snapshot = domSnapshot();
@@ -1877,6 +1975,26 @@
                     },
                     dom_info: snapshot
                 });
+                lastActivityAt = Date.now();
+            }
+
+            if (Date.now() - lastActivityAt >= heartbeatEveryMs) {
+                try {
+                    await report('ASSISTANT_PROGRESS', command.command_id, {
+                        text: assistantText,
+                        result: {
+                            heartbeat: true,
+                            assistant_len: assistantText.length,
+                            assistant_count: assistantCount,
+                            stop_visible: snapshot.stop_visible
+                        },
+                        dom_info: snapshot
+                    });
+                } catch (error) {
+                    console.warn('[MAuto Bridge] heartbeat report failed', error);
+                } finally {
+                    lastActivityAt = Date.now();
+                }
             }
 
             if (!snapshot.stop_visible && !postStopSince) {
@@ -1884,7 +2002,7 @@
             }
 
             if (snapshot.stop_visible) {
-                await sleep(config.report_wait_every_ms);
+                await sleep(heartbeatEveryMs);
                 continue;
             }
 
@@ -1899,12 +2017,14 @@
                     },
                     dom_info: snapshot
                 });
-                await sleep(config.report_wait_every_ms);
+                lastActivityAt = Date.now();
+                await sleep(heartbeatEveryMs);
                 continue;
             }
 
             if (Date.now() - quietSince >= config.assistant_quiet_ms && hasFreshAssistantOutput) {
                 const synced = await syncTranscript('wait_assistant_done');
+                lastActivityAt = Date.now();
                 const finalSnapshot = synced ? synced.snapshot : snapshot;
                 const finalText = synced && synced.transcript.last_assistant ? synced.transcript.last_assistant.text : assistantText;
                 const finalAssistantCount = (finalSnapshot.messages.counts.assistant || 0);
@@ -1931,6 +2051,7 @@
 
             if (Date.now() - quietSince >= config.assistant_force_sync_quiet_ms && hasFreshAssistantOutput) {
                 const synced = await syncTranscript('wait_assistant_done_force_sync');
+                lastActivityAt = Date.now();
                 const finalSnapshot = synced ? synced.snapshot : snapshot;
                 const finalText = synced && synced.transcript.last_assistant ? synced.transcript.last_assistant.text : assistantText;
                 const finalAssistantCount = finalSnapshot.messages.counts.assistant || 0;
@@ -1975,7 +2096,7 @@
                 return;
             }
 
-            await sleep(config.report_wait_every_ms);
+            await sleep(heartbeatEveryMs);
         }
     }
 
@@ -2046,7 +2167,14 @@
         }
 
         const previousRole = nextRole();
-        const assignedRole = setRole(targetRole);
+        const assignedRole = await assignRole(targetRole);
+        if (!assignedRole) {
+            await report('ROLE_TAKEOVER_FAILED', command.command_id, {
+                result: { reason: 'claim_reservation_failed', role: targetRole },
+                dom_info: snapshot
+            });
+            return;
+        }
         const targetPath = payload.new_chat ? '/' : String(payload.path || window.location.href || '/');
         const targetUrl = cleanNavigationUrl(targetPath);
         const reload = shouldReload || payload.reload === true || payload.navigate === true || payload.new_chat === true;
@@ -2061,6 +2189,20 @@
             },
             dom_info: snapshot
         });
+        if (previousRole && previousRole !== 'NONE' && previousRole !== assignedRole) {
+            try {
+                await request('POST', `${SERVER_URL}/api/release-role`, {
+                    role: previousRole,
+                    session_id: window.location.pathname || '',
+                    page_instance_id: PAGE_INSTANCE_ID,
+                    role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+                    role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(previousRole) : ''
+                });
+                sessionStorage.removeItem(roleClaimKey(previousRole));
+            } catch (error) {
+                console.warn('[MAuto Bridge] old role release failed', error);
+            }
+        }
 
         if (reload) {
             setTimeout(() => {
@@ -2241,21 +2383,40 @@
         }
 
         try {
+            const requestRole = role;
+            const requestGeneration = typeof roleAssignmentGeneration !== 'undefined' ? roleAssignmentGeneration : 0;
             const response = await request('POST', `${SERVER_URL}/api/status`, {
                 role,
                 session_id: window.location.pathname || '',
+                page_instance_id: PAGE_INSTANCE_ID,
+                role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+                role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
+                claim_role: typeof roleClaimPending !== 'undefined' && roleClaimPending,
                 dom_info: domSnapshot()
             });
+            if ((typeof roleAssignmentGeneration !== 'undefined' && requestGeneration !== roleAssignmentGeneration) || nextRole() !== requestRole) {
+                return;
+            }
+            if (typeof roleClaimPending !== 'undefined') {
+                roleClaimPending = false;
+            }
             updateConfig(response);
+            if (response && response.clear_role) {
+                clearRole();
+                updateUI();
+                return;
+            }
             flowStatus = response.flow_status || null;
             updateUI();
             if (response && response.command) {
                 const command = response.command;
                 if (command.command_id && command.command_id !== activeCommandId) {
+                    activeCommandRole = role;
                     activeCommandAction = String(command.action || 'WAIT').toUpperCase();
                     try {
                         await executeCommand(command);
                     } finally {
+                        activeCommandRole = '';
                         activeCommandAction = '';
                     }
                 }
@@ -2270,6 +2431,9 @@
     function schedulePoll() {
         if (stopped) {
             return;
+        }
+        if (pollTimer) {
+            clearTimeout(pollTimer);
         }
         pollTimer = setTimeout(() => {
             pollTimer = null;
@@ -2295,11 +2459,16 @@
             '"': '&quot;',
             "'": '&#39;'
         })[char]);
-        const label = String(status.detail_label || '').trim();
-        const detailRole = String(status.detail_role || '').trim();
-        const detail = (label === 'From' || label === 'Routed') && detailRole
-            ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">${escapeText(label)}: ${escapeText(detailRole)}</div>`
-            : '';
+        const fromRole = String(status.from_role || '').trim();
+        const doneFrom = String(status.done_from || '').trim();
+        const sentTo = String(status.sent_to || '').trim();
+        const detail = state === 'RUNNING' && fromRole
+            ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">From: ${escapeText(fromRole)}</div>`
+            : state === 'DONE' && doneFrom
+                ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">Done From: ${escapeText(doneFrom)}</div>${sentTo ? `<div id="mauto-flow-sent" style="font-size:8px;line-height:1.05;color:#9adfbe;">Sent to: ${escapeText(sentTo)}</div>` : ''}`
+                : state === 'WAITING' && sentTo
+                    ? `<div id="mauto-flow-sent" style="font-size:8px;line-height:1.05;color:#9adfbe;margin-top:1px;">Sent to: ${escapeText(sentTo)}</div>`
+                    : '';
         return `<div id="mauto-flow-state" style="font-size:9px;font-weight:700;line-height:1.05;color:${color};margin-top:0;">${state}</div>${detail}`;
     }
 
@@ -2314,8 +2483,7 @@
         const flowMarkup = hasRole ? flowStatusMarkup(flowStatus) : '';
         const roleMargin = flowMarkup ? '1px' : '4px';
         uiContainer.innerHTML = hasRole ? `
-            <div style="color:#888;line-height:1.5;">Ver: ${ver}</div>
-            <div style="margin-bottom:${roleMargin};line-height:1.5;">Role: <span style="color:#10a37f;font-weight:bold;">${role}</span></div>
+            <div style="margin-bottom:${roleMargin};line-height:1.5;"><span style="color:#10a37f;font-weight:bold;">${role}</span> <span style="color:#888;">${ver}</span></div>
             ${flowMarkup}
             <button id="mauto-clear-role-btn" style="width:100%;padding:2px 0;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:10px;">Clear</button>
         ` : `
@@ -2328,23 +2496,11 @@
         const clearBtn = document.getElementById('mauto-clear-role-btn');
 
         if (setBtn) {
-            setBtn.onclick = () => {
-                const current = nextRole();
-                const value = prompt('Role:', current === 'NONE' ? '' : current);
-                if (value !== null) {
-                    const normalized = value.trim().toUpperCase() || 'None';
-                    setRole(normalized);
-                    updateUI();
-                    scheduleSync('role_changed');
-                }
-            };
+            setBtn.onclick = handleManualSetRole;
         }
 
         if (clearBtn) {
-            clearBtn.onclick = () => {
-                setRole('None');
-                updateUI();
-            };
+            clearBtn.onclick = handleClearRole;
         }
     }
 
@@ -2404,13 +2560,14 @@
         stopped = false;
         activeCommandId = '';
         activeCommandAction = '';
+        activeCommandRole = '';
         lastAcceptedTurnContext = null;
         composerWatchdogState = null;
         createUI();
         attachObserver();
         scheduleSync('start');
         schedulePoll();
-        composerWatchdogTimer = setInterval(checkComposerWatchdog, 1000);
+        composerWatchdogTimer = setInterval(checkComposerWatchdog, Math.max(1000, Number(config.composer_watchdog_poll_ms || 20000)));
         console.log('[MAuto Bridge] start', BRIDGE_VERSION);
     }
 
@@ -2418,6 +2575,7 @@
         stopped = true;
         activeCommandId = '';
         activeCommandAction = '';
+        activeCommandRole = '';
         lastAcceptedTurnContext = null;
         composerWatchdogState = null;
         if (pollTimer) {

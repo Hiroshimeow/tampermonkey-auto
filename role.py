@@ -28,6 +28,7 @@ UPLOADS_DIR = STATE_DIR / "uploads"
 LOGS_DIR = STATE_DIR / "logs"
 PROMPT_SPILL_THRESHOLD = 8000
 REQUEST_MARKER = "ROLE_REQUEST_ID"
+ROLE_CONTEXT_MARKER = "MAUTO_ROLE_CONTEXT_V1"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -288,10 +289,71 @@ def run_pre_send_actions(client: BridgeClient, role: str, *, restart: bool, new_
             client.wait_until_clean_ready(role, min(float(timeout_s), 30.0))
 
 def snapshot_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return []
     dom_info = snapshot.get("dom_info") or {}
+    if not isinstance(dom_info, dict):
+        return []
     messages_payload = dom_info.get("messages") or {}
+    if not isinstance(messages_payload, dict):
+        return []
     messages = messages_payload.get("messages") or []
     return messages if isinstance(messages, list) else []
+
+
+def make_role_context_marker(role: str, role_context_hash: str) -> str:
+    return f"{ROLE_CONTEXT_MARKER}: {normalize_role(role)}:{role_context_hash}"
+
+
+def snapshot_has_role_context(snapshot: dict[str, Any], marker: str) -> bool:
+    if not isinstance(snapshot, dict):
+        raise TypeError("role snapshot must be a mapping")
+    dom_info = snapshot.get("dom_info")
+    if not isinstance(dom_info, dict):
+        raise TypeError("snapshot dom_info must be a mapping")
+    messages_payload = dom_info.get("messages")
+    if not isinstance(messages_payload, dict):
+        raise TypeError("snapshot messages payload must be a mapping")
+    if not isinstance(messages_payload.get("messages"), list):
+        raise TypeError("snapshot messages must be a list")
+
+    marker_prefix = marker.rsplit(":", 1)[0] + ":"
+    latest_marker = ""
+    for item in snapshot_messages(snapshot):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        for raw_line in str(item.get("text") or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith(marker_prefix):
+                latest_marker = line
+    return latest_marker == marker
+
+
+def conversation_needs_role_context(
+    client: BridgeClient,
+    role: str,
+    marker: str,
+    timeout_s: float,
+) -> bool:
+    try:
+        result = client.command_roundtrip(
+            role,
+            "SYNC_TRANSCRIPT",
+            timeout_s=max(1.0, min(float(timeout_s), 20.0)),
+        )
+        if command_failed(result):
+            raise RuntimeError(f"transcript sync failed: {result}")
+        snapshot = client.role_snapshot(role)
+        return not snapshot_has_role_context(snapshot, marker)
+    except Exception as exc:
+        print(
+            f"[role-context] bootstrap check failed for {role}; sending full context: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
 
 
 def find_response_for_marker(snapshot: dict[str, Any], request_id: str) -> tuple[str, bool, bool]:
@@ -412,18 +474,25 @@ def fail_payload(*, exit_code: int, status: str, request_id: str, run_id: str, r
     return payload
 
 
-def maybe_spill_prompt(request_id: str, prompt: str, uploads: list[Path]) -> tuple[str, list[Path]]:
+def maybe_spill_prompt(
+    request_id: str,
+    prompt: str,
+    uploads: list[Path],
+    visible_markers: tuple[str, ...] = (),
+) -> tuple[str, list[Path]]:
     if len(prompt) <= PROMPT_SPILL_THRESHOLD:
         return prompt, uploads
     spill_dir = UPLOADS_DIR / request_id
     spill_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = spill_dir / "prompt.md"
     prompt_file.write_text(prompt, encoding="utf-8")
-    short_prompt = (
-        f"{REQUEST_MARKER}: {request_id}\n\n"
+    visible_lines = [f"{REQUEST_MARKER}: {request_id}"]
+    visible_lines.extend(marker.strip() for marker in visible_markers if marker.strip())
+    visible_lines.append(
         "Read attached prompt.md and any other attached files. "
         "Follow the role instructions inside prompt.md and return the requested result directly."
     )
+    short_prompt = "\n\n".join(visible_lines)
     return short_prompt, [prompt_file, *uploads]
 
 
@@ -459,7 +528,11 @@ def publish_role_flow_status(
     update = getattr(client, "update_flow_statuses", None)
     if not callable(update):
         return False
-    updates = {role: {"state": "RUNNING"} if running else None}
+    updates = {
+        role: {"state": "RUNNING", "from_role": "USER"}
+        if running
+        else {"state": "DONE", "done_from": "USER"}
+    }
     try:
         update(run_id, updates)
     except Exception as exc:
@@ -559,15 +632,33 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError(f"{role} ledger says request {request_id} was sent, but marker was not found after recovery grace; retry later or use --new-request")
 
             run_pre_send_actions(client, role, restart=args.restart, new_chat=args.new_chat, timeout_s=args.timeout)
+            has_role_context = bool(context_rendered.files)
+            context_marker = make_role_context_marker(role, role_context_hash) if has_role_context else ""
+            include_role_context = False
+            if has_role_context:
+                include_role_context = bool(args.new_chat) or conversation_needs_role_context(
+                    client,
+                    role,
+                    context_marker,
+                    args.timeout,
+                )
             source_responses = source_responses_for_key if source_role and not args.request_id else (fetch_source_responses(client, source_role) if source_role else [])
             user_prompt = build_prompt(prompt, source_role, source_responses)
+            if include_role_context:
+                user_prompt = f"{context_marker}\n\n{user_prompt}"
             rendered = render_direct_role_prompt(
                 role=role,
                 user_prompt=user_prompt,
                 request_id=request_id,
                 request_marker=REQUEST_MARKER,
+                include_role_context=include_role_context,
             )
-            final_prompt, final_uploads = maybe_spill_prompt(request_id, rendered.text, upload_paths)
+            final_prompt, final_uploads = maybe_spill_prompt(
+                request_id,
+                rendered.text,
+                upload_paths,
+                visible_markers=(context_marker,) if include_role_context else (),
+            )
             response = run_role_request(client, role, final_prompt, final_uploads, ledger, args.timeout)
     except ManualInputPendingError as exc:
         ledger["status"] = "failed_retryable"

@@ -46,7 +46,7 @@ class RouteExecutorMixin:
         if len(targets) > 1:
             if execute_handoff:
                 self.reset_roles_for_handoff(targets, state)
-            self.publish_flow_route(result.prompt_role, list(targets))
+            self.publish_flow_route(result.prompt_role, list(targets), caller_role=result.caller_role)
             child_results = self.dispatch_parallel(targets, state, result.prompt_role, depth + 1)
             joined = format_child_results(result.prompt_role, child_results)
             if result.prompt_role in self.prompt_roles and not self.finished and self.has_turn_budget():
@@ -57,7 +57,7 @@ class RouteExecutorMixin:
             print(f"[dispatch] {result.prompt_role} -> {next_role}", flush=True)
             if execute_handoff or self.should_new_chat(state, next_role):
                 self.reset_roles_for_handoff([next_role], state)
-            self.publish_flow_route(result.prompt_role, [next_role])
+            self.publish_flow_route(result.prompt_role, [next_role], caller_role=result.caller_role)
             self.dispatch_role(next_role, next_message, state, caller_role=result.prompt_role, depth=depth + 1)
         return result
 

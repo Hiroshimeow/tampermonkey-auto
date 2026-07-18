@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 import role
 
 
@@ -124,9 +126,9 @@ def test_role_flow_status_marks_and_clears_only_the_target_role(monkeypatch, tmp
     assert code == 0
     assert payload["role"] == "TEST1"
     assert len(flow_updates) == 2
-    assert flow_updates[0][1] == {"TEST1": {"state": "RUNNING"}}
+    assert flow_updates[0][1] == {"TEST1": {"state": "RUNNING", "from_role": "USER"}}
     assert flow_updates[1][0] == flow_updates[0][0]
-    assert flow_updates[1][1] == {"TEST1": None}
+    assert flow_updates[1][1] == {"TEST1": {"state": "DONE", "done_from": "USER"}}
 
 
 def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_path, capsys) -> None:
@@ -152,8 +154,8 @@ def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_p
     assert code == 3
     assert payload["status"] == "failed_retryable"
     assert [updates for _run_id, updates in flow_updates] == [
-        {"TEST2": {"state": "RUNNING"}},
-        {"TEST2": None},
+        {"TEST2": {"state": "RUNNING", "from_role": "USER"}},
+        {"TEST2": {"state": "DONE", "done_from": "USER"}},
     ]
 
 
@@ -182,7 +184,7 @@ def test_role_flow_status_does_not_render_route_detail_for_single_role(monkeypat
     stdout_json(capsys.readouterr().out)
 
     assert code == 0
-    assert flow_updates[0] == {"B": {"state": "RUNNING"}}
+    assert flow_updates[0] == {"B": {"state": "RUNNING", "from_role": "USER"}}
 
 
 def test_main_uses_resp_from_and_outputs_source_count(monkeypatch, tmp_path, capsys) -> None:
@@ -473,3 +475,534 @@ def test_completed_request_returns_cached_response(monkeypatch, tmp_path, capsys
     assert second["request_id"] == first["request_id"]
     assert second["recovered"] is True
     assert response_text(second) == "cached answer"
+
+
+def current_context_marker(role_name: str = "DEV") -> str:
+    rendered = role.render_direct_role_prompt(
+        role=role_name,
+        user_prompt="USER_PROMPT_PLACEHOLDER",
+        request_id="REQUEST_ID_PLACEHOLDER",
+        request_marker=role.REQUEST_MARKER,
+    )
+    context_hash = role.sha256_text(role.rendered_hash_source(rendered))
+    return role.make_role_context_marker(role_name, context_hash)
+
+
+def test_direct_role_renderer_defaults_to_full_prompt_and_skill() -> None:
+    rendered = role.render_direct_role_prompt(
+        role="DEV",
+        user_prompt="implement it",
+        request_id="req-1",
+    )
+
+    assert "[ROLE PROMPT: DEV]" in rendered.text
+    assert "[ROLE SKILL: DEV]" in rendered.text
+    assert "ROLE_REQUEST_ID: req-1" in rendered.text
+    assert rendered.text.endswith("implement it")
+    assert rendered.files
+
+
+def test_direct_role_renderer_thin_mode_omits_prompt_and_skill() -> None:
+    rendered = role.render_direct_role_prompt(
+        role="DEV",
+        user_prompt="continue",
+        request_id="req-2",
+        include_role_context=False,
+    )
+
+    assert "[ROLE PROMPT:" not in rendered.text
+    assert "[ROLE SKILL:" not in rendered.text
+    assert rendered.text == "ROLE_REQUEST_ID: req-2\n\nUSER_PROMPT:\n\ncontinue"
+    assert rendered.files == ()
+
+
+@pytest.mark.parametrize("role_name", ["PLAN", "DEV", "REVIEW", "REVIEW2"])
+def test_configured_role_renderer_supports_full_and_thin_context(role_name: str) -> None:
+    full = role.render_direct_role_prompt(role=role_name, user_prompt="task", request_id="full")
+    thin = role.render_direct_role_prompt(
+        role=role_name,
+        user_prompt="task",
+        request_id="thin",
+        include_role_context=False,
+    )
+
+    assert f"[ROLE PROMPT: {role_name}]" in full.text
+    assert f"[ROLE SKILL: {role_name}]" in full.text
+    assert full.files
+    assert "[ROLE PROMPT:" not in thin.text
+    assert "[ROLE SKILL:" not in thin.text
+    assert thin.files == ()
+
+
+def test_snapshot_has_role_context_requires_exact_user_marker_line() -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    snapshot = {
+        "dom_info": {
+            "messages": {
+                "messages": [
+                    {"role": "assistant", "text": marker},
+                    {"role": "user", "text": f"quoted {marker} suffix"},
+                    {"role": "user", "text": f"before\n{marker}\nafter"},
+                ]
+            }
+        }
+    }
+
+    assert role.snapshot_has_role_context(snapshot, marker)
+    assert not role.snapshot_has_role_context(
+        {"dom_info": {"messages": {"messages": [{"role": "assistant", "text": marker}]}}},
+        marker,
+    )
+    assert not role.snapshot_has_role_context(
+        {"dom_info": {"messages": {"messages": [{"role": "user", "text": f"prefix {marker} suffix"}]}}},
+        marker,
+    )
+
+
+class UnexpectedBootstrapError(Exception):
+    pass
+
+
+class BootstrapProbeClient:
+    def __init__(self, snapshot: dict | Exception, sync_result: dict | Exception | None = None):
+        self.snapshot_value = snapshot
+        self.sync_value = sync_result if sync_result is not None else {"done": True, "status": "TRANSCRIPT_SAVED"}
+        self.calls = []
+
+    def command_roundtrip(self, role_name: str, action: str, timeout_s: float) -> dict:
+        self.calls.append((role_name, action, timeout_s))
+        if isinstance(self.sync_value, Exception):
+            raise self.sync_value
+        return self.sync_value
+
+    def role_snapshot(self, role_name: str) -> dict:
+        if isinstance(self.snapshot_value, Exception):
+            raise self.snapshot_value
+        return self.snapshot_value
+
+
+def test_conversation_needs_role_context_detects_matching_marker() -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    client = BootstrapProbeClient(
+        {"dom_info": {"messages": {"messages": [{"role": "user", "text": f"before\n{marker}\nafter"}]}}}
+    )
+
+    assert role.conversation_needs_role_context(client, "DEV", marker, 99.0) is False
+    assert client.calls == [("DEV", "SYNC_TRANSCRIPT", 20.0)]
+
+
+def test_conversation_needs_role_context_fails_safe_when_marker_missing_or_old() -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    old_marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "b" * 64
+    missing = BootstrapProbeClient({"dom_info": {"messages": {"messages": []}}})
+    old = BootstrapProbeClient(
+        {"dom_info": {"messages": {"messages": [{"role": "user", "text": old_marker}]}}}
+    )
+
+    assert role.conversation_needs_role_context(missing, "DEV", marker, 5.0) is True
+    assert role.conversation_needs_role_context(old, "DEV", marker, 5.0) is True
+    assert len(missing.calls) == 1
+    assert len(old.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "snapshot,sync_result",
+    [
+        (KeyError("unexpected snapshot failure"), None),
+        ({}, UnexpectedBootstrapError("unexpected sync failure")),
+    ],
+)
+def test_conversation_needs_role_context_falls_back_on_any_ordinary_exception(
+    snapshot: dict | Exception,
+    sync_result: dict | Exception | None,
+    capsys,
+) -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    client = BootstrapProbeClient(snapshot, sync_result)
+
+    assert role.conversation_needs_role_context(client, "DEV", marker, 5.0) is True
+    assert "[role-context] bootstrap check failed for DEV; sending full context:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("control_exception", [KeyboardInterrupt(), SystemExit(9)])
+def test_conversation_needs_role_context_does_not_swallow_process_control_exceptions(control_exception: BaseException) -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+
+    class ControlClient:
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float) -> dict:
+            raise control_exception
+
+    with pytest.raises(type(control_exception)):
+        role.conversation_needs_role_context(ControlClient(), "DEV", marker, 5.0)
+
+
+@pytest.mark.parametrize(
+    "snapshot,sync_result",
+    [
+        (RuntimeError("snapshot failed"), None),
+        ({}, OSError("sync failed")),
+        ({}, {"done": False, "status": "TRANSCRIPT_FAILED"}),
+        ({"dom_info": {"messages": {"messages": "bad"}}}, None),
+    ],
+)
+def test_conversation_needs_role_context_fails_safe_on_probe_errors(
+    snapshot: dict | Exception,
+    sync_result: dict | Exception | None,
+    capsys,
+) -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    client = BootstrapProbeClient(snapshot, sync_result)
+
+    assert role.conversation_needs_role_context(client, "DEV", marker, 5.0) is True
+    assert "[role-context] bootstrap check failed for DEV" in capsys.readouterr().err
+
+
+def marker_snapshot(messages: list[dict]) -> dict:
+    return {"dom_info": {"messages": {"messages": messages}}}
+
+
+def test_latest_exact_same_role_marker_is_authoritative() -> None:
+    marker_a = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    marker_b = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "b" * 64
+
+    assert role.snapshot_has_role_context(marker_snapshot([{"role": "user", "text": marker_a}]), marker_a)
+
+    a_then_b = marker_snapshot(
+        [
+            {"role": "user", "text": marker_a},
+            {"role": "user", "text": marker_b},
+        ]
+    )
+    assert not role.snapshot_has_role_context(a_then_b, marker_a)
+    assert role.snapshot_has_role_context(a_then_b, marker_b)
+
+
+def test_latest_marker_authority_ignores_assistant_echoes_substrings_and_other_roles() -> None:
+    marker_a = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    marker_b = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "b" * 64
+    review_marker = "MAUTO_ROLE_CONTEXT_V1: REVIEW:" + "c" * 64
+    snapshot = marker_snapshot(
+        [
+            {"role": "user", "text": marker_b},
+            {"role": "assistant", "text": marker_a},
+            {"role": "user", "text": f"quoted {marker_a} suffix"},
+            {"role": "user", "text": review_marker},
+        ]
+    )
+
+    assert role.snapshot_has_role_context(snapshot, marker_b)
+    assert not role.snapshot_has_role_context(snapshot, marker_a)
+
+
+def test_latest_marker_line_within_one_user_message_is_authoritative() -> None:
+    marker_a = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    marker_b = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "b" * 64
+    snapshot = marker_snapshot([{"role": "user", "text": f"before\n{marker_a}\n{marker_b}\nafter"}])
+
+    assert not role.snapshot_has_role_context(snapshot, marker_a)
+    assert role.snapshot_has_role_context(snapshot, marker_b)
+
+
+def test_latest_malformed_same_role_marker_invalidates_historical_match() -> None:
+    marker_a = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    malformed = "MAUTO_ROLE_CONTEXT_V1: DEV:not-a-valid-hash"
+    snapshot = marker_snapshot(
+        [
+            {"role": "user", "text": marker_a},
+            {"role": "user", "text": malformed},
+        ]
+    )
+
+    assert not role.snapshot_has_role_context(snapshot, marker_a)
+
+
+def test_spilled_bootstrap_keeps_context_marker_visible(monkeypatch, tmp_path) -> None:
+    marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "a" * 64
+    monkeypatch.setattr(role, "UPLOADS_DIR", tmp_path / "uploads")
+
+    short_prompt, uploads = role.maybe_spill_prompt(
+        "req-1",
+        "x" * (role.PROMPT_SPILL_THRESHOLD + 1),
+        [],
+        visible_markers=(marker,),
+    )
+
+    assert "ROLE_REQUEST_ID: req-1" in short_prompt
+    assert marker in short_prompt
+    assert len(uploads) == 1
+    assert uploads[0].name == "prompt.md"
+
+
+def install_stateful_client(
+    monkeypatch,
+    *,
+    initial_messages: dict[str, list[dict]] | None = None,
+    fail_sync: bool = False,
+    sync_exception: Exception | None = None,
+    snapshot_exception: Exception | None = None,
+):
+    state = {
+        "messages": {name: list(items) for name, items in (initial_messages or {}).items()},
+        "sent_prompts": [],
+        "actions": [],
+        "fail_sync": fail_sync,
+        "sync_exception": sync_exception,
+        "snapshot_exception": snapshot_exception,
+    }
+
+    class StatefulClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
+            return {"status": "OK"}
+
+        def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:
+            state["actions"].append((role_name, action))
+            if action == "SYNC_TRANSCRIPT" and state["sync_exception"] is not None:
+                raise state["sync_exception"]
+            if action == "SYNC_TRANSCRIPT" and state["fail_sync"]:
+                raise OSError("sync unavailable")
+            if action == "RELOAD_PAGE":
+                return {"done": True, "status": "PAGE_RELOADING"}
+            return {"done": True, "status": "TRANSCRIPT_SAVED"}
+
+        def new_chat(self, role_name: str, timeout_s: float = 25.0) -> dict:
+            state["actions"].append((role_name, "NEW_CHAT"))
+            state["messages"][role_name] = []
+            return {"done": True, "status": "NEW_CHAT_NAVIGATING"}
+
+        def role_snapshot(self, role_name: str) -> dict:
+            if state["snapshot_exception"] is not None:
+                raise state["snapshot_exception"]
+            return {"dom_info": {"messages": {"messages": list(state["messages"].get(role_name, []))}}}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            state["actions"].append((role_name, "SEND"))
+            state["sent_prompts"].append(prompt)
+            state["messages"].setdefault(role_name, []).append({"role": "user", "text": prompt})
+            answer = f"answer {len(state['sent_prompts'])}"
+            state["messages"][role_name].append({"role": "assistant", "text": answer})
+            return answer
+
+    monkeypatch.setattr(role, "BridgeClient", StatefulClient)
+    return state
+
+
+def test_main_bootstraps_context_once_per_conversation(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+
+    first_code = role.main(["--role", "DEV", "--prompt", "first task"])
+    stdout_json(capsys.readouterr().out)
+    second_code = role.main(["--role", "DEV", "--prompt", "second task"])
+    stdout_json(capsys.readouterr().out)
+
+    assert first_code == 0
+    assert second_code == 0
+    assert "[ROLE PROMPT: DEV]" in state["sent_prompts"][0]
+    assert "[ROLE SKILL: DEV]" in state["sent_prompts"][0]
+    assert current_context_marker("DEV") in state["sent_prompts"][0]
+    assert "[ROLE PROMPT:" not in state["sent_prompts"][1]
+    assert "[ROLE SKILL:" not in state["sent_prompts"][1]
+    assert current_context_marker("DEV") not in state["sent_prompts"][1]
+    assert "ROLE_REQUEST_ID:" in state["sent_prompts"][1]
+    assert state["sent_prompts"][1].endswith("second task")
+
+
+def test_unconfigured_role_skips_context_probe(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+
+    code = role.main(["--role", "J", "--prompt", "literal custom task"])
+    payload = stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["role"] == "J"
+    assert state["actions"] == [("J", "SEND")]
+    assert "MAUTO_ROLE_CONTEXT_V1" not in state["sent_prompts"][0]
+    assert "[ROLE PROMPT:" not in state["sent_prompts"][0]
+    assert "[ROLE SKILL:" not in state["sent_prompts"][0]
+    assert "ROLE_REQUEST_ID:" in state["sent_prompts"][0]
+    assert state["sent_prompts"][0].endswith("literal custom task")
+
+
+def test_new_chat_context_rebootstraps_after_navigation(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    marker = current_context_marker("DEV")
+    state = install_stateful_client(
+        monkeypatch,
+        initial_messages={"DEV": [{"role": "user", "text": marker}]},
+    )
+
+    code = role.main(["--role", "DEV", "--new-chat", "--prompt", "fresh task"])
+    stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert state["actions"] == [("DEV", "NEW_CHAT"), ("DEV", "SEND")]
+    assert "[ROLE PROMPT: DEV]" in state["sent_prompts"][0]
+    assert "[ROLE SKILL: DEV]" in state["sent_prompts"][0]
+    assert marker in state["sent_prompts"][0]
+
+
+def test_restart_context_probes_after_reload_and_stays_thin(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    marker = current_context_marker("DEV")
+    state = install_stateful_client(
+        monkeypatch,
+        initial_messages={"DEV": [{"role": "user", "text": marker}]},
+    )
+
+    code = role.main(["--role", "DEV", "--restart", "--prompt", "same chat task"])
+    stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert state["actions"] == [("DEV", "RELOAD_PAGE"), ("DEV", "SYNC_TRANSCRIPT"), ("DEV", "SEND")]
+    assert "[ROLE PROMPT:" not in state["sent_prompts"][0]
+    assert "[ROLE SKILL:" not in state["sent_prompts"][0]
+    assert marker not in state["sent_prompts"][0]
+
+
+def test_changed_context_rebootstraps_once_then_returns_to_thin(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    current_marker = current_context_marker("DEV")
+    old_marker = "MAUTO_ROLE_CONTEXT_V1: DEV:" + "0" * 64
+    state = install_stateful_client(
+        monkeypatch,
+        initial_messages={"DEV": [{"role": "user", "text": old_marker}]},
+    )
+
+    first_code = role.main(["--role", "DEV", "--prompt", "after context edit"])
+    stdout_json(capsys.readouterr().out)
+    second_code = role.main(["--role", "DEV", "--prompt", "next request"])
+    stdout_json(capsys.readouterr().out)
+
+    assert first_code == second_code == 0
+    assert "[ROLE PROMPT: DEV]" in state["sent_prompts"][0]
+    assert current_marker in state["sent_prompts"][0]
+    assert "[ROLE PROMPT:" not in state["sent_prompts"][1]
+    assert current_marker not in state["sent_prompts"][1]
+
+
+@pytest.mark.parametrize(
+    "exception_stage,unexpected_exception",
+    [
+        ("sync", UnexpectedBootstrapError("unexpected sync failure")),
+        ("snapshot", KeyError("unexpected snapshot failure")),
+    ],
+)
+def test_main_unexpected_bootstrap_exception_falls_back_to_one_success_json_and_full_send(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    exception_stage: str,
+    unexpected_exception: Exception,
+) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(
+        monkeypatch,
+        sync_exception=unexpected_exception if exception_stage == "sync" else None,
+        snapshot_exception=unexpected_exception if exception_stage == "snapshot" else None,
+    )
+
+    code = role.main(["--role", "DEV", "--prompt", f"safe {exception_stage} fallback"])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["status"] == "completed"
+    assert payload["exit_code"] == 0
+    assert state["actions"].count(("DEV", "SEND")) == 1
+    assert len(state["sent_prompts"]) == 1
+    sent = state["sent_prompts"][0]
+    assert "[ROLE PROMPT: DEV]" in sent
+    assert "[ROLE SKILL: DEV]" in sent
+    assert current_context_marker("DEV") in sent
+    assert "[role-context] bootstrap check failed for DEV; sending full context:" in captured.err
+
+
+def test_bootstrap_check_failure_falls_back_to_full_and_keeps_stdout_json(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch, fail_sync=True)
+
+    code = role.main(["--role", "DEV", "--prompt", "safe fallback"])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert "[ROLE PROMPT: DEV]" in state["sent_prompts"][0]
+    assert "[ROLE SKILL: DEV]" in state["sent_prompts"][0]
+    assert current_context_marker("DEV") in state["sent_prompts"][0]
+    assert "[role-context] bootstrap check failed for DEV" in captured.err
+
+
+def test_main_context_reversion_a_to_b_to_a_rebootstraps_then_stays_thin(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+    context = {"version": "A"}
+    monkeypatch.setattr(role, "rendered_hash_source", lambda rendered: f"context-{context['version']}")
+    marker_a = role.make_role_context_marker("DEV", role.sha256_text("context-A"))
+    marker_b = role.make_role_context_marker("DEV", role.sha256_text("context-B"))
+
+    assert role.main(["--role", "DEV", "--prompt", "version A first"]) == 0
+    stdout_json(capsys.readouterr().out)
+    context["version"] = "B"
+    assert role.main(["--role", "DEV", "--prompt", "version B"]) == 0
+    stdout_json(capsys.readouterr().out)
+    context["version"] = "A"
+    assert role.main(["--role", "DEV", "--prompt", "version A restored"]) == 0
+    stdout_json(capsys.readouterr().out)
+    assert role.main(["--role", "DEV", "--prompt", "version A unchanged"]) == 0
+    stdout_json(capsys.readouterr().out)
+
+    assert marker_a in state["sent_prompts"][0]
+    assert marker_b in state["sent_prompts"][1]
+    assert "[ROLE PROMPT: DEV]" in state["sent_prompts"][2]
+    assert "[ROLE SKILL: DEV]" in state["sent_prompts"][2]
+    assert marker_a in state["sent_prompts"][2]
+    assert "[ROLE PROMPT:" not in state["sent_prompts"][3]
+    assert "[ROLE SKILL:" not in state["sent_prompts"][3]
+    assert marker_a not in state["sent_prompts"][3]
+
+
+def test_resp_from_uses_thin_target_context(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    marker = current_context_marker("REVIEW")
+    state = install_stateful_client(
+        monkeypatch,
+        initial_messages={
+            "REVIEW": [{"role": "user", "text": marker}],
+            "DEV": [{"role": "assistant", "text": "source evidence"}],
+        },
+    )
+
+    code = role.main(["--role", "REVIEW", "--resp-from", "DEV", "--prompt", "judge it"])
+    payload = stdout_json(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["source_response_count"] == 1
+    sent = state["sent_prompts"][0]
+    assert "RESPONSES_FROM DEV" in sent
+    assert "source evidence" in sent
+    assert "judge it" in sent
+    assert "ROLE_REQUEST_ID:" in sent
+    assert "[ROLE PROMPT:" not in sent
+    assert "[ROLE SKILL:" not in sent
+
+
+def test_completed_configured_request_returns_before_bootstrap_probe(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+
+    first_code = role.main(["--role", "DEV", "--prompt", "same task"])
+    first = stdout_json(capsys.readouterr().out)
+    actions_after_first = list(state["actions"])
+    second_code = role.main(["--role", "DEV", "--prompt", "same task"])
+    second = stdout_json(capsys.readouterr().out)
+
+    assert first_code == second_code == 0
+    assert second["request_id"] == first["request_id"]
+    assert second["recovered"] is True
+    assert state["actions"] == actions_after_first

@@ -177,9 +177,16 @@ class LifecycleClient:
 class FlowStatusClient:
     def __init__(self):
         self.updates: list[tuple[str, dict[str, dict[str, Any] | None]]] = []
+        self.calls: list[dict[str, Any]] = []
 
-    def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+    def update_flow_statuses(
+        self,
+        run_id: str,
+        updates: dict[str, dict[str, Any] | None],
+        **metadata: Any,
+    ) -> dict[str, Any]:
         self.updates.append((run_id, updates))
+        self.calls.append({"run_id": run_id, "updates": updates, **metadata})
         return {"status": "OK"}
 
 
@@ -216,10 +223,13 @@ def test_flow_ui_initial_turn_marks_start_running_and_all_other_members_waiting(
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST1": {"state": "RUNNING", "from_role": "User"},
-        "TEST2": {"state": "WAITING"},
-        "TEST3": {"state": "WAITING"},
+        "TEST1": {"state": "RUNNING", "logical_role": "A", "from_role": "User"},
+        "TEST2": {"state": "WAITING", "logical_role": "B"},
+        "TEST3": {"state": "WAITING", "logical_role": "C"},
     }
+    assert client.calls[-1]["request_id"] == coordinator.flow_run_id
+    assert client.calls[-1]["activate"] is True
+    assert len(client.calls[-1]["goal_hash"]) == 64
     assert "DEV" not in updates
 
 
@@ -231,8 +241,8 @@ def test_flow_ui_route_marks_only_actual_source_and_target_without_predicting_c(
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST1": {"state": "DONE", "done_from": "User", "sent_to": "B"},
-        "TEST2": {"state": "RUNNING", "from_role": "A"},
+        "TEST1": {"state": "DONE", "logical_role": "A", "done_from": "User", "sent_to": "B"},
+        "TEST2": {"state": "RUNNING", "logical_role": "B", "from_role": "A"},
     }
     assert "TEST3" not in updates
 
@@ -245,34 +255,36 @@ def test_flow_ui_repeated_debate_updates_the_real_direction() -> None:
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST2": {"state": "DONE", "done_from": "A", "sent_to": "A"},
-        "TEST1": {"state": "RUNNING", "from_role": "B"},
+        "TEST2": {"state": "DONE", "logical_role": "B", "done_from": "A", "sent_to": "A"},
+        "TEST1": {"state": "RUNNING", "logical_role": "A", "from_role": "B"},
     }
 
 
-def test_flow_ui_cleanup_names_only_this_coordinators_physical_roles() -> None:
+def test_flow_ui_finalization_retains_role_cards_and_sets_terminal_status() -> None:
     coordinator, client = flow_ui_coordinator()
     coordinator.begin_flow_status()
+    initial_updates = client.updates[-1][1]
 
-    coordinator.clear_flow_status()
+    coordinator.finalize_flow_status("complete")
 
-    run_id, updates = client.updates[-1]
-    assert run_id == coordinator.flow_run_id
-    assert updates == {"TEST1": None, "TEST2": None, "TEST3": None}
+    assert client.updates[-1] == (coordinator.flow_run_id, {})
+    assert client.calls[-1]["terminal_status"] == "complete"
+    assert all(value is not None for value in initial_updates.values())
 
 
 def test_flow_ui_diagnostic_parse_failure_never_breaks_core_flow() -> None:
     coordinator, _client = flow_ui_coordinator()
 
     class BrokenDiagnosticClient:
-        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None], **metadata: Any) -> dict[str, Any]:
+            del run_id, updates, metadata
             raise ValueError("invalid diagnostic JSON")
 
     coordinator.client = BrokenDiagnosticClient()  # type: ignore[assignment]
 
     coordinator.begin_flow_status()
     coordinator.publish_flow_route("A", ["B"], caller_role="User")
-    coordinator.clear_flow_status()
+    coordinator.finalize_flow_status("runtime_error")
 
 
 def test_flow_ui_parallel_fan_in_marks_children_waiting_and_parent_running() -> None:
@@ -284,9 +296,9 @@ def test_flow_ui_parallel_fan_in_marks_children_waiting_and_parent_running() -> 
 
     _run_id, updates = client.updates[-1]
     assert updates == {
-        "TEST2": {"state": "DONE", "done_from": "A", "sent_to": "A"},
-        "TEST3": {"state": "DONE", "done_from": "A", "sent_to": "A"},
-        "TEST1": {"state": "RUNNING", "from_role": "B, C"},
+        "TEST2": {"state": "DONE", "logical_role": "B", "done_from": "A", "sent_to": "A"},
+        "TEST3": {"state": "DONE", "logical_role": "C", "done_from": "A", "sent_to": "A"},
+        "TEST1": {"state": "RUNNING", "logical_role": "A", "from_role": "B, C"},
     }
 
 
@@ -389,6 +401,121 @@ def test_bridge_flow_status_publisher_uses_one_scoped_backend_request(monkeypatc
             },
         )
     ]
+
+
+def test_bridge_flow_status_publisher_sends_optional_durable_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = BridgeClient("http://127.0.0.1:8500")
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_json_request(method: str, path: str, payload: dict[str, Any] | None = None, timeout_s: float | None = None):
+        del timeout_s
+        calls.append((method, path, payload or {}))
+        return {"status": "OK"}
+
+    monkeypatch.setattr(client, "json_request", fake_json_request)
+
+    client.update_flow_statuses(
+        "run-test",
+        {"SHARED": {"state": "DONE", "logical_role": "PLAN"}},
+        request_id="req-test",
+        parent_request_id="",
+        goal_hash="a" * 64,
+        terminal_status="complete",
+        activate=True,
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/admin/flow-status",
+            {
+                "run_id": "run-test",
+                "updates": {"SHARED": {"state": "DONE", "logical_role": "PLAN"}},
+                "request_id": "req-test",
+                "parent_request_id": "",
+                "goal_hash": "a" * 64,
+                "terminal_status": "complete",
+                "activate": True,
+            },
+        )
+    ]
+
+
+def test_flow_ui_shared_physical_role_tracks_current_logical_role() -> None:
+    args = parse_args(
+        [
+            "--role",
+            "A,B",
+            "--browser-roles",
+            "SHARED",
+            "--role-map",
+            "A=SHARED B=SHARED",
+            "--goal",
+            "shared role flow",
+            "--reload-after",
+            "0",
+        ]
+    )
+    coordinator = Coordinator(args)
+    client = FlowStatusClient()
+    coordinator.client = client  # type: ignore[assignment]
+
+    coordinator.begin_flow_status()
+    coordinator.publish_flow_route("A", ["B"], caller_role="USER")
+
+    assert client.updates[0][1] == {
+        "SHARED": {"state": "RUNNING", "logical_role": "A", "from_role": "User"}
+    }
+    assert client.updates[-1][1] == {
+        "SHARED": {"state": "RUNNING", "logical_role": "B", "from_role": "A"}
+    }
+
+
+def test_authorized_finish_marks_shared_physical_card_done_and_preserves_other_cards() -> None:
+    args = parse_args(
+        [
+            "--role",
+            "REVIEW,DEV,PLAN,A",
+            "--browser-roles",
+            "SHARED,OTHER",
+            "--role-map",
+            "REVIEW=SHARED DEV=SHARED PLAN=SHARED A=OTHER",
+            "--finish-roles",
+            "PLAN",
+            "--goal",
+            "finish shared flow",
+            "--reload-after",
+            "0",
+        ]
+    )
+    coordinator = Coordinator(args)
+    client = FlowStatusClient()
+    coordinator.client = client  # type: ignore[assignment]
+
+    def fake_call(prompt_role: str, browser_role: str, prompt: str, instruction: str, repair: bool = False) -> str:
+        del browser_role, prompt, instruction, repair
+        if prompt_role == "REVIEW":
+            return '```json\n{"DEV":"implement"}\n```'
+        if prompt_role == "DEV":
+            return '```json\n{"PLAN":"verify"}\n```'
+        if prompt_role == "PLAN":
+            return '```json\n{"FINISH":"complete"}\n```'
+        raise AssertionError(prompt_role)
+
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish shared flow")
+
+    assert result["status"] == "complete"
+    assert result["approved_by"] == "PLAN"
+    final = client.calls[-1]
+    assert final["terminal_status"] == "complete"
+    assert final["updates"] == {
+        "SHARED": {"state": "DONE", "logical_role": "PLAN", "done_from": "PLAN"}
+    }
+    initial = client.calls[0]["updates"]
+    assert "OTHER" in initial
+    assert initial["OTHER"]["state"] == "WAITING"
 
 
 @pytest.mark.parametrize("role", ["REVIEW", "FINISH"])
@@ -586,8 +713,8 @@ def test_invalid_terminal_route_resyncs_latest_response_before_format_repair() -
         def __init__(self) -> None:
             self.sync_calls = 0
 
-        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
-            del run_id, updates
+        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None], **metadata: Any) -> dict[str, Any]:
+            del run_id, updates, metadata
             return {"status": "OK"}
 
         def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
@@ -670,8 +797,8 @@ def test_malformed_snapshot_resync_retains_original_and_reaches_structured_stop(
     calls: list[bool] = []
 
     class MalformedSnapshotClient:
-        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
-            del run_id, updates
+        def update_flow_statuses(self, run_id: str, updates: dict[str, dict[str, Any] | None], **metadata: Any) -> dict[str, Any]:
+            del run_id, updates, metadata
             return {"status": "OK"}
 
         def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:

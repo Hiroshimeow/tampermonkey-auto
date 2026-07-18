@@ -66,6 +66,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         state = FlowState(goal=goal)
         self.current_goal = goal
         try:
+            self.begin_flow_status()
             loader_errors = self.runtime_config.loader_errors()
             if loader_errors:
                 raise FlowStopError(
@@ -73,7 +74,6 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                     "required route-mode loader files are missing, empty, unreadable, or invalidly encoded",
                     loader_errors=loader_errors,
                 )
-            self.begin_flow_status()
             if self.args.preflight and not self.dry_run:
                 self.preflight()
             first_instruction = "Start from the user goal. Decide the first phase and route work to the right role(s)."
@@ -83,36 +83,67 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             self.finished = self.flow_stop_result(state, exc.status, exc.message, **exc.details)
         except RuntimeError as exc:
             self.finished = self.flow_stop_result(state, "runtime_error", str(exc))
-        finally:
-            self.clear_flow_status()
 
-        if self.finished:
-            return self.finished
-        return self.unfinished_result(state)
+        result = self.finished or self.unfinished_result(state)
+        self.finalize_flow_status(
+            str(result.get("status") or "runtime_error"),
+            finishing_role=str(result.get("approved_by") or ""),
+        )
+        return result
 
-    def publish_flow_statuses(self, updates: dict[str, dict[str, Any] | None]) -> None:
-        if self.dry_run or not updates:
+    def publish_flow_statuses(
+        self,
+        updates: dict[str, dict[str, Any] | None],
+        *,
+        request_id: str = "",
+        parent_request_id: str | None = None,
+        goal_hash: str | None = None,
+        terminal_status: str | None = None,
+        activate: bool = False,
+    ) -> None:
+        if self.dry_run:
+            return
+        if not updates and terminal_status is None and not activate:
             return
         update = getattr(self.client, "update_flow_statuses", None)
         if not callable(update):
             return
         try:
-            update(self.flow_run_id, updates)
+            update(
+                self.flow_run_id,
+                updates,
+                request_id=request_id or self.flow_run_id,
+                parent_request_id=parent_request_id,
+                goal_hash=goal_hash,
+                terminal_status=terminal_status,
+                activate=activate,
+            )
         except Exception as exc:
             print(f"[flow-ui] status update failed: {exc}", flush=True)
 
     def begin_flow_status(self) -> None:
         self.flow_status_active = True
-        updates: dict[str, dict[str, Any] | None] = {
-            physical: {"state": "WAITING"}
-            for physical in self.runtime_config.physical_roles
-        }
+        updates: dict[str, dict[str, Any] | None] = {}
+        for physical in self.runtime_config.physical_roles:
+            logical_roles = self.runtime_config.logical_roles_for(physical)
+            updates[physical] = {
+                "state": "WAITING",
+                "logical_role": logical_roles[0] if logical_roles else physical,
+            }
         start_physical = self.pick_browser_role(self.start_role)
         updates[start_physical] = {
             "state": "RUNNING",
+            "logical_role": self.start_role,
             "from_role": "User",
         }
-        self.publish_flow_statuses(updates)
+        goal_hash = self.runtime_config.provenance_for(self.start_role, self.current_goal).goal_hash
+        self.publish_flow_statuses(
+            updates,
+            request_id=self.flow_run_id,
+            parent_request_id="",
+            goal_hash=goal_hash,
+            activate=True,
+        )
 
     def publish_flow_route(self, source_role: str, target_roles: list[str], *, caller_role: str) -> None:
         if not self.flow_status_active or not target_roles:
@@ -125,6 +156,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         updates: dict[str, dict[str, Any] | None] = {
             self.pick_browser_role(source): {
                 "state": "DONE",
+                "logical_role": source,
                 "done_from": caller or "User",
                 "sent_to": ", ".join(targets),
             }
@@ -132,6 +164,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         for target in targets:
             updates[self.pick_browser_role(target)] = {
                 "state": "RUNNING",
+                "logical_role": target,
                 "from_role": source,
             }
         self.publish_flow_statuses(updates)
@@ -146,6 +179,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         updates: dict[str, dict[str, Any] | None] = {
             self.pick_browser_role(source): {
                 "state": "DONE",
+                "logical_role": source,
                 "done_from": target,
                 "sent_to": target,
             }
@@ -153,15 +187,29 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         }
         updates[self.pick_browser_role(target)] = {
             "state": "RUNNING",
+            "logical_role": target,
             "from_role": ", ".join(sources),
         }
         self.publish_flow_statuses(updates)
 
-    def clear_flow_status(self) -> None:
+    def finalize_flow_status(self, terminal_status: str, *, finishing_role: str = "") -> None:
         if not self.flow_status_active:
             return
         self.flow_status_active = False
-        self.publish_flow_statuses({physical: None for physical in self.runtime_config.physical_roles})
+        normalized_terminal = str(terminal_status or "runtime_error")
+        normalized_finisher = normalize_role(finishing_role)
+        updates: dict[str, dict[str, Any] | None] = {}
+        if normalized_terminal == "complete" and normalized_finisher in self.finish_roles:
+            updates[self.pick_browser_role(normalized_finisher)] = {
+                "state": "DONE",
+                "logical_role": normalized_finisher,
+                "done_from": normalized_finisher,
+            }
+        self.publish_flow_statuses(
+            updates,
+            request_id=self.flow_run_id,
+            terminal_status=normalized_terminal,
+        )
 
     def flow_stop_result(self, state: FlowState, status: str, message: str, **details: Any) -> dict[str, Any]:
         result: dict[str, Any] = {

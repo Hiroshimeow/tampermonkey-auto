@@ -362,12 +362,25 @@ class BridgeClient:
         self,
         run_id: str,
         updates: dict[str, dict[str, Any] | None],
+        *,
+        request_id: str = "",
+        parent_request_id: str | None = None,
+        goal_hash: str | None = None,
+        terminal_status: str | None = None,
+        activate: bool = False,
     ) -> dict[str, Any]:
-        return self.json_request(
-            "POST",
-            "/api/admin/flow-status",
-            {"run_id": run_id, "updates": updates},
-        )
+        payload: dict[str, Any] = {"run_id": run_id, "updates": updates}
+        if request_id:
+            payload["request_id"] = request_id
+        if parent_request_id is not None:
+            payload["parent_request_id"] = parent_request_id
+        if goal_hash is not None:
+            payload["goal_hash"] = goal_hash
+        if terminal_status is not None:
+            payload["terminal_status"] = terminal_status
+        if activate:
+            payload["activate"] = True
+        return self.json_request("POST", "/api/admin/flow-status", payload)
 
     def wait_command(self, command_id: str, timeout_s: float) -> dict[str, Any]:
         deadline = time.time() + timeout_s

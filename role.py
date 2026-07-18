@@ -522,19 +522,27 @@ def run_role_request(client: BridgeClient, role: str, final_prompt: str, uploads
 def publish_role_flow_status(
     client: BridgeClient,
     run_id: str,
+    request_id: str,
     role: str,
     running: bool,
+    terminal_status: str | None = None,
 ) -> bool:
     update = getattr(client, "update_flow_statuses", None)
     if not callable(update):
         return False
     updates = {
-        role: {"state": "RUNNING", "from_role": "USER"}
+        role: {"state": "RUNNING", "logical_role": role, "from_role": "USER"}
         if running
-        else {"state": "DONE", "done_from": "USER"}
+        else {"state": "DONE", "logical_role": role, "done_from": "USER"}
     }
     try:
-        update(run_id, updates)
+        update(
+            request_id,
+            updates,
+            request_id=request_id,
+            terminal_status="" if running else terminal_status,
+            activate=running,
+        )
     except Exception as exc:
         print(f"[flow-ui] status update failed: {exc}", file=sys.stderr, flush=True)
     return True
@@ -606,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:
             flow_status_started = publish_role_flow_status(
                 client,
                 run_id,
+                request_id,
                 role,
                 running=True,
             )
@@ -660,6 +669,18 @@ def main(argv: list[str] | None = None) -> int:
                 visible_markers=(context_marker,) if include_role_context else (),
             )
             response = run_role_request(client, role, final_prompt, final_uploads, ledger, args.timeout)
+        response = str(response or "").strip()
+        if response:
+            path = save_response(request_id, response)
+            ledger["status"] = "completed"
+            ledger["response_path"] = str(path)
+            save_ledger(ledger)
+            emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses) if source_role else 0))
+            return 0
+        ledger["status"] = "failed_retryable"
+        save_ledger(ledger)
+        emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error="empty response", message=f"empty response from {role}"))
+        return 3
     except ManualInputPendingError as exc:
         ledger["status"] = "failed_retryable"
         save_ledger(ledger)
@@ -672,20 +693,14 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     finally:
         if client is not None and flow_status_started:
-            publish_role_flow_status(client, run_id, role, running=False)
-
-    response = str(response or "").strip()
-    if response:
-        path = save_response(request_id, response)
-        ledger["status"] = "completed"
-        ledger["response_path"] = str(path)
-        save_ledger(ledger)
-        emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses) if source_role else 0))
-        return 0
-    ledger["status"] = "failed_retryable"
-    save_ledger(ledger)
-    emit_json(fail_payload(exit_code=3, status="failed_retryable", request_id=request_id, run_id=run_id, role=role, error="empty response", message=f"empty response from {role}"))
-    return 3
+            publish_role_flow_status(
+                client,
+                run_id,
+                request_id,
+                role,
+                running=False,
+                terminal_status=str(ledger.get("status") or "failed_retryable"),
+            )
 
 
 if __name__ == "__main__":

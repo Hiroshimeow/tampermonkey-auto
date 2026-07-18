@@ -1,3 +1,5 @@
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 import time
@@ -11,11 +13,16 @@ import server as controller
 
 class DiagnosticControllerTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.flow_path = Path(self.temp_dir.name) / ".role_state" / "flow.json"
         self.client = TestClient(controller.app)
-        controller.state = controller.DiagnosticState()
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
         for role in ("DEV", "IMG", "REVIEW", "SOLO"):
             controller.state.status[role] = "ONLINE"
             controller.state.role_seen_at[role] = time.time()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
     def test_status_report_and_sync_flow(self):
         command = controller.state.create_command("A", "PROBE", {"depth": 1})
@@ -706,7 +713,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         )
         self.client.post(
             "/api/admin/flow-status",
-            json={"run_id": "new-run", "updates": {"TEST1": {"state": "WAITING"}}},
+            json={"run_id": "new-run", "activate": True, "updates": {"TEST1": {"state": "WAITING"}}},
         )
 
         stale_cleanup = self.client.post(
@@ -732,7 +739,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         )
         self.client.post(
             "/api/admin/flow-status",
-            json={"run_id": "new-run", "updates": {"TEST1": {"state": "WAITING"}}},
+            json={"run_id": "new-run", "activate": True, "updates": {"TEST1": {"state": "WAITING"}}},
         )
 
         self.client.post(
@@ -760,9 +767,137 @@ class DiagnosticControllerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 400)
         self.assertNotIn("TEST1", controller.state.flow_statuses)
-        self.assertEqual(controller.state.flow_statuses["TEST2"]["state"], "WAITING")
+        self.assertNotIn("TEST2", controller.state.flow_statuses)
+        self.assertFalse(self.flow_path.exists())
+
+    def test_legacy_flow_calls_activate_only_genuinely_new_requests(self):
+        first = self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "legacy-1", "updates": {"TAB": {"state": "RUNNING"}}},
+        )
+        second = self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "legacy-2", "updates": {"TAB": {"state": "RUNNING"}}},
+        )
+        delayed_first = self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": "legacy-1",
+                "terminal_status": "completed",
+                "updates": {"TAB": {"state": "DONE"}},
+            },
+        )
+        retry_second = self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "legacy-2", "updates": {"TAB": {"state": "RUNNING"}}},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(delayed_first.status_code, 200)
+        self.assertEqual(retry_second.status_code, 200)
+        document = controller.state.flow_store.document
+        self.assertEqual(document["active_request_id"], "legacy-2")
+        self.assertEqual(document["requests"]["legacy-1"]["activation_order"], 1)
+        self.assertEqual(document["requests"]["legacy-2"]["activation_order"], 2)
+        self.assertEqual(len(document["requests"]), 2)
+        self.assertEqual(controller.state.flow_statuses["TAB"]["run_id"], "legacy-2")
+
+    def test_admin_flow_read_supports_active_specific_and_missing_request(self):
+        response = self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "request_id": "req-active",
+                "run_id": "run-active",
+                "parent_request_id": "parent-1",
+                "goal_hash": "a" * 64,
+                "activate": True,
+                "updates": {
+                    "SHARED": {
+                        "state": "RUNNING",
+                        "logical_role": "PLAN",
+                        "from_role": "REVIEW",
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "request_id": "req-other",
+                "run_id": "run-other",
+                "updates": {"SHARED": {"state": "DONE", "logical_role": "DEV"}},
+            },
+        )
+
+        active = self.client.get("/api/admin/flow").json()
+        specific = self.client.get("/api/admin/flow", params={"request_id": "req-other"}).json()
+        missing = self.client.get("/api/admin/flow", params={"request_id": "missing"}).json()
+
+        self.assertEqual(active["version"], 1)
+        self.assertEqual(active["revision"], 2)
+        self.assertEqual(active["active_request_id"], "req-active")
+        self.assertIsNone(active["load_error"])
+        self.assertEqual(active["flow"]["request_id"], "req-active")
+        self.assertEqual(active["flow"]["roles"]["SHARED"]["logical_role"], "PLAN")
+        self.assertEqual(specific["flow"]["request_id"], "req-other")
+        self.assertIsNone(missing["flow"])
+
+    def test_server_restart_hydrates_active_role_projection(self):
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "request_id": "req-restart",
+                "run_id": "run-restart",
+                "activate": True,
+                "updates": {
+                    "SHARED": {
+                        "state": "RUNNING",
+                        "logical_role": "REVIEW",
+                        "from_role": "DEV",
+                    }
+                },
+            },
+        )
+
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
+        status = self.client.post(
+            "/api/status",
+            json={"role": "SHARED", "session_id": "/c/restart", "page_instance_id": "page-restart"},
+        ).json()
+
+        self.assertEqual(
+            status["flow_status"],
+            {
+                "run_id": "run-restart",
+                "state": "RUNNING",
+                "logical_role": "REVIEW",
+                "from_role": "DEV",
+            },
+        )
+
+    def test_corrupt_flow_file_blocks_only_flow_mutation_and_remains_untouched(self):
+        corrupt = b'{"version":1,"requests":'
+        self.flow_path.parent.mkdir(parents=True, exist_ok=True)
+        self.flow_path.write_bytes(corrupt)
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
+
+        read = self.client.get("/api/admin/flow")
+        mutation = self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "run-test", "updates": {"TEST1": {"state": "RUNNING"}}},
+        )
+        config = self.client.get("/api/admin/config")
+
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual(read.json()["load_error"]["code"], "invalid_flow_file")
+        self.assertIsNone(read.json()["flow"])
+        self.assertEqual(mutation.status_code, 409)
+        self.assertEqual(config.status_code, 200)
+        self.assertEqual(self.flow_path.read_bytes(), corrupt)
 
     def test_admin_command_and_result_endpoints(self):
         create_response = self.client.post(

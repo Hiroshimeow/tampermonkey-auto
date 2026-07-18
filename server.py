@@ -11,9 +11,11 @@ from collections import defaultdict, deque
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from apps.flow_store import DEFAULT_FLOW_PATH, FlowStore, FlowStoreMutationError
 
 
 SERVER_HOST = "127.0.0.1"
@@ -119,12 +121,17 @@ class RoleReleaseRequest(BaseModel):
 
 
 class FlowStatusRequest(BaseModel):
-    run_id: str
+    run_id: str = ""
+    request_id: str = ""
+    parent_request_id: Optional[str] = None
+    goal_hash: Optional[str] = None
+    terminal_status: Optional[str] = None
+    activate: bool = False
     updates: Dict[str, Optional[Dict[str, Any]]] = Field(default_factory=dict)
 
 
 class DiagnosticState:
-    def __init__(self):
+    def __init__(self, flow_path=DEFAULT_FLOW_PATH):
         self.lock = threading.RLock()
         self.commands = {}
         self.command_results = {}
@@ -142,10 +149,8 @@ class DiagnosticState:
         self.role_seen_at = defaultdict(float)
         self.role_owners = {}
         self.next_role_claim_generation = 0
-        self.flow_statuses = {}
-        self.flow_run_order = {}
-        self.flow_role_order = {}
-        self.next_flow_run_order = 0
+        self.flow_store = FlowStore(flow_path)
+        self.flow_statuses = self.flow_store.active_projection()
         self.auto_open_roles = {}
         self.auto_role_inflight = defaultdict(int)
         self.config = {
@@ -221,55 +226,30 @@ class DiagnosticState:
         self,
         run_id: str,
         updates: Dict[str, Optional[Dict[str, Any]]],
+        *,
+        request_id: str = "",
+        parent_request_id: Optional[str] = None,
+        goal_hash: Optional[str] = None,
+        terminal_status: Optional[str] = None,
+        activate: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
-        owner = str(run_id or "").strip()
-        if not owner:
-            return {}
-        changed = {}
+        explicit_request_id = str(request_id or "").strip()
+        resolved_request_id = str(explicit_request_id or run_id or "").strip()
+        resolved_run_id = str(run_id or resolved_request_id or "").strip()
         with self.lock:
-            owner_order = self.flow_run_order.get(owner)
-            if owner_order is None:
-                self.next_flow_run_order += 1
-                owner_order = self.next_flow_run_order
-                self.flow_run_order[owner] = owner_order
-            for raw_role, raw_status in updates.items():
-                role = str(raw_role or "").strip().upper()
-                if not role:
-                    continue
-                if owner_order < self.flow_role_order.get(role, 0):
-                    continue
-                if raw_status is None:
-                    current = self.flow_statuses.get(role)
-                    if current and current.get("run_id") == owner:
-                        self.flow_statuses.pop(role, None)
-                        self.flow_role_order[role] = owner_order
-                    changed[role] = dict(self.flow_statuses.get(role) or {})
-                    continue
-                state_name = str(raw_status.get("state") or "").strip().upper()
-                if state_name not in {"RUNNING", "WAITING", "DONE"}:
-                    continue
-                record = {"run_id": owner, "state": state_name}
-                from_role = str(raw_status.get("from_role") or "").strip()[:80]
-                done_from = str(raw_status.get("done_from") or "").strip()[:80]
-                sent_to = str(raw_status.get("sent_to") or "").strip()[:80]
-                if state_name == "RUNNING" and from_role:
-                    record["from_role"] = from_role
-                if state_name == "DONE":
-                    if done_from:
-                        record["done_from"] = done_from
-                    if sent_to:
-                        record["sent_to"] = sent_to
-                if state_name == "WAITING":
-                    if sent_to:
-                        record["sent_to"] = sent_to
-                    else:
-                        previous = self.flow_statuses.get(role) or {}
-                        if previous.get("run_id") == owner and previous.get("sent_to"):
-                            record["sent_to"] = previous["sent_to"]
-                self.flow_statuses[role] = record
-                self.flow_role_order[role] = owner_order
-                changed[role] = dict(record)
-        return changed
+            existing_requests = self.flow_store.document["requests"]
+            effective_activate = activate or (not explicit_request_id and resolved_request_id not in existing_requests)
+            self.flow_store.patch(
+                request_id=resolved_request_id,
+                run_id=resolved_run_id,
+                updates=updates,
+                activate=effective_activate,
+                parent_request_id=parent_request_id,
+                goal_hash=goal_hash,
+                terminal_status=terminal_status,
+            )
+            self.flow_statuses = self.flow_store.active_projection()
+            return {role: dict(status) for role, status in self.flow_statuses.items()}
 
     def queue_auto_open_role(self, role: str, url: str = "") -> None:
         normalized = str(role or "").strip().upper()
@@ -835,7 +815,26 @@ def api_admin_command(req: AdminCommandRequest):
 
 @app.post("/api/admin/flow-status")
 def api_admin_flow_status(req: FlowStatusRequest):
-    return {"status": "OK", "flow_statuses": state.update_flow_statuses(req.run_id, req.updates)}
+    try:
+        flow_statuses = state.update_flow_statuses(
+            req.run_id,
+            req.updates,
+            request_id=req.request_id,
+            parent_request_id=req.parent_request_id,
+            goal_hash=req.goal_hash,
+            terminal_status=req.terminal_status,
+            activate=req.activate,
+        )
+    except FlowStoreMutationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "OK", "flow_statuses": flow_statuses, "flow": state.flow_store.read(req.request_id or req.run_id)}
+
+
+@app.get("/api/admin/flow")
+def api_admin_flow(request_id: str = ""):
+    return state.flow_store.read(request_id or None)
 
 
 @app.get("/api/admin/config")
@@ -867,7 +866,8 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
-        item("admin", "POST", "/api/admin/flow-status", "Update run-scoped browser role flow status."),
+        item("admin", "POST", "/api/admin/flow-status", "Atomically patch durable request-keyed semantic role flow state."),
+        item("admin", "GET", "/api/admin/flow", "Read durable active or request-specific semantic flow state.", "/api/admin/flow?request_id=demo-request-id"),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
         item("admin", "GET", "/api/admin/events", "Read recent event log.", "/api/admin/events?role=A&limit=20"),

@@ -103,7 +103,7 @@ def test_main_without_resp_from_outputs_response_path(monkeypatch, tmp_path, cap
     assert "bridge log should go to stderr" in captured.err
 
 
-def test_role_flow_status_marks_and_clears_only_the_target_role(monkeypatch, tmp_path, capsys) -> None:
+def test_role_flow_status_uses_durable_request_and_finalizes_without_clearing(monkeypatch, tmp_path, capsys) -> None:
     isolate_role_state(monkeypatch, tmp_path)
     flow_updates = []
 
@@ -111,8 +111,8 @@ def test_role_flow_status_marks_and_clears_only_the_target_role(monkeypatch, tmp
         def __init__(self, base_url: str, request_timeout: float) -> None:
             pass
 
-        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
-            flow_updates.append((run_id, updates))
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
+            flow_updates.append({"run_id": run_id, "updates": updates, **metadata})
             return {"status": "OK"}
 
         def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
@@ -126,12 +126,67 @@ def test_role_flow_status_marks_and_clears_only_the_target_role(monkeypatch, tmp
     assert code == 0
     assert payload["role"] == "TEST1"
     assert len(flow_updates) == 2
-    assert flow_updates[0][1] == {"TEST1": {"state": "RUNNING", "from_role": "USER"}}
-    assert flow_updates[1][0] == flow_updates[0][0]
-    assert flow_updates[1][1] == {"TEST1": {"state": "DONE", "done_from": "USER"}}
+    assert flow_updates[0]["run_id"] == payload["request_id"]
+    assert flow_updates[0]["run_id"] != payload["run_id"]
+    assert flow_updates[0]["request_id"] == payload["request_id"]
+    assert flow_updates[0]["activate"] is True
+    assert flow_updates[0]["terminal_status"] == ""
+    assert flow_updates[0]["updates"] == {
+        "TEST1": {"state": "RUNNING", "logical_role": "TEST1", "from_role": "USER"}
+    }
+    assert flow_updates[1]["run_id"] == flow_updates[0]["run_id"]
+    assert flow_updates[1]["request_id"] == payload["request_id"]
+    assert flow_updates[1]["terminal_status"] == "completed"
+    assert flow_updates[1]["updates"] == {
+        "TEST1": {"state": "DONE", "logical_role": "TEST1", "done_from": "USER"}
+    }
 
 
-def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_path, capsys) -> None:
+def test_direct_role_retry_reuses_durable_identity_and_clears_terminal_status(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    flow_updates = []
+    responses = [RuntimeError("first attempt failed"), "second attempt succeeded"]
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
+            flow_updates.append({"run_id": run_id, "updates": updates, **metadata})
+            return {"status": "OK"}
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+    request_id = "req_TEST1_retry-fixed"
+
+    first_code = role.main(["--role", "TEST1", "--prompt", "hello", "--request-id", request_id])
+    first_output = capsys.readouterr()
+    first_payload = stdout_json(first_output.out)
+    second_code = role.main(["--role", "TEST1", "--prompt", "hello", "--request-id", request_id])
+    second_output = capsys.readouterr()
+    second_payload = stdout_json(second_output.out)
+
+    assert first_code == 3
+    assert second_code == 0
+    assert first_payload["request_id"] == second_payload["request_id"] == request_id
+    assert first_payload["run_id"] != second_payload["run_id"]
+    assert [call["run_id"] for call in flow_updates] == [request_id, request_id, request_id, request_id]
+    assert flow_updates[0]["terminal_status"] == ""
+    assert flow_updates[1]["terminal_status"] == "failed_retryable"
+    assert flow_updates[2]["terminal_status"] == ""
+    assert flow_updates[2]["updates"]["TEST1"]["state"] == "RUNNING"
+    assert flow_updates[3]["terminal_status"] == "completed"
+    assert flow_updates[3]["updates"]["TEST1"]["state"] == "DONE"
+    assert len([line for line in first_output.out.splitlines() if line.strip()]) == 1
+    assert len([line for line in second_output.out.splitlines() if line.strip()]) == 1
+
+
+def test_role_flow_status_finalizes_failed_request_without_clearing(monkeypatch, tmp_path, capsys) -> None:
     isolate_role_state(monkeypatch, tmp_path)
     flow_updates = []
 
@@ -139,8 +194,8 @@ def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_p
         def __init__(self, base_url: str, request_timeout: float) -> None:
             pass
 
-        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
-            flow_updates.append((run_id, updates))
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
+            flow_updates.append({"run_id": run_id, "updates": updates, **metadata})
             return {"status": "OK"}
 
         def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
@@ -153,10 +208,16 @@ def test_role_flow_status_clears_target_after_runtime_failure(monkeypatch, tmp_p
 
     assert code == 3
     assert payload["status"] == "failed_retryable"
-    assert [updates for _run_id, updates in flow_updates] == [
-        {"TEST2": {"state": "RUNNING", "from_role": "USER"}},
-        {"TEST2": {"state": "DONE", "done_from": "USER"}},
-    ]
+    assert flow_updates[0]["request_id"] == payload["request_id"]
+    assert flow_updates[0]["activate"] is True
+    assert flow_updates[0]["updates"] == {
+        "TEST2": {"state": "RUNNING", "logical_role": "TEST2", "from_role": "USER"}
+    }
+    assert flow_updates[1]["request_id"] == payload["request_id"]
+    assert flow_updates[1]["terminal_status"] == "failed_retryable"
+    assert flow_updates[1]["updates"] == {
+        "TEST2": {"state": "DONE", "logical_role": "TEST2", "done_from": "USER"}
+    }
 
 
 def test_role_flow_status_does_not_render_route_detail_for_single_role(monkeypatch, tmp_path, capsys) -> None:
@@ -167,8 +228,8 @@ def test_role_flow_status_does_not_render_route_detail_for_single_role(monkeypat
         def __init__(self, base_url: str, request_timeout: float) -> None:
             pass
 
-        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
-            flow_updates.append(updates)
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
+            flow_updates.append({"run_id": run_id, "updates": updates, **metadata})
             return {"status": "OK"}
 
         def role_snapshot(self, role_name: str) -> dict:
@@ -184,7 +245,34 @@ def test_role_flow_status_does_not_render_route_detail_for_single_role(monkeypat
     stdout_json(capsys.readouterr().out)
 
     assert code == 0
-    assert flow_updates[0] == {"B": {"state": "RUNNING", "from_role": "USER"}}
+    assert flow_updates[0]["updates"] == {
+        "B": {"state": "RUNNING", "logical_role": "B", "from_role": "USER"}
+    }
+
+
+def test_role_flow_publication_failure_preserves_stdout_and_exit_contract(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+
+    class FakeClient:
+        def __init__(self, base_url: str, request_timeout: float) -> None:
+            pass
+
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
+            raise RuntimeError("flow backend unavailable")
+
+        def call_browser_role(self, role_name: str, prompt: str, timeout_s: float) -> str:
+            return "ok despite flow failure"
+
+    monkeypatch.setattr(role, "BridgeClient", FakeClient)
+
+    code = role.main(["--role", "TEST3", "--prompt", "hello"])
+    captured = capsys.readouterr()
+    payload = stdout_json(captured.out)
+
+    assert code == 0
+    assert payload["status"] == "completed"
+    assert response_text(payload) == "ok despite flow failure"
+    assert "[flow-ui] status update failed: flow backend unavailable" in captured.err
 
 
 def test_main_uses_resp_from_and_outputs_source_count(monkeypatch, tmp_path, capsys) -> None:
@@ -754,7 +842,7 @@ def install_stateful_client(
         def __init__(self, base_url: str, request_timeout: float) -> None:
             pass
 
-        def update_flow_statuses(self, run_id: str, updates: dict) -> dict:
+        def update_flow_statuses(self, run_id: str, updates: dict, **metadata) -> dict:
             return {"status": "OK"}
 
         def command_roundtrip(self, role_name: str, action: str, timeout_s: float = 20.0) -> dict:

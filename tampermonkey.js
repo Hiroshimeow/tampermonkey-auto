@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAuto Diagnostic Bridge Standalone
 // @namespace    http://tampermonkey.net/
-// @version      1.0.4
+// @version      1.0.5
 // @description  Standalone MAuto bridge without unsafe-eval or hot reload.
 // @match        https://chatgpt.com/*
 // @match        https://*.chatgpt.com/*
@@ -15,7 +15,7 @@
     'use strict';
 
     const SERVER_URL = 'http://127.0.0.1:8500';
-    const BRIDGE_VERSION = 'standalone-1.0.4';
+    const BRIDGE_VERSION = 'standalone-1.0.5';
     const PAGE_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     let observationSeq = 0;
     function nextObservationSeq() { observationSeq += 1; return observationSeq; }
@@ -1937,6 +1937,89 @@
             Math.max(1000, Number(config.report_wait_every_ms) || 1500)
         );
         let lastActivityAt = Date.now();
+        let stableCandidateKey = '';
+        let stableCandidateSamples = 0;
+        let strongestCandidateText = '';
+        let strongestCandidateCount = 0;
+        let strongestCandidatePage = '';
+
+        function resetStableCandidate() {
+            stableCandidateKey = '';
+            stableCandidateSamples = 0;
+        }
+
+        function observeStableCandidate(snapshot, text, assistantCount) {
+            const candidateText = String(text || '');
+            const hasFreshTurn = assistantCount > initialAssistantCount;
+            const hasFreshText = candidateText && candidateText !== initialAssistantText;
+            const complete = Boolean(
+                (hasFreshTurn || hasFreshText)
+                && snapshot.composer === true
+                && !snapshot.stop_visible
+                && !hasManualComposerInput(snapshot)
+                && !looksIncompleteAssistantText(candidateText)
+            );
+            if (!complete) {
+                resetStableCandidate();
+                return null;
+            }
+            const pageGeneration = String(
+                snapshot.page_instance_id
+                || (typeof PAGE_INSTANCE_ID !== 'undefined' ? PAGE_INSTANCE_ID : '')
+            );
+            const shorterPrefix = Boolean(
+                strongestCandidateText
+                && strongestCandidateCount === assistantCount
+                && strongestCandidatePage === pageGeneration
+                && strongestCandidateText.startsWith(candidateText)
+                && candidateText.length < strongestCandidateText.length
+            );
+            if (shorterPrefix) {
+                resetStableCandidate();
+                return null;
+            }
+            if (
+                !strongestCandidateText
+                || strongestCandidateCount !== assistantCount
+                || strongestCandidatePage !== pageGeneration
+                || candidateText.length >= strongestCandidateText.length
+                || !candidateText.startsWith(strongestCandidateText)
+            ) {
+                strongestCandidateText = candidateText;
+                strongestCandidateCount = assistantCount;
+                strongestCandidatePage = pageGeneration;
+            }
+            const candidateKey = JSON.stringify([candidateText, assistantCount, pageGeneration]);
+            stableCandidateSamples = candidateKey === stableCandidateKey ? stableCandidateSamples + 1 : 1;
+            stableCandidateKey = candidateKey;
+            if (stableCandidateSamples >= 2) {
+                return {
+                    snapshot,
+                    text: candidateText,
+                    assistant_count: assistantCount
+                };
+            }
+            return null;
+        }
+
+        async function reportStableCompletion(stableCompletion, extraResult = {}) {
+            await report('ASSISTANT_DONE', command.command_id, {
+                text: stableCompletion.text,
+                result: {
+                    assistant_len: stableCompletion.text.length,
+                    counts: stableCompletion.snapshot.messages.counts,
+                    stable_samples: stableCandidateSamples,
+                    ...extraResult,
+                    turn_context: {
+                        before_user_count: turnContext.before_user_count,
+                        before_assistant_count: turnContext.before_assistant_count,
+                        accepted_at: turnContext.accepted_at
+                    }
+                },
+                dom_info: stableCompletion.snapshot
+            });
+            lastAcceptedTurnContext = null;
+        }
 
         while (!stopped) {
             const snapshot = domSnapshot();
@@ -1948,6 +2031,12 @@
             const hasNewAssistantTurn = assistantCount > initialAssistantCount;
             const hasFreshAssistantText = assistantText && assistantText !== initialAssistantText;
             const hasFreshAssistantOutput = hasNewAssistantTurn || hasFreshAssistantText;
+
+            const stableCompletion = observeStableCandidate(snapshot, assistantText, assistantCount);
+            if (stableCompletion) {
+                await reportStableCompletion(stableCompletion);
+                return;
+            }
 
             if (Date.now() >= deadline) {
                 await report('ASSISTANT_TIMEOUT', command.command_id, {
@@ -2006,7 +2095,7 @@
             }
 
             if (snapshot.stop_visible) {
-                await sleep(heartbeatEveryMs);
+                await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
                 continue;
             }
 
@@ -2022,7 +2111,7 @@
                     dom_info: snapshot
                 });
                 lastActivityAt = Date.now();
-                await sleep(heartbeatEveryMs);
+                await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
                 continue;
             }
 
@@ -2035,21 +2124,15 @@
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
                 if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
-                    await report('ASSISTANT_DONE', command.command_id, {
-                        text: finalText,
-                        result: {
-                            assistant_len: finalText.length,
-                            counts: finalSnapshot.messages.counts,
-                            turn_context: {
-                                before_user_count: turnContext.before_user_count,
-                                before_assistant_count: turnContext.before_assistant_count,
-                                accepted_at: turnContext.accepted_at
-                            }
-                        },
-                        dom_info: finalSnapshot
-                    });
-                    lastAcceptedTurnContext = null;
-                    return;
+                    const syncedStableCompletion = observeStableCandidate(
+                        finalSnapshot,
+                        finalText,
+                        finalAssistantCount
+                    );
+                    if (syncedStableCompletion) {
+                        await reportStableCompletion(syncedStableCompletion);
+                        return;
+                    }
                 }
             }
 
@@ -2062,22 +2145,15 @@
                 const finalHasFreshText = finalText && finalText !== initialAssistantText;
                 const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
                 if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
-                    await report('ASSISTANT_DONE', command.command_id, {
-                        text: finalText,
-                        result: {
-                            assistant_len: finalText.length,
-                            counts: finalSnapshot.messages.counts,
-                            force_sync: true,
-                            turn_context: {
-                                before_user_count: turnContext.before_user_count,
-                                before_assistant_count: turnContext.before_assistant_count,
-                                accepted_at: turnContext.accepted_at
-                            }
-                        },
-                        dom_info: finalSnapshot
-                    });
-                    lastAcceptedTurnContext = null;
-                    return;
+                    const forceSyncedStableCompletion = observeStableCandidate(
+                        finalSnapshot,
+                        finalText,
+                        finalAssistantCount
+                    );
+                    if (forceSyncedStableCompletion) {
+                        await reportStableCompletion(forceSyncedStableCompletion, { force_sync: true });
+                        return;
+                    }
                 }
             }
 
@@ -2100,7 +2176,7 @@
                 return;
             }
 
-            await sleep(heartbeatEveryMs);
+            await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
         }
     }
 
@@ -2149,9 +2225,7 @@
             dom_info: snapshot
         });
         lastAcceptedTurnContext = null;
-        setTimeout(() => {
-            window.location.assign('/');
-        }, config.reload_after_timeout_ms);
+        window.location.assign('/');
     }
 
     function roleFromPayload(payload) {
@@ -2411,7 +2485,7 @@
                 updateUI();
                 return;
             }
-            flowStatus = response.flow_status || null;
+            flowStatus = hydrateFlowStatus(response && response.flow_status, requestRole);
             updateUI();
             if (response && response.command) {
                 const command = response.command;
@@ -2446,11 +2520,35 @@
         }, config.poll_ms);
     }
 
-    function flowStatusMarkup(status) {
-        const state = String(status && status.state || '').trim().toUpperCase();
+    function hydrateFlowStatus(status, physicalRole) {
+        if (!status || typeof status !== 'object' || Array.isArray(status)) {
+            return null;
+        }
+        const state = String(status.state || '').trim().toUpperCase();
         if (state !== 'RUNNING' && state !== 'WAITING' && state !== 'DONE') {
+            return null;
+        }
+        const normalizedPhysicalRole = String(physicalRole || '').trim().toUpperCase().slice(0, 80);
+        const hydrated = {
+            state,
+            logical_role: (String(status.logical_role || '').trim().toUpperCase() || normalizedPhysicalRole).slice(0, 80)
+        };
+        const fieldLimits = { run_id: 256, from_role: 80, done_from: 80, sent_to: 80 };
+        for (const [field, limit] of Object.entries(fieldLimits)) {
+            const value = String(status[field] || '').trim();
+            if (value) {
+                hydrated[field] = value.slice(0, limit);
+            }
+        }
+        return hydrated;
+    }
+
+    function flowStatusMarkup(status, physicalRole) {
+        const hydrated = hydrateFlowStatus(status, physicalRole);
+        if (!hydrated) {
             return '';
         }
+        const state = hydrated.state;
         let color = '#d6a84b';
         if (state === 'RUNNING') {
             color = '#ff5c5c';
@@ -2464,9 +2562,14 @@
             '"': '&quot;',
             "'": '&#39;'
         })[char]);
-        const fromRole = String(status.from_role || '').trim();
-        const doneFrom = String(status.done_from || '').trim();
-        const sentTo = String(status.sent_to || '').trim();
+        const normalizedPhysicalRole = String(physicalRole || '').trim().toUpperCase();
+        const logicalRole = String(hydrated.logical_role || '').trim().toUpperCase();
+        const stateLabel = logicalRole && logicalRole !== normalizedPhysicalRole
+            ? `${escapeText(logicalRole)} · ${state}`
+            : state;
+        const fromRole = String(hydrated.from_role || '').trim();
+        const doneFrom = String(hydrated.done_from || '').trim();
+        const sentTo = String(hydrated.sent_to || '').trim();
         const detail = state === 'RUNNING' && fromRole
             ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">From: ${escapeText(fromRole)}</div>`
             : state === 'DONE' && doneFrom
@@ -2474,7 +2577,7 @@
                 : state === 'WAITING' && sentTo
                     ? `<div id="mauto-flow-sent" style="font-size:8px;line-height:1.05;color:#9adfbe;margin-top:1px;">Sent to: ${escapeText(sentTo)}</div>`
                     : '';
-        return `<div id="mauto-flow-state" style="font-size:9px;font-weight:700;line-height:1.05;color:${color};margin-top:0;">${state}</div>${detail}`;
+        return `<div id="mauto-flow-state" style="font-size:9px;font-weight:700;line-height:1.05;color:${color};margin-top:0;">${stateLabel}</div>${detail}`;
     }
 
     function updateUI() {
@@ -2485,7 +2588,7 @@
         const role = nextRole();
         const hasRole = role !== 'NONE' && role !== 'None' && role !== '';
         const ver = BRIDGE_VERSION.replace('standalone-', '');
-        const flowMarkup = hasRole ? flowStatusMarkup(flowStatus) : '';
+        const flowMarkup = hasRole ? flowStatusMarkup(flowStatus, role) : '';
         const roleMargin = flowMarkup ? '1px' : '4px';
         uiContainer.innerHTML = hasRole ? `
             <div style="margin-bottom:${roleMargin};line-height:1.5;"><span style="color:#10a37f;font-weight:bold;">${role}</span> <span style="color:#888;">${ver}</span></div>

@@ -7,22 +7,38 @@ import time
 import uuid
 import re
 
+from contextlib import asynccontextmanager
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from apps.flow_store import DEFAULT_FLOW_PATH, FlowStore, FlowStoreMutationError
+from apps.task_scheduler import TaskScheduler
+from apps.task_store import (
+    DEFAULT_TASK_PATH,
+    RESERVING_WAKE_STATES,
+    TaskConflictError,
+    TaskStore,
+    TaskStoreMutationError,
+    normalize_role,
+    task_reserves_controller,
+)
 
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8500
+DASHBOARD_PATH = Path(__file__).resolve().with_name("dashboard.html")
 
 
 TERMINAL_STATES = {
+    "CANCELLED",
+    "EXPIRED",
     "PROBE_DONE",
     "DUMP_BUTTONS_DONE",
     "COMPOSER_STABLE",
@@ -55,6 +71,10 @@ TERMINAL_STATES = {
     "UNKNOWN_COMMAND",
     "ERROR_COMMAND",
 }
+
+
+PAGE_HANDOFF_SAFE_ACTIONS = {"PROBE", "SYNC_TRANSCRIPT", "WAIT_ASSISTANT_DONE"}
+COMMAND_CANCEL_STATES = {"CANCELLED", "EXPIRED"}
 
 
 class StatusRequest(BaseModel):
@@ -100,6 +120,11 @@ class AdminCommandRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AdminCommandCancelRequest(BaseModel):
+    state: str = "CANCELLED"
+    reason: str = "cancelled_by_admin"
+
+
 class AdminConfigRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
@@ -130,8 +155,44 @@ class FlowStatusRequest(BaseModel):
     updates: Dict[str, Optional[Dict[str, Any]]] = Field(default_factory=dict)
 
 
+class TaskCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+    target_root: str
+    branch: str
+    prompt: str
+    skill_path: str = "skills/ORCHESTRATOR.md"
+    controller_role: str
+    logical_roles: list[str]
+    physical_role_map: Dict[str, str]
+    finish_roles: list[str]
+    status: str = "BACKLOG"
+    enabled: bool = True
+    schedule: Dict[str, Any] = Field(default_factory=lambda: {"kind": "manual"})
+
+
+class TaskPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int
+    changes: Dict[str, Any] = Field(default_factory=dict)
+    actor_role: str = ""
+    wake_resolution: Optional[str] = None
+
+
+class TaskMoveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int
+    status: str
+    actor_role: str = ""
+
+
+class TaskRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int
+
+
 class DiagnosticState:
-    def __init__(self, flow_path=DEFAULT_FLOW_PATH):
+    def __init__(self, flow_path=DEFAULT_FLOW_PATH, task_path=DEFAULT_TASK_PATH, scheduler_poll_s: float = 1.0):
         self.lock = threading.RLock()
         self.commands = {}
         self.command_results = {}
@@ -151,6 +212,16 @@ class DiagnosticState:
         self.next_role_claim_generation = 0
         self.flow_store = FlowStore(flow_path)
         self.flow_statuses = self.flow_store.active_projection()
+        self.task_store = TaskStore(task_path)
+        self.server_instance_id = f"server-{uuid.uuid4().hex}"
+        self.task_scheduler = TaskScheduler(
+            store=self.task_store,
+            server_instance_id=self.server_instance_id,
+            readiness=self.controller_readiness,
+            create_command=self.create_command,
+            command_result=self.scheduler_command_result,
+            poll_interval_s=scheduler_poll_s,
+        )
         self.auto_open_roles = {}
         self.auto_role_inflight = defaultdict(int)
         self.config = {
@@ -221,6 +292,79 @@ class DiagnosticState:
         with self.lock:
             self.config.update(updates)
             return dict(self.config)
+
+    def role_is_online(self, role: str, *, now: float | None = None) -> tuple[bool, float | None]:
+        normalized = normalize_role(role)
+        seen_at = float(self.role_seen_at.get(normalized, 0.0) or 0.0)
+        age = max(0.0, (time.time() if now is None else now) - seen_at) if seen_at else None
+        poll_s = max(0.1, float(self.config.get("poll_ms", 800) or 800) / 1000.0)
+        return bool(age is not None and age <= max(10.0, poll_s * 5.0)), age
+
+    def controller_readiness(self, role: str) -> Dict[str, Any]:
+        normalized = normalize_role(role)
+        with self.lock:
+            online, _ = self.role_is_online(normalized)
+            dom = dict(self.dom_info.get(normalized) or {})
+            composer_text = str(dom.get("composer_text") or "")
+            if not composer_text and int(dom.get("composer_text_len") or 0) > 0:
+                composer_text = "<unknown-nonempty-composer>"
+            attachments = dom.get("composer_attachments")
+            attachment_count = len(attachments) if isinstance(attachments, list) else int(dom.get("attachment_count") or 0)
+            active = self.active_command(normalized)
+            return {
+                "online": online,
+                "active_command": dict(active) if active else None,
+                "composer": bool(dom.get("composer")),
+                "stop_visible": bool(dom.get("stop_visible")),
+                "composer_text": composer_text,
+                "attachment_count": attachment_count,
+                "manual_input": bool(dom.get("manual_input_pending")),
+            }
+
+    def scheduler_command_result(self, command_id: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            result = self.command_results.get(command_id)
+            return dict(result) if result is not None else None
+
+    def role_inventory(self) -> list[Dict[str, Any]]:
+        with self.lock:
+            roles = set(self.status) | set(self.role_seen_at) | set(self.role_owners) | set(self.dom_info) | set(self.commands) | set(self.flow_statuses)
+            tasks = self.task_store.list_tasks(include_archived=True)
+            for task in tasks:
+                roles.add(task["controller_role"])
+                roles.update(task["physical_role_map"].values())
+            result = []
+            for role in sorted(roles):
+                normalized = normalize_role(role)
+                online, age = self.role_is_online(normalized)
+                dom = dict(self.dom_info.get(normalized) or {})
+                flow = dict(self.flow_statuses.get(normalized) or {})
+                active = self.active_command(normalized)
+                reserved_task = next(
+                    (task for task in tasks if task["controller_role"] == normalized and task_reserves_controller(task) and not task.get("archived_at")),
+                    None,
+                )
+                result.append({
+                    "role": normalized,
+                    "online": online,
+                    "status": "ONLINE" if online else "OFFLINE",
+                    "last_seen_age_s": age,
+                    "current_logical_role": flow.get("logical_role") or None,
+                    "current_task_id": reserved_task["task_id"] if reserved_task else None,
+                    "reservation_state": (
+                        reserved_task["wake"]["state"] if reserved_task and reserved_task["wake"]["state"] in RESERVING_WAKE_STATES
+                        else reserved_task["status"] if reserved_task else None
+                    ),
+                    "page_path": dom.get("page_path") or dom.get("pathname") or "",
+                    "active_command": {
+                        "command_id": active.get("command_id"),
+                        "action": active.get("action"),
+                        "state": self.command_status.get(active.get("command_id"), active.get("status", "PENDING")),
+                    } if active else None,
+                    "transport": "userscript",
+                    "external_target": None,
+                })
+            return result
 
     def update_flow_statuses(
         self,
@@ -452,8 +596,52 @@ class DiagnosticState:
         current["observation_seq"] = accepted_seq
         return True, "accepted", accepted_seq
 
-    def create_command(self, role: str, action: str, payload: Optional[dict] = None):
-        command_id = str(uuid.uuid4())
+    def terminalize_command(self, command_id: str, terminal_state: str, reason: str) -> Optional[Dict[str, Any]]:
+        terminal_state = str(terminal_state or "").strip().upper()
+        if terminal_state not in COMMAND_CANCEL_STATES:
+            raise ValueError(f"unsupported command terminal state: {terminal_state or 'empty'}")
+        with self.lock:
+            existing = self.command_results.get(command_id)
+            if existing is not None:
+                return dict(existing)
+            cmd = next(
+                (candidate for candidate in self.commands.values() if candidate.get("command_id") == command_id),
+                None,
+            )
+            if not cmd:
+                return None
+            result = {
+                "role": cmd.get("role", ""),
+                "state": terminal_state,
+                "text": "",
+                "result": {"reason": str(reason or "unspecified")},
+                "dom_info": {},
+                "observation_accepted": False,
+                "observation_reason": "command_terminalized",
+                "ts": time.time(),
+            }
+            self.command_status[command_id] = terminal_state
+            self.command_results[command_id] = result
+            self.log(
+                str(cmd.get("role") or ""),
+                f"COMMAND_{terminal_state}",
+                command_id=command_id,
+                action=cmd.get("action", ""),
+                reason=result["result"]["reason"],
+                owner_page_instance_id=cmd.get("owner_page_instance_id", ""),
+            )
+            return dict(result)
+
+    def create_command(
+        self,
+        role: str,
+        action: str,
+        payload: Optional[dict] = None,
+        command_id: str = "",
+    ):
+        command_id = str(command_id or uuid.uuid4()).strip()
+        if not command_id or len(command_id) > 160:
+            raise ValueError("command_id must be a non-empty string of at most 160 characters")
         cmd = {
             "command_id": command_id,
             "role": role,
@@ -466,6 +654,24 @@ class DiagnosticState:
             "owner_session_id": "",
         }
         with self.lock:
+            if (
+                command_id in self.command_status
+                or command_id in self.command_results
+                or any(existing.get("command_id") == command_id for existing in self.commands.values())
+            ):
+                raise RuntimeError(f"command_id already exists: {command_id}")
+            active = self.active_command(role)
+            if active:
+                if str(active.get("action") or "").upper() not in PAGE_HANDOFF_SAFE_ACTIONS:
+                    raise RuntimeError(
+                        f"role {role} already has active mutating command {active.get('command_id')} "
+                        f"({active.get('action')})"
+                    )
+                self.terminalize_command(
+                    str(active.get("command_id") or ""),
+                    "CANCELLED",
+                    "superseded_by_new_command",
+                )
             self.commands[role] = cmd
             self.command_status[command_id] = "PENDING"
             self.log(role, "COMMAND_CREATED", command_id=command_id, action=action, payload=payload or {})
@@ -674,7 +880,18 @@ class DiagnosticState:
 
 state = DiagnosticState()
 
-app = FastAPI(title="MAuto Browser Bridge Server")
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    active_state = state
+    active_state.task_scheduler.start()
+    try:
+        yield
+    finally:
+        active_state.task_scheduler.stop()
+
+
+app = FastAPI(title="MAuto Browser Bridge Server", lifespan=app_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -723,6 +940,18 @@ def api_status(req: StatusRequest):
             and active_before_poll.get("status") == "DELIVERED"
             and not state.command_owner_matches(active_before_poll, req.page_instance_id)
         )
+        if (
+            command_locked_to_other_page
+            and same_claim
+            and str(active_before_poll.get("action") or "").upper() in PAGE_HANDOFF_SAFE_ACTIONS
+        ):
+            state.terminalize_command(
+                str(active_before_poll.get("command_id") or ""),
+                "CANCELLED",
+                "owner_page_replaced",
+            )
+            active_before_poll = None
+            command_locked_to_other_page = False
         page_current, page_reason = (False, "role_owner_mismatch")
         if retired_same_claim:
             page_reason = "stale_page_instance_id"
@@ -809,8 +1038,27 @@ def api_sync(req: SyncRequest):
 
 @app.post("/api/admin/command")
 def api_admin_command(req: AdminCommandRequest):
-    cmd = state.create_command(req.role, req.action, req.payload)
+    try:
+        cmd = state.create_command(req.role, req.action, req.payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"command": cmd}
+
+
+@app.post("/api/admin/command/{command_id}/cancel")
+def api_admin_command_cancel(command_id: str, req: AdminCommandCancelRequest):
+    try:
+        result = state.terminalize_command(command_id, req.state, req.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"unknown command: {command_id}")
+    return {
+        "command_id": command_id,
+        "status": result["state"],
+        "done": True,
+        "result": result,
+    }
 
 
 @app.post("/api/admin/flow-status")
@@ -835,6 +1083,123 @@ def api_admin_flow_status(req: FlowStatusRequest):
 @app.get("/api/admin/flow")
 def api_admin_flow(request_id: str = ""):
     return state.flow_store.read(request_id or None)
+
+
+def _validated_task_body(model_type, body: Any):
+    try:
+        return model_type.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail={"code": "invalid_task_request", "errors": exc.errors()}) from exc
+
+
+def _task_error(exc: Exception):
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail={"code": "task_not_found", "message": str(exc.args[0])}) from exc
+    if isinstance(exc, TaskConflictError):
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+    if isinstance(exc, TaskStoreMutationError):
+        raise HTTPException(status_code=409, detail={"code": "task_store_unavailable", "message": str(exc)}) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail={"code": "invalid_task_request", "message": str(exc)}) from exc
+    raise exc
+
+
+def _task_mutation_response(task: Dict[str, Any]):
+    return {"task": task, "store_revision": state.task_store.document["revision"]}
+
+
+@app.get("/api/admin/tasks")
+def api_admin_tasks(include_archived: bool = False):
+    payload = state.task_store.read(include_archived=include_archived)
+    payload["scheduler"] = state.task_scheduler.health()
+    return payload
+
+
+@app.get("/api/admin/tasks/{task_id}")
+def api_admin_task(task_id: str):
+    task = state.task_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail={"code": "task_not_found", "message": task_id})
+    return _task_mutation_response(task)
+
+
+@app.post("/api/admin/tasks")
+def api_admin_task_create(body: Any = Body(...)):
+    req = _validated_task_body(TaskCreateRequest, body)
+    try:
+        if req.status.strip().upper() not in {"BACKLOG", "READY", "BLOCKED"}:
+            raise ValueError("new tasks must start in BACKLOG, READY, or BLOCKED")
+        task = state.task_store.create(req.model_dump())
+        return _task_mutation_response(task)
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.patch("/api/admin/tasks/{task_id}")
+def api_admin_task_patch(task_id: str, body: Any = Body(...)):
+    req = _validated_task_body(TaskPatchRequest, body)
+    try:
+        task = state.task_store.patch(
+            task_id,
+            req.expected_revision,
+            req.changes,
+            actor_role=req.actor_role,
+            wake_resolution=req.wake_resolution,
+        )
+        state.task_scheduler.wake()
+        return _task_mutation_response(task)
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.post("/api/admin/tasks/{task_id}/move")
+def api_admin_task_move(task_id: str, body: Any = Body(...)):
+    req = _validated_task_body(TaskMoveRequest, body)
+    try:
+        task = state.task_store.move(task_id, req.expected_revision, req.status, actor_role=req.actor_role)
+        state.task_scheduler.wake()
+        return _task_mutation_response(task)
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.post("/api/admin/tasks/{task_id}/wake")
+def api_admin_task_wake(task_id: str, body: Any = Body(...)):
+    req = _validated_task_body(TaskRevisionRequest, body)
+    try:
+        return _task_mutation_response(state.task_scheduler.request_manual(task_id, req.expected_revision))
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.post("/api/admin/tasks/{task_id}/pause")
+def api_admin_task_pause(task_id: str, body: Any = Body(...)):
+    req = _validated_task_body(TaskRevisionRequest, body)
+    try:
+        return _task_mutation_response(state.task_store.pause(task_id, req.expected_revision))
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.post("/api/admin/tasks/{task_id}/resume")
+def api_admin_task_resume(task_id: str, body: Any = Body(...)):
+    req = _validated_task_body(TaskRevisionRequest, body)
+    try:
+        task = state.task_store.resume(task_id, req.expected_revision)
+        state.task_scheduler.wake()
+        return _task_mutation_response(task)
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+
+
+@app.get("/api/admin/roles")
+def api_admin_roles():
+    return {"roles": state.role_inventory()}
+
+
+@app.get("/dashboard", response_class=FileResponse)
+def dashboard():
+    return FileResponse(DASHBOARD_PATH, media_type="text/html")
 
 
 @app.get("/api/admin/config")
@@ -866,14 +1231,25 @@ def api_route_catalog(base_url: str = ""):
         item("client", "POST", "/api/report", "Browser command result/report ingestion."),
         item("client", "POST", "/api/sync", "Transcript and DOM snapshot sync."),
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
+        item("admin", "POST", "/api/admin/command/{command_id}/cancel", "Terminalize a stranded command as CANCELLED or EXPIRED."),
         item("admin", "POST", "/api/admin/flow-status", "Atomically patch durable request-keyed semantic role flow state."),
         item("admin", "GET", "/api/admin/flow", "Read durable active or request-specific semantic flow state.", "/api/admin/flow?request_id=demo-request-id"),
+        item("tasks", "GET", "/api/admin/tasks", "Read durable Kanban tasks and scheduler health."),
+        item("tasks", "GET", "/api/admin/tasks/{task_id}", "Read one durable task.", "/api/admin/tasks/task-demo"),
+        item("tasks", "POST", "/api/admin/tasks", "Create a validated dashboard task."),
+        item("tasks", "PATCH", "/api/admin/tasks/{task_id}", "Optimistically update task metadata/result or resolve a wake."),
+        item("tasks", "POST", "/api/admin/tasks/{task_id}/move", "Optimistically move or claim a Kanban task."),
+        item("tasks", "POST", "/api/admin/tasks/{task_id}/wake", "Reserve one manual wake occurrence."),
+        item("tasks", "POST", "/api/admin/tasks/{task_id}/pause", "Pause task scheduling."),
+        item("tasks", "POST", "/api/admin/tasks/{task_id}/resume", "Resume and recompute task scheduling."),
+        item("tasks", "GET", "/api/admin/roles", "Read generic userscript role inventory and task reservations."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
         item("admin", "GET", "/api/admin/events", "Read recent event log.", "/api/admin/events?role=A&limit=20"),
         item("admin", "GET", "/api/admin/config", "Read runtime config."),
         item("admin", "POST", "/api/admin/config", "Update runtime config."),
         item("admin", "GET", "/api/admin/routes", "List available server endpoints."),
+        item("presentation", "GET", "/dashboard", "Polling Kanban task control plane with live flow and role status."),
     ]
 
 

@@ -15,13 +15,15 @@ class DiagnosticControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.flow_path = Path(self.temp_dir.name) / ".role_state" / "flow.json"
+        self.task_path = Path(self.temp_dir.name) / ".role_state" / "tasks.json"
         self.client = TestClient(controller.app)
-        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path, task_path=self.task_path)
         for role in ("DEV", "IMG", "REVIEW", "SOLO"):
             controller.state.status[role] = "ONLINE"
             controller.state.role_seen_at[role] = time.time()
 
     def tearDown(self):
+        controller.state.task_scheduler.stop()
         self.temp_dir.cleanup()
 
     def test_status_report_and_sync_flow(self):
@@ -404,6 +406,201 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertEqual(new_lease["command"]["command_id"], new_command["command_id"])
         self.assertEqual(controller.state.commands["A"]["owner_page_instance_id"], "page-a-reload")
+
+    def test_new_page_cancels_stranded_probe_and_accepts_clean_observation(self):
+        claim = self.client.post("/api/reserve-role-claim", json={"role": "PLAN"}).json()["role_claim_id"]
+        identity = {"role": "PLAN", "role_owner_id": "tab-1", "role_claim_id": claim}
+        self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "claim_role": True,
+                "observation_seq": 1,
+                "dom_info": {"page_path": "/c/old", "marker": "old"},
+            },
+        )
+        command = controller.state.create_command("PLAN", "PROBE", {})
+        leased = self.client.post(
+            "/api/status",
+            json={**identity, "session_id": "/c/old", "page_instance_id": "page-old"},
+        ).json()
+
+        recovered = self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/",
+                "page_instance_id": "page-new",
+                "observation_seq": 1,
+                "dom_info": {"page_path": "/", "marker": "new"},
+            },
+        ).json()
+
+        self.assertEqual(leased["command"]["command_id"], command["command_id"])
+        self.assertEqual(recovered["command"]["action"], "WAIT")
+        self.assertFalse(recovered["clear_role"])
+        self.assertTrue(recovered["observation_accepted"])
+        self.assertEqual(controller.state.observation_pages["PLAN"]["page_instance_id"], "page-new")
+        self.assertEqual(controller.state.dom_info["PLAN"]["marker"], "new")
+        self.assertEqual(controller.state.command_status[command["command_id"]], "CANCELLED")
+        self.assertEqual(controller.state.command_results[command["command_id"]]["result"]["reason"], "owner_page_replaced")
+
+    def test_new_page_cancels_delivered_assistant_wait_once_and_leases_next_command(self):
+        claim = self.client.post("/api/reserve-role-claim", json={"role": "PLAN"}).json()["role_claim_id"]
+        identity = {"role": "PLAN", "role_owner_id": "tab-1", "role_claim_id": claim}
+        self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "claim_role": True,
+                "observation_seq": 1,
+                "dom_info": {"page_path": "/c/old", "marker": "old"},
+            },
+        )
+        command = controller.state.create_command("PLAN", "WAIT_ASSISTANT_DONE", {})
+        leased = self.client.post(
+            "/api/status",
+            json={**identity, "session_id": "/c/old", "page_instance_id": "page-old"},
+        ).json()
+
+        replaced = self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/",
+                "page_instance_id": "page-new",
+                "observation_seq": 1,
+                "dom_info": {"page_path": "/", "marker": "new"},
+            },
+        ).json()
+        repeated = self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/",
+                "page_instance_id": "page-new",
+                "observation_seq": 2,
+                "dom_info": {"page_path": "/", "marker": "newer"},
+            },
+        ).json()
+        stale_report = self.client.post(
+            "/api/report",
+            json={
+                **identity,
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "command_id": command["command_id"],
+                "state": "ASSISTANT_DONE",
+                "text": "late old-page response",
+            },
+        ).json()
+
+        result = controller.state.command_results[command["command_id"]]
+        self.assertEqual(leased["command"]["command_id"], command["command_id"])
+        self.assertEqual(replaced["command"]["action"], "WAIT")
+        self.assertTrue(replaced["observation_accepted"])
+        self.assertTrue(repeated["observation_accepted"])
+        self.assertEqual(result["state"], "CANCELLED")
+        self.assertEqual(result["result"]["reason"], "owner_page_replaced")
+        self.assertEqual(stale_report["status"], "IGNORED")
+        self.assertEqual(controller.state.command_results[command["command_id"]], result)
+
+        next_command = controller.state.create_command("PLAN", "PROBE", {})
+        next_lease = self.client.post(
+            "/api/status",
+            json={**identity, "session_id": "/", "page_instance_id": "page-new"},
+        ).json()
+        self.assertEqual(next_lease["command"]["command_id"], next_command["command_id"])
+
+    def test_expired_probe_is_terminal_and_unblocks_next_command(self):
+        command = controller.state.create_command("A", "PROBE", {})
+        leased = self.client.post(
+            "/api/status",
+            json={"role": "A", "session_id": "/c/old", "page_instance_id": "page-old"},
+        ).json()
+        expired = self.client.post(
+            f"/api/admin/command/{command['command_id']}/cancel",
+            json={"state": "EXPIRED", "reason": "bridge_timeout"},
+        ).json()
+        next_command = controller.state.create_command("A", "PROBE", {})
+        next_lease = self.client.post(
+            "/api/status",
+            json={"role": "A", "session_id": "/", "page_instance_id": "page-new"},
+        ).json()
+
+        self.assertEqual(leased["command"]["command_id"], command["command_id"])
+        self.assertTrue(expired["done"])
+        self.assertEqual(expired["status"], "EXPIRED")
+        self.assertEqual(expired["result"]["result"]["reason"], "bridge_timeout")
+        self.assertEqual(next_lease["command"]["command_id"], next_command["command_id"])
+
+    def test_superseded_probe_is_cancelled_instead_of_orphaned(self):
+        first = controller.state.create_command("A", "PROBE", {})
+        second = controller.state.create_command("A", "PROBE", {})
+
+        self.assertEqual(controller.state.command_status[first["command_id"]], "CANCELLED")
+        self.assertEqual(
+            controller.state.command_results[first["command_id"]]["result"]["reason"],
+            "superseded_by_new_command",
+        )
+        self.assertEqual(controller.state.active_command("A")["command_id"], second["command_id"])
+
+    def test_admin_cannot_supersede_active_mutating_command(self):
+        command = controller.state.create_command("A", "CLICK_SEND", {})
+        self.client.post(
+            "/api/status",
+            json={"role": "A", "session_id": "/c/owner", "page_instance_id": "page-owner"},
+        )
+
+        rejected = self.client.post(
+            "/api/admin/command",
+            json={"role": "A", "action": "PROBE", "payload": {}},
+        )
+
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(controller.state.active_command("A")["command_id"], command["command_id"])
+        self.assertEqual(controller.state.command_status[command["command_id"]], "DELIVERED")
+
+    def test_new_page_cannot_steal_mutating_command_from_same_claim(self):
+        claim = self.client.post("/api/reserve-role-claim", json={"role": "PLAN"}).json()["role_claim_id"]
+        identity = {"role": "PLAN", "role_owner_id": "tab-1", "role_claim_id": claim}
+        self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/c/old",
+                "page_instance_id": "page-old",
+                "claim_role": True,
+                "observation_seq": 1,
+                "dom_info": {"marker": "old"},
+            },
+        )
+        command = controller.state.create_command("PLAN", "CLICK_SEND", {})
+        leased = self.client.post(
+            "/api/status",
+            json={**identity, "session_id": "/c/old", "page_instance_id": "page-old"},
+        ).json()
+        rival = self.client.post(
+            "/api/status",
+            json={
+                **identity,
+                "session_id": "/",
+                "page_instance_id": "page-new",
+                "observation_seq": 1,
+                "dom_info": {"marker": "new"},
+            },
+        ).json()
+
+        self.assertEqual(leased["command"]["command_id"], command["command_id"])
+        self.assertEqual(rival["command"]["action"], "WAIT")
+        self.assertFalse(rival["observation_accepted"])
+        self.assertEqual(controller.state.command_status[command["command_id"]], "DELIVERED")
+        self.assertEqual(controller.state.observation_pages["PLAN"]["page_instance_id"], "page-old")
+        self.assertEqual(controller.state.dom_info["PLAN"]["marker"], "old")
 
     def test_role_owner_claim_survives_reload_but_rejects_displaced_claim(self):
         first_claim = self.client.post("/api/reserve-role-claim", json={"role": "PLAN"}).json()["role_claim_id"]
@@ -863,7 +1060,7 @@ class DiagnosticControllerTests(unittest.TestCase):
             },
         )
 
-        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path, task_path=self.task_path)
         status = self.client.post(
             "/api/status",
             json={"role": "SHARED", "session_id": "/c/restart", "page_instance_id": "page-restart"},
@@ -883,7 +1080,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         corrupt = b'{"version":1,"requests":'
         self.flow_path.parent.mkdir(parents=True, exist_ok=True)
         self.flow_path.write_bytes(corrupt)
-        controller.state = controller.DiagnosticState(flow_path=self.flow_path)
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path, task_path=self.task_path)
 
         read = self.client.get("/api/admin/flow")
         mutation = self.client.post(
@@ -1052,6 +1249,20 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertFalse(role_payload["online"])
         self.assertIsNone(role_payload["last_seen_age_s"])
 
+    def test_dashboard_serves_repository_owned_html_file(self):
+        self.assertEqual(
+            controller.DASHBOARD_PATH,
+            Path(controller.__file__).resolve().with_name("dashboard.html"),
+        )
+
+        response = self.client.get("/dashboard")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/html"))
+        self.assertIn("<title>Stable Flow Kanban</title>", response.text)
+        self.assertIn('id="dashboard-root"', response.text)
+        self.assertIn('data-dashboard-version="5"', response.text)
+
     def test_admin_routes_lists_samples(self):
         response = self.client.get("/api/admin/routes")
         self.assertEqual(response.status_code, 200)
@@ -1060,7 +1271,11 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
-        self.assertEqual({"client", "admin"}, {route["group"] for route in routes})
+        dashboard_route = next(route for route in routes if route["path"] == "/dashboard")
+        self.assertEqual(dashboard_route["method"], "GET")
+        self.assertEqual(dashboard_route["group"], "presentation")
+        self.assertEqual(dashboard_route["sample"], "/dashboard")
+        self.assertEqual({"client", "admin", "tasks", "presentation"}, {route["group"] for route in routes})
 
     def test_startup_log_lists_backend_api_samples(self):
         with patch("builtins.print") as print_mock:
@@ -1070,6 +1285,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertIn("backend API", output)
         self.assertIn("http://127.0.0.1:8500/api/admin/role/A", output)
         self.assertIn("http://127.0.0.1:8500/api/admin/routes", output)
+        self.assertIn("http://127.0.0.1:8500/dashboard", output)
 
     def test_admin_config_get_and_partial_update(self):
         get_response = self.client.get("/api/admin/config")
@@ -1815,6 +2031,246 @@ class DiagnosticControllerTests(unittest.TestCase):
         second = self.client.post("/api/claim-role", json={"session_id": "/c/next"})
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()["role"], "")
+
+
+class TaskControlPlaneTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name) / ".role_state"
+        self.flow_path = root / "flow.json"
+        self.task_path = root / "tasks.json"
+        controller.state = controller.DiagnosticState(
+            flow_path=self.flow_path,
+            task_path=self.task_path,
+            scheduler_poll_s=0.01,
+        )
+        self.client = TestClient(controller.app)
+
+    def tearDown(self):
+        controller.state.task_scheduler.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def payload(**overrides):
+        data = {
+            "title": "Dashboard task",
+            "target_root": r"E:\\target",
+            "branch": "feat/task",
+            "prompt": "Inspect current evidence and implement the authorized task.",
+            "skill_path": "skills/ORCHESTRATOR.md",
+            "controller_role": "control_x",
+            "logical_roles": ["dev1", "review2", "plan_z"],
+            "physical_role_map": {"dev1": "worker_a", "review2": "worker_b", "plan_z": "worker_a"},
+            "finish_roles": ["plan_z"],
+            "status": "READY",
+            "enabled": True,
+            "schedule": {"kind": "manual"},
+        }
+        data.update(overrides)
+        return data
+
+    def create(self, **overrides):
+        response = self.client.post("/api/admin/tasks", json=self.payload(**overrides))
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["task"]
+
+    def test_task_crud_move_archive_and_revision_conflicts(self):
+        task = self.create()
+        listed = self.client.get("/api/admin/tasks").json()
+        self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+        self.assertIn("scheduler", listed)
+        self.assertEqual(self.client.get(f"/api/admin/tasks/{task['task_id']}").status_code, 200)
+
+        changed = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": task["revision"], "changes": {"title": "Changed"}},
+        ).json()["task"]
+        stale = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": task["revision"], "changes": {"title": "Stale"}},
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["detail"]["code"], "stale_revision")
+
+        wrong = self.client.post(
+            f"/api/admin/tasks/{task['task_id']}/move",
+            json={"expected_revision": changed["revision"], "status": "RUNNING", "actor_role": "OTHER"},
+        )
+        self.assertEqual(wrong.status_code, 409)
+        self.assertEqual(wrong.json()["detail"]["code"], "controller_mismatch")
+        running = self.client.post(
+            f"/api/admin/tasks/{task['task_id']}/move",
+            json={"expected_revision": changed["revision"], "status": "RUNNING", "actor_role": "CONTROL_X"},
+        ).json()["task"]
+        linked = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": running["revision"], "actor_role": "CONTROL_X", "changes": {"active_request_id": "req-1"}},
+        ).json()["task"]
+        blocked_reassign = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": linked["revision"], "changes": {"controller_role": "NEW_CONTROL"}},
+        )
+        self.assertEqual(blocked_reassign.status_code, 409)
+        self.assertEqual(blocked_reassign.json()["detail"]["code"], "active_task_reassignment")
+        done = self.client.post(
+            f"/api/admin/tasks/{task['task_id']}/move",
+            json={"expected_revision": linked["revision"], "status": "DONE", "actor_role": "CONTROL_X"},
+        ).json()["task"]
+        archived = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": done["revision"], "changes": {"archived": True}},
+        ).json()["task"]
+        self.assertTrue(archived["archived_at"])
+        self.assertEqual(self.client.get("/api/admin/tasks").json()["tasks"], [])
+        self.assertEqual(len(self.client.get("/api/admin/tasks?include_archived=true").json()["tasks"]), 1)
+
+    def test_controller_conflict_pause_resume_and_required_error_classes(self):
+        first = self.create(title="first")
+        second = self.create(title="second")
+        running = self.client.post(
+            f"/api/admin/tasks/{first['task_id']}/move",
+            json={"expected_revision": first["revision"], "status": "RUNNING", "actor_role": "CONTROL_X"},
+        )
+        self.assertEqual(running.status_code, 200)
+        conflict = self.client.post(
+            f"/api/admin/tasks/{second['task_id']}/move",
+            json={"expected_revision": second["revision"], "status": "RUNNING", "actor_role": "CONTROL_X"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["detail"]["code"], "controller_busy")
+
+        paused = self.client.post(
+            f"/api/admin/tasks/{second['task_id']}/pause",
+            json={"expected_revision": second["revision"]},
+        ).json()["task"]
+        self.assertFalse(paused["enabled"])
+        resumed = self.client.post(
+            f"/api/admin/tasks/{second['task_id']}/resume",
+            json={"expected_revision": paused["revision"]},
+        ).json()["task"]
+        self.assertTrue(resumed["enabled"])
+        self.assertEqual(self.client.get("/api/admin/tasks/not-found").status_code, 404)
+        bad_schedule = self.client.post(
+            "/api/admin/tasks",
+            json=self.payload(schedule={"kind": "interval", "minutes": 0}),
+        )
+        self.assertEqual(bad_schedule.status_code, 400)
+        bad_field = self.client.post(
+            "/api/admin/tasks",
+            json={**self.payload(), "command": "do something"},
+        )
+        self.assertEqual(bad_field.status_code, 400)
+
+    def test_create_command_accepts_exact_durable_id_and_rejects_collision(self):
+        command = controller.state.create_command("CONTROL_X", "PROBE", {"depth": 1}, "durable-command-id")
+        self.assertEqual(command["command_id"], "durable-command-id")
+        with self.assertRaisesRegex(RuntimeError, "command_id already exists"):
+            controller.state.create_command("OTHER", "PROBE", {}, "durable-command-id")
+        with self.assertRaisesRegex(ValueError, "command_id"):
+            controller.state.create_command("OTHER", "PROBE", {}, " " * 4)
+
+    def test_required_conflicts_invalid_transition_archive_execution_and_uncertain_wake(self):
+        backlog = self.create(title="backlog", status="BACKLOG", controller_role="controller_a")
+        invalid = self.client.post(
+            f"/api/admin/tasks/{backlog['task_id']}/move",
+            json={"expected_revision": backlog["revision"], "status": "RUNNING", "actor_role": "CONTROLLER_A"},
+        )
+        self.assertEqual(invalid.status_code, 409)
+        self.assertEqual(invalid.json()["detail"]["code"], "invalid_state_transition")
+
+        archive = self.client.patch(
+            f"/api/admin/tasks/{backlog['task_id']}",
+            json={"expected_revision": backlog["revision"], "changes": {"archived": True}},
+        )
+        self.assertEqual(archive.status_code, 409)
+        self.assertEqual(archive.json()["detail"]["code"], "archive_requires_done")
+
+        ready = self.create(title="execution", controller_role="controller_b")
+        wrong_execution = self.client.patch(
+            f"/api/admin/tasks/{ready['task_id']}",
+            json={"expected_revision": ready["revision"], "actor_role": "OTHER", "changes": {"blocker": "blocked"}},
+        )
+        self.assertEqual(wrong_execution.status_code, 409)
+        self.assertEqual(wrong_execution.json()["detail"]["code"], "controller_mismatch")
+
+        claimed = self.client.post(
+            f"/api/admin/tasks/{ready['task_id']}/wake",
+            json={"expected_revision": ready["revision"]},
+        ).json()["task"]
+        duplicate = self.client.post(
+            f"/api/admin/tasks/{ready['task_id']}/wake",
+            json={"expected_revision": claimed["revision"]},
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json()["detail"]["code"], "duplicate_or_uncertain_wake")
+
+        uncertain = controller.state.task_store.update_wake(
+            ready["task_id"], claimed["revision"], state="UNCERTAIN", error="ambiguous", blocker="ambiguous"
+        )
+        unresolved = self.client.patch(
+            f"/api/admin/tasks/{ready['task_id']}",
+            json={"expected_revision": uncertain["revision"], "actor_role": "CONTROLLER_B", "changes": {}, "wake_resolution": "invalid"},
+        )
+        self.assertEqual(unresolved.status_code, 400)
+        resolved = self.client.patch(
+            f"/api/admin/tasks/{ready['task_id']}",
+            json={"expected_revision": uncertain["revision"], "actor_role": "CONTROLLER_B", "changes": {}, "wake_resolution": "not_sent"},
+        )
+        self.assertEqual(resolved.status_code, 200)
+        self.assertEqual(resolved.json()["task"]["wake"]["state"], "IDLE")
+
+    def test_wake_is_reserved_server_side_without_shell_or_direct_dashboard_command(self):
+        task = self.create(controller_role="offline_controller")
+        with patch("server.subprocess.run") as subprocess_run:
+            response = self.client.post(
+                f"/api/admin/tasks/{task['task_id']}/wake",
+                json={"expected_revision": task["revision"]},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["task"]["wake"]["state"], "CLAIMED")
+        subprocess_run.assert_not_called()
+        controller.state.task_scheduler.tick()
+        current = self.client.get(f"/api/admin/tasks/{task['task_id']}").json()["task"]
+        self.assertEqual(current["wake"]["state"], "DEFERRED")
+        self.assertEqual(current["wake"]["error"], "controller_offline")
+        self.assertEqual(controller.state.commands, {})
+
+    def test_role_inventory_unions_opaque_assignments_and_userscript_seam(self):
+        task = self.create(controller_role="ops_a", physical_role_map={"dev1": "box_7", "review2": "worker-12", "plan_z": "box_7"})
+        controller.state.role_seen_at["OPS_A"] = time.time()
+        controller.state.dom_info["OPS_A"] = {"composer": True, "page_path": "/c/controller"}
+        roles = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertIn("OPS_A", roles)
+        self.assertIn("BOX_7", roles)
+        self.assertIn("WORKER-12", roles)
+        self.assertEqual(roles["OPS_A"]["transport"], "userscript")
+        self.assertIsNone(roles["OPS_A"]["external_target"])
+        self.assertEqual(roles["OPS_A"]["page_path"], "/c/controller")
+        self.assertIsNone(roles["OPS_A"]["current_task_id"])
+
+    def test_lifespan_starts_and_stops_exact_scheduler_instance(self):
+        active = controller.state
+        self.assertFalse(active.task_scheduler.health()["running"])
+        with TestClient(controller.app) as client:
+            health = client.get("/api/admin/tasks").json()["scheduler"]
+            self.assertTrue(health["running"])
+            self.assertEqual(health["server_instance_id"], active.server_instance_id)
+        self.assertFalse(active.task_scheduler.health()["running"])
+
+    def test_task_store_load_error_isolated_from_flow_role_and_command_reads(self):
+        corrupt = b'{"version":1,"tasks":'
+        self.task_path.parent.mkdir(parents=True, exist_ok=True)
+        self.task_path.write_bytes(corrupt)
+        controller.state = controller.DiagnosticState(flow_path=self.flow_path, task_path=self.task_path)
+        tasks = self.client.get("/api/admin/tasks")
+        self.assertEqual(tasks.status_code, 200)
+        self.assertIsNotNone(tasks.json()["load_error"])
+        self.assertEqual(self.client.get("/api/admin/flow").status_code, 200)
+        self.assertEqual(self.client.get("/api/admin/role/ANY").status_code, 200)
+        create = self.client.post("/api/admin/tasks", json=self.payload())
+        self.assertEqual(create.status_code, 409)
+        self.assertEqual(create.json()["detail"]["code"], "task_store_unavailable")
+        self.assertEqual(self.task_path.read_bytes(), corrupt)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,12 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 const metadataVersion = source.match(/\/\/ @version\s+([^\s]+)/)?.[1];
 const bridgeVersion = source.match(/const BRIDGE_VERSION = 'standalone-([^']+)'/)?.[1];
 assert.equal(bridgeVersion, metadataVersion, 'userscript metadata and bridge runtime versions must stay in sync');
-assert.equal(metadataVersion, '1.0.4', 'watchdog sampling release must identify itself as version 1.0.4');
+assert.equal(metadataVersion, '1.0.5', 'flow dashboard release must identify itself as version 1.0.5');
 assert.match(source, /bridge_version:\s*BRIDGE_VERSION/, 'domSnapshot must expose the active userscript version');
 assert.match(source, /let flowStatus = null;/, 'browser poll state must retain only this tab flow status');
-assert.match(source, /flowStatus = response\.flow_status \|\| null;/, 'status poll must update flow UI state from backend');
-assert.match(source, /function flowStatusMarkup\(status\)/, 'flow status rendering must be isolated in a small helper');
+assert.match(source, /function hydrateFlowStatus\(status,\s*physicalRole\)/, 'flow status hydration must be isolated in a pure helper');
+assert.match(source, /flowStatus = hydrateFlowStatus\(response && response\.flow_status,\s*requestRole\);/, 'status poll must hydrate only the exact requested physical role response');
+assert.match(source, /function flowStatusMarkup\(status,\s*physicalRole\)/, 'flow status rendering must receive the physical role explicitly');
 assert.doesNotMatch(source, />QUEUED</, 'flow UI must never render a QUEUED state');
 assert.match(source, /composer_watchdog_ms:\s*60000/, 'stale composer watchdog must use a 60 second window');
 assert.match(source, /composer_watchdog_poll_ms:\s*20000/, 'stale composer watchdog must sample every 20 seconds');
@@ -58,6 +59,10 @@ assert.match(source, /Date\.now\(\) >= deadline[\s\S]*?ASSISTANT_TIMEOUT/, 'WAIT
 assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
 assert.match(source, /function looksIncompleteAssistantText\(text\)/, 'WAIT_ASSISTANT_DONE must detect partial JSON/code block text');
 assert.match(source, /!looksIncompleteAssistantText\(finalText\)/, 'WAIT_ASSISTANT_DONE must not report done for incomplete final text');
+assert.match(source, /stableCandidateSamples/, 'WAIT_ASSISTANT_DONE must track repeated stable complete observations');
+assert.match(source, /stableCandidateSamples\s*>=\s*2/, 'WAIT_ASSISTANT_DONE must require two matching complete observations');
+assert.match(source, /snapshot\.composer\s*===\s*true/, 'WAIT_ASSISTANT_DONE stable completion must require an existing composer');
+assert.match(source, /stableCompletion[\s\S]*?ASSISTANT_DONE[\s\S]*?Date\.now\(\)\s*>=\s*deadline/, 'stable completion must be evaluated before timeout for the same sampled state');
 assert.match(source, /function hasManualComposerInput\(snapshot\)/, 'tampermonkey.js must centralize manual composer detection');
 assert.match(source, /function normalizeComposerText\(text\)/, 'composer ownership must use conservative normalization');
 assert.match(source, /function composerOwnsExpectedPrompt\(snapshot,\s*expectedText\)/, 'CLICK_SEND must verify expected prompt ownership');
@@ -220,35 +225,77 @@ assert.equal(
 
 const flowUiContext = {};
 vm.runInNewContext(
-    `${extractFunction('flowStatusMarkup')}; globalThis.flowStatusMarkup = flowStatusMarkup;`,
+    `${extractFunction('hydrateFlowStatus')}; ${extractFunction('flowStatusMarkup')}; globalThis.hydrateFlowStatus = hydrateFlowStatus; globalThis.flowStatusMarkup = flowStatusMarkup;`,
     flowUiContext,
 );
+const hydrateFlowStatus = flowUiContext.hydrateFlowStatus;
 const flowStatusMarkup = flowUiContext.flowStatusMarkup;
+const hydratedFlow = JSON.parse(JSON.stringify(hydrateFlowStatus({
+    run_id: 'run-1',
+    state: ' running ',
+    logical_role: ' plan ',
+    from_role: 'User',
+    done_from: 'REVIEW',
+    sent_to: 'DEV',
+    arbitrary: '<script>drop me</script>',
+}, ' dev ')));
+assert.deepEqual(hydratedFlow, {
+    run_id: 'run-1',
+    state: 'RUNNING',
+    logical_role: 'PLAN',
+    from_role: 'User',
+    done_from: 'REVIEW',
+    sent_to: 'DEV',
+}, 'hydration must normalize state/logical role and copy only the display whitelist');
+assert.equal(hydrateFlowStatus(null, 'DEV'), null, 'missing flow state must clear the local display');
+assert.equal(hydrateFlowStatus([], 'DEV'), null, 'array payloads are not valid flow status objects');
+assert.equal(hydrateFlowStatus({ state: 'QUEUED' }, 'DEV'), null, 'unknown semantic states must clear the local display');
+assert.equal(hydrateFlowStatus({ state: 'WAITING' }, 'dev').logical_role, 'DEV', 'missing logical role must fall back to the physical role');
+const boundedFlow = hydrateFlowStatus({
+    state: 'RUNNING',
+    run_id: 'r'.repeat(300),
+    logical_role: 'p'.repeat(100),
+    from_role: 'f'.repeat(100),
+    done_from: 'd'.repeat(100),
+    sent_to: 's'.repeat(100),
+}, 'x'.repeat(100));
+assert.equal(boundedFlow.run_id.length, 256, 'run_id must be bounded for local display state');
+assert.equal(boundedFlow.logical_role.length, 80, 'logical role must retain the server display-field bound');
+assert.equal(boundedFlow.from_role.length, 80, 'from role must retain the server display-field bound');
+assert.equal(boundedFlow.done_from.length, 80, 'done-from role must retain the server display-field bound');
+assert.equal(boundedFlow.sent_to.length, 80, 'sent-to role must retain the server display-field bound');
+
 const runningMarkup = flowStatusMarkup({
     state: 'RUNNING',
+    logical_role: 'PLAN',
     from_role: 'User',
-});
+}, 'DEV');
 assert.match(runningMarkup, /id="mauto-flow-state"/, 'running state must use a dedicated compact UI element');
 assert.match(runningMarkup, /color:#ff5c5c/, 'RUNNING must render red');
-assert.match(runningMarkup, />RUNNING</, 'running state label must be visible');
+assert.match(runningMarkup, />PLAN · RUNNING</, 'a shared physical tab must show the active logical role');
 assert.match(runningMarkup, /From: User/, 'turn 1 must show From: User');
 
-const waitingMarkup = flowStatusMarkup({ state: 'WAITING' });
+const sameRoleMarkup = flowStatusMarkup({ state: 'RUNNING', logical_role: 'TEST1' }, 'TEST1');
+assert.match(sameRoleMarkup, />RUNNING</, 'matching logical and physical roles render only the state');
+assert.doesNotMatch(sameRoleMarkup, /TEST1 · RUNNING/, 'matching roles must not duplicate the physical role');
+const waitingMarkup = flowStatusMarkup({ state: 'WAITING', logical_role: 'DEV' }, 'DEV');
 assert.match(waitingMarkup, /color:#d6a84b/, 'WAITING must render amber');
 assert.match(waitingMarkup, />WAITING</, 'waiting state label must be visible');
 assert.doesNotMatch(waitingMarkup, /mauto-flow-detail/, 'unreached waiting roles must not show predictive detail');
-const doneMarkup = flowStatusMarkup({ state: 'DONE', done_from: 'A', sent_to: 'B' });
+const doneMarkup = flowStatusMarkup({ state: 'DONE', logical_role: 'PLAN', done_from: 'A', sent_to: 'B' }, 'DEV');
 assert.match(doneMarkup, /color:#10a37f/, 'DONE must render green');
-assert.match(doneMarkup, />DONE</, 'completed role must render DONE');
+assert.match(doneMarkup, />PLAN · DONE</, 'completed shared role must retain logical role context');
 assert.match(doneMarkup, /Done From: A/, 'completed role must identify the real caller');
 assert.match(doneMarkup, /Sent to: B/, 'completed role must render its validated route');
-assert.equal(flowStatusMarkup(null), '', 'nonparticipant role must retain the old UI without a flow block');
-assert.equal(flowStatusMarkup({ state: 'QUEUED' }), '', 'unknown states must not render');
+assert.equal(flowStatusMarkup(null, 'DEV'), '', 'nonparticipant role must retain the old UI without a flow block');
+assert.equal(flowStatusMarkup({ state: 'QUEUED' }, 'DEV'), '', 'unknown states must not render');
 const hostileMarkup = flowStatusMarkup({
     state: 'RUNNING',
+    logical_role: '</div><style>button{display:none}</style><div>',
     from_role: '</div><style>textarea{display:none}</style><div>',
-});
-assert.doesNotMatch(hostileMarkup, /<style>/, 'flow detail must not inject markup into the ChatGPT page');
+}, 'DEV');
+assert.doesNotMatch(hostileMarkup, /<style>/, 'flow labels and detail must not inject markup into the ChatGPT page');
+assert.match(hostileMarkup, /&lt;STYLE&gt;/, 'logical role must be HTML escaped');
 assert.match(hostileMarkup, /&lt;style&gt;/, 'flow detail must be HTML escaped');
 
 const completionContext = {};
@@ -489,6 +536,7 @@ vm.runInNewContext(
      let clockMs = 0;
      let reports = [];
      let snapshotFactory = () => ({
+         composer: true,
          stop_visible: true,
          composer_text_len: 0,
          composer_attachments: [],
@@ -543,6 +591,7 @@ vm.runInNewContext(
          reports = [];
          stopped = false;
          snapshotFactory = () => ({
+             composer: true,
              stop_visible: true,
              composer_text_len: 0,
              composer_attachments: [],
@@ -569,6 +618,7 @@ vm.runInNewContext(
          snapshotFactory = (now) => {
              const done = now >= 6000;
              return {
+                 composer: true,
                  stop_visible: !done,
                  composer_text_len: 0,
                  composer_attachments: [],
@@ -587,6 +637,65 @@ vm.runInNewContext(
              accepted_at: 1
          };
          await handleWaitAssistantDone({ command_id: 'cmd-done', payload: { timeout_ms: 30000 } });
+         return { reports, clockMs };
+     };
+     globalThis.runBoundaryCompletion = async () => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         snapshotFactory = (now) => {
+             const done = now >= 5000;
+             return {
+                 composer: true,
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"REVIEW\":\"inspect\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"REVIEW\":\"inspect\"}' } : { text: '' }
+                 }
+             };
+         };
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-boundary', payload: { timeout_ms: 10000 } });
+         return { reports, clockMs };
+     };
+     globalThis.runComposerRejectedCompletion = async (composerMode) => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         snapshotFactory = (now) => {
+             const done = now >= 5000;
+             const snapshot = {
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"PLAN\":\"must not complete\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"PLAN\":\"must not complete\"}' } : { text: '' }
+                 }
+             };
+             if (composerMode === 'false') {
+                 snapshot.composer = false;
+             }
+             return snapshot;
+         };
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-composer-' + composerMode, payload: { timeout_ms: 10000 } });
          return { reports, clockMs };
      };`,
     phase1HeartbeatContext,
@@ -609,6 +718,20 @@ const phase1HydratedTerminals = phase1HydratedWait.reports.filter((item) => item
 assert.equal(phase1HydratedTerminals.length, 1, 'hydrated completion must emit one terminal result');
 assert.equal(phase1HydratedTerminals[0].state, 'ASSISTANT_DONE');
 assert.equal(phase1HydratedWait.reports.at(-1).state, 'ASSISTANT_DONE', 'no heartbeat may occur after hydrated completion');
+
+const phase1BoundaryWait = await phase1HeartbeatContext.runBoundaryCompletion();
+const phase1BoundaryTerminals = phase1BoundaryWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+assert.equal(phase1BoundaryTerminals.length, 1, 'deadline-boundary completion must emit exactly one terminal result');
+assert.equal(phase1BoundaryTerminals[0].state, 'ASSISTANT_DONE', 'stable completion must beat timeout in the same sampled state');
+assert.equal(phase1BoundaryTerminals[0].at, 10000, 'deadline-boundary completion must use the original deadline');
+
+for (const composerMode of ['missing', 'false']) {
+    const rejectedWait = await phase1HeartbeatContext.runComposerRejectedCompletion(composerMode);
+    const rejectedTerminals = rejectedWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+    assert.equal(rejectedTerminals.length, 1, `${composerMode} composer completion must emit exactly one terminal result`);
+    assert.equal(rejectedTerminals[0].state, 'ASSISTANT_TIMEOUT', `${composerMode} composer must never satisfy stable completion`);
+    assert.equal(rejectedTerminals[0].at, 10000, `${composerMode} composer rejection must retain the original deadline`);
+}
 
 const phase1ImmutableRoleContext = {};
 vm.runInNewContext(
@@ -898,18 +1021,20 @@ vm.runInNewContext(
      ${extractFunction('releaseRoleClaim')};
      ${extractFunction('assignRole')};
      ${extractFunction('handleRoleAssignmentMessage')};
+     ${extractFunction('hydrateFlowStatus')};
      ${extractFunction('pollOnce')};
      ${extractFunction('schedulePoll')};
      globalThis.run = async () => {
          const oldPoll = pollOnce();
          await handleRoleAssignmentMessage({ origin: 'https://chatgpt.com', data: { type: 'MAUTO_SET_ROLE', role: 'B' } });
          const pendingAfterAssignment = timers.size;
-         resolveStatus({ command: { action: 'WAIT' }, config: {}, flow_status: null });
+         resolveStatus({ command: { action: 'WAIT' }, config: {}, flow_status: { state: 'RUNNING', logical_role: 'OLD' } });
          await oldPoll;
+         const flowAfterOldResponse = flowStatus;
          const assignedPoll = pollOnce();
-         resolveStatus({ command: { action: 'WAIT' }, config: {}, flow_status: null });
+         resolveStatus({ command: { action: 'WAIT' }, config: {}, flow_status: { state: 'waiting', logical_role: 'plan', arbitrary: 'drop' } });
          await assignedPoll;
-         return { visibleRole: nextRole(), pendingAfterAssignment, pendingAfterOldResponse: timers.size, roleClaimPending, requests };
+         return { visibleRole: nextRole(), pendingAfterAssignment, pendingAfterOldResponse: timers.size, roleClaimPending, flowAfterOldResponse, flowStatus, requests };
      };`,
     assignmentPollRaceContext,
 );
@@ -917,6 +1042,8 @@ const assignmentPollRace = await assignmentPollRaceContext.run();
 assert.equal(assignmentPollRace.visibleRole, 'B', 'the real assignment handler must switch to B');
 assert.equal(assignmentPollRace.pendingAfterAssignment, 1, 'the real assignment callback must schedule one poll');
 assert.equal(assignmentPollRace.pendingAfterOldResponse, 1, 'the stale in-flight poll must leave exactly one pending next poll');
+assert.equal(assignmentPollRace.flowAfterOldResponse, null, 'a delayed response for physical role A must return before hydrating role B UI');
+assert.deepEqual(JSON.parse(JSON.stringify(assignmentPollRace.flowStatus)), { state: 'WAITING', logical_role: 'PLAN' }, 'the current physical role response must hydrate only normalized display fields');
 const assignmentReserveIndex = assignmentPollRace.requests.findIndex((item) => item.url.endsWith('/api/reserve-role-claim'));
 const assignmentClaimIndex = assignmentPollRace.requests.findIndex((item) => item.url.endsWith('/api/status') && item.payload.role === 'B');
 assert.ok(assignmentReserveIndex >= 0 && assignmentClaimIndex > assignmentReserveIndex, 'new assignment must reserve then persist and publish its claimed status poll');
@@ -1002,6 +1129,7 @@ vm.runInNewContext(
      ${extractFunction('report')};
      ${extractFunction('handleWaitAssistantDone')};
      ${extractFunction('executeCommand')};
+     ${extractFunction('hydrateFlowStatus')};
      ${extractFunction('pollOnce')};
      globalThis.run = async () => {
          await pollOnce();

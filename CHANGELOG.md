@@ -2,6 +2,60 @@
 
 All notable changes to the Tampermonkey bridge and its role orchestration flow are documented here.
 
+## [1.0.6] - 2026-07-19
+
+Version 1.0.6 turns the read-only flow page into a durable Kanban task control plane while preserving the accepted userscript transport and role-flow behavior.
+
+### Durable tasks and scheduling
+
+- Add atomic, fail-closed `.role_state/tasks.json` persistence with schema validation, optimistic per-task revisions, bounded event history, archive semantics, and six explicit Kanban states.
+- Add controller ownership and reservation checks across RUNNING/REVIEW, active requests, and wake dispatch so one physical controller cannot own two active conversational workflows.
+- Add manual, one-time, interval, and five-field cron schedules with explicit timezone validation, UTC persistence, missed-run coalescing, pause/resume, and lifecycle-managed scheduler health.
+- Add restart-safe wake stages. Ambiguous or old-server dispatches become `UNCERTAIN` instead of replaying.
+
+### Safe controller wakeups
+
+- Add task CRUD, move, wake, pause, resume, generic role inventory, and scheduler health APIs.
+- Keep wake prompts role-parameterized and non-executable; controllers must re-read and claim their exact task before starting work.
+- Reuse the accepted userscript transport only after proving controller presence, no active command, idle assistant, exact clean composer ownership, and zero attachments.
+- Issue exactly one server-side `SET_PROMPT` and one `CLICK_SEND`; the dashboard never calls the browser command endpoint directly.
+
+### Kanban dashboard
+
+- Replace the Phase 03 read-only cards with responsive `BACKLOG`, `READY`, `RUNNING`, `REVIEW`, `BLOCKED`, and `DONE` columns.
+- Add create/edit/detail dialogs, drag/drop and keyboard move controls, archive, filters, result/blocker editing, schedule controls, manual wake, pause/resume, and evidence-based uncertain-wake resolution.
+- Poll tasks, role inventory, and durable flow independently while retaining last-good data and exposing store, scheduler, connection, and revision conflicts.
+- Expose userscript transport and future target metadata as display-only seams; Phase 06 browser-target controls remain absent.
+
+### Documentation and verification
+
+- Update `skills/ORCHESTRATOR.md` with exact task claim, mutation, conflict, duplicate-flow, and wake-resolution rules.
+- Add focused task store, scheduler, server API, and dashboard contract coverage.
+
+## [1.0.5] - 2026-07-18
+
+Version 1.0.5 adds read-only visibility for durable semantic flow without changing physical role ownership or command behavior.
+
+### Logical-role hydration
+
+- Hydrate only validated `RUNNING`, `WAITING`, and `DONE` status records returned for the exact physical role poll.
+- Whitelist bounded display fields and normalize the logical role for presentation only.
+- Show `LOGICAL · STATE` when one physical tab is acting as a different logical role, while avoiding duplicate labels when both roles match.
+- Clear stale or invalid local flow display state without deriving or publishing semantic state in the userscript.
+
+### Read-only dashboard
+
+- Serve dependency-free `dashboard.html` at `/dashboard`.
+- Read durable flow from `/api/admin/flow` and fan out concurrent GET requests to `/api/admin/role/{role}` every two seconds.
+- Show semantic flow, presence, sessions, active command, compact DOM observation, load errors, partial role-detail failures, and stale retained data.
+- Add no aggregate JSON API, writer endpoint, control button, external dependency, websocket, or event stream.
+
+### Operator checkpoint
+
+- Restart `server.py` before opening `/dashboard` so the new route is loaded.
+- Save/reload `tampermonkey.js` and reload managed role tabs before validating logical-role presentation.
+- Live-smoke NEW_CHAT recovery and the dashboard only after both server and userscript reloads.
+
 ## [1.0.4] - 2026-07-18
 
 Version 1.0.4 reduces composer-watchdog sampling overhead while preserving the existing stale-draft safety window.

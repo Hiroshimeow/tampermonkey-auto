@@ -288,7 +288,72 @@ uv run python main.py `
 
 The logical-to-physical binding is resolved once at startup. Logical roles sharing one physical tab are serialized, including prompt/send/response transactions and reset/reload operations. This prevents concurrent mutation of the tab, but it does not create separate browser chat histories for those logical roles. A NEW_CHAT reset holds the physical lock until navigation is acknowledged, the page-instance generation changes, the role re-registers, and a clean empty composer is confirmed at `/`; only then are bootstrap state and phase advanced. Preflight targets every resolved physical role, including values that appear only in `--role-map`, and stops on command failure or `done=false`.
 
+### Run REVIEW, DEV, and PLAN on one physical tab
+
+Use this mode when one browser tab is reliable and you want that tab to execute several logical roles in sequence. The logical role still controls the injected prompt and skill; `--role-map` only selects the physical browser tab used for transport.
+
+Prepare one clean browser tab registered as physical role `DEV`, then run:
+
+```powershell
+uv run main.py `
+  --role REVIEW,DEV,PLAN `
+  --browser-roles DEV `
+  --role-map "REVIEW=DEV DEV=DEV PLAN=DEV" `
+  --finish-roles PLAN `
+  --goal "Read the exact .plan file, continue REVIEW -> PLAN -> DEV -> REVIEW until PLAN verifies everything and FINISHes." `
+  --timeout 1800 `
+  --request-timeout 1800 `
+  --parallelism 1 `
+  --new-chat-on-handoff `
+  --handoff-command-policy always `
+  --reload-after 0
+```
+
+There is intentionally no `--max-turns` flag. The default value is `0`, so the workflow continues until an authorized `FINISH` or an unrecoverable runtime error.
+
+With the command above:
+
+- `REVIEW`, `DEV`, and `PLAN` are logical roles with their own prompts and skills.
+- All three use the same physical browser tab registered as `DEV`.
+- `--parallelism 1` serializes all work on that tab.
+- `PLAN` is the only role allowed to `FINISH`.
+- `--new-chat-on-handoff` starts a clean chat between logical roles.
+- The first logical role is the first name in `--role`, here `REVIEW`.
+
+Every non-final role response must include a `HANDOFF:` section and request a handoff in the final route JSON:
+
+````text
+HANDOFF:
+Read exactly .plan/turn_34_review_for_plan.md and continue as PLAN.
+
+```json
+{
+  "PLAN": "Read exactly .plan/turn_34_review_for_plan.md and continue.",
+  "command": "handoff"
+}
+```
+````
+
+The runtime then resets the shared physical tab to a new chat, injects the next logical role context, and continues automatically. Do not use this mode for roles that must run concurrently; logical roles mapped to the same physical tab are necessarily sequential.
+
 Composer sending requires exact normalized prompt ownership, zero real attachments, composer presence, and `send_enabled=true` immediately before the click. The userscript performs one click per `CLICK_SEND` command and has no hidden `requestSubmit` fallback; Python may retry the command once only when the exact owned prompt remains, so the total submit budget is two attempts.
+
+## Stable Flow Kanban control plane
+
+Open `/dashboard` on the bridge server to manage durable tasks across `BACKLOG`, `READY`, `RUNNING`, `REVIEW`, `BLOCKED`, and `DONE`.
+
+Task records are stored atomically in `.role_state/tasks.json`. The dashboard supports create/edit, native drag/drop plus keyboard move controls, archive, pause/resume, manual wake, schedules (`manual`, one-time, interval, and five-field cron with an IANA timezone), optimistic revision conflicts, and explicit resolution of uncertain wakes. It polls tasks, generic role inventory, and durable flow independently every two seconds and retains the last good projection when one source fails.
+
+The dashboard never sends browser commands directly. `POST /api/admin/tasks/{task_id}/wake` reserves one occurrence; the server scheduler verifies exact controller assignment, role presence, no active browser command, idle assistant, clean composer, and zero attachments before issuing the bounded userscript sequence `SET_PROMPT` followed by one `CLICK_SEND`. Ambiguous dispatch survives restart as `UNCERTAIN` and requires evidence-based resolution.
+
+Controllers should read `skills/ORCHESTRATOR.md`, re-read the exact task before each revisioned mutation, claim `READY -> RUNNING` with their exact assigned role, and update request/result/blocker fields through the task API. Phase 05 exposes `transport` and `external_target` metadata only; browser-target controls remain out of scope.
+
+Focused control-plane checks:
+
+```powershell
+uv run python -m pytest tests/test_task_store.py tests/test_task_scheduler.py tests/test_server.py -q
+node .\tests\test_dashboard_contract.mjs
+```
 
 ## Verification
 

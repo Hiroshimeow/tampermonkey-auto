@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Stable Flow Kanban</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --canvas: #0b0f14;
+            --surface: #111820;
+            --surface-2: #17212b;
+            --surface-3: #1d2a36;
+            --line: #2b3b49;
+            --line-strong: #415667;
+            --text: #edf4f8;
+            --muted: #9aabba;
+            --cyan: #67d9e8;
+            --amber: #efbb62;
+            --red: #ef7c77;
+            --green: #74d59b;
+            --violet: #b39aef;
+            --blue: #78a9f2;
+            --shadow: 0 16px 44px rgba(0, 0, 0, .28);
+            --radius: 12px;
+            font-family: "Segoe UI Variable", "Aptos", system-ui, sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background:
+                linear-gradient(rgba(103, 217, 232, .025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(103, 217, 232, .025) 1px, transparent 1px),
+                var(--canvas);
+            background-size: 28px 28px;
+            color: var(--text);
+        }
+        button, input, select, textarea { font: inherit; }
+        button, select, input, textarea {
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--text);
+        }
+        button { cursor: pointer; padding: 8px 11px; font-weight: 650; }
+        button:hover { border-color: var(--cyan); }
+        button:disabled { cursor: not-allowed; opacity: .45; }
+        input, select, textarea { width: 100%; padding: 8px 9px; }
+        textarea { min-height: 92px; resize: vertical; }
+        :focus-visible { outline: 3px solid var(--cyan); outline-offset: 2px; }
+        [hidden] { display: none !important; }
+
+        #dashboard-root { min-height: 100vh; padding: 14px; }
+        #dashboard-root[data-stale="true"] .topbar { border-color: var(--amber); }
+        .topbar {
+            position: sticky;
+            top: 8px;
+            z-index: 20;
+            display: grid;
+            grid-template-columns: minmax(220px, 1fr) auto;
+            gap: 14px;
+            align-items: center;
+            padding: 12px 14px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: rgba(17, 24, 32, .96);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(10px);
+        }
+        .brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
+        .brand-mark {
+            display: grid;
+            width: 42px;
+            height: 42px;
+            place-items: center;
+            border: 1px solid var(--cyan);
+            border-radius: 9px;
+            color: var(--cyan);
+            font: 800 13px/1 ui-monospace, Consolas, monospace;
+        }
+        .brand h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+        .brand p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+        .health-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+        .health-pill {
+            display: inline-flex;
+            gap: 6px;
+            align-items: center;
+            min-height: 30px;
+            padding: 5px 9px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--surface-2);
+            color: var(--muted);
+            font: 650 11px/1.2 ui-monospace, Consolas, monospace;
+        }
+        .health-pill strong { color: var(--text); }
+        .health-pill[data-tone="good"] strong { color: var(--green); }
+        .health-pill[data-tone="warn"] strong { color: var(--amber); }
+        .health-pill[data-tone="bad"] strong { color: var(--red); }
+        .primary { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
+        .danger { border-color: var(--red); color: #ffc5c2; }
+        .quiet { background: transparent; }
+
+        .filters {
+            display: grid;
+            grid-template-columns: minmax(190px, 2fr) repeat(4, minmax(130px, 1fr)) auto;
+            gap: 8px;
+            margin: 12px 0;
+            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--surface);
+        }
+        .filter-check { display: flex; gap: 7px; align-items: center; padding: 0 8px; color: var(--muted); font-size: 12px; }
+        .filter-check input { width: auto; }
+        .notice-stack { display: grid; gap: 7px; margin-bottom: 10px; }
+        .notice {
+            padding: 9px 11px;
+            border: 1px solid var(--amber);
+            border-radius: 8px;
+            background: rgba(239, 187, 98, .09);
+            color: #ffdca2;
+            font: 600 12px/1.4 ui-monospace, Consolas, monospace;
+        }
+        .notice[data-kind="error"] { border-color: var(--red); background: rgba(239, 124, 119, .09); color: #ffc1be; }
+
+        .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 10px; align-items: start; }
+        .board {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(245px, 1fr));
+            gap: 9px;
+            min-width: 0;
+            overflow-x: auto;
+            padding-bottom: 14px;
+        }
+        .kanban-column {
+            min-height: 68vh;
+            border: 1px solid var(--line);
+            border-top: 3px solid var(--state-accent, var(--line-strong));
+            border-radius: var(--radius);
+            background: rgba(17, 24, 32, .92);
+        }
+        .kanban-column[data-kanban-state="BACKLOG"] { --state-accent: var(--muted); }
+        .kanban-column[data-kanban-state="READY"] { --state-accent: var(--cyan); }
+        .kanban-column[data-kanban-state="RUNNING"] { --state-accent: var(--blue); }
+        .kanban-column[data-kanban-state="REVIEW"] { --state-accent: var(--violet); }
+        .kanban-column[data-kanban-state="BLOCKED"] { --state-accent: var(--red); }
+        .kanban-column[data-kanban-state="DONE"] { --state-accent: var(--green); }
+        .column-head {
+            position: sticky;
+            top: 82px;
+            z-index: 6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 11px;
+            border-bottom: 1px solid var(--line);
+            background: var(--surface);
+        }
+        .column-head h2 { margin: 0; font: 800 12px/1 ui-monospace, Consolas, monospace; letter-spacing: .08em; }
+        .column-count { min-width: 24px; padding: 3px 6px; border-radius: 99px; background: var(--surface-3); text-align: center; font-size: 11px; }
+        .task-list { min-height: 60vh; padding: 8px; }
+        .task-list[data-drag-over="true"] { outline: 2px dashed var(--cyan); outline-offset: -5px; background: rgba(103, 217, 232, .05); }
+        .empty-column { padding: 18px 8px; color: var(--muted); text-align: center; font-size: 12px; }
+
+        .task-card {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 8px;
+            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-2);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, .16);
+        }
+        .task-card[aria-grabbed="true"] { opacity: .55; }
+        .task-title {
+            display: block;
+            width: 100%;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: var(--text);
+            text-align: left;
+            font-size: 14px;
+            line-height: 1.28;
+        }
+        .task-path, .task-meta, .task-note { overflow-wrap: anywhere; }
+        .task-path { color: var(--muted); font: 11px/1.45 ui-monospace, Consolas, monospace; }
+        .task-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+        .tag { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); font: 650 10px/1.2 ui-monospace, Consolas, monospace; }
+        .tag[data-alert="true"] { border-color: var(--red); color: #ffaaa6; }
+        .task-note { color: #ffd1ce; font-size: 11px; line-height: 1.35; }
+        .task-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+        .task-actions button, .task-actions select { width: auto; min-height: 30px; padding: 5px 7px; font-size: 11px; }
+        .move-select { max-width: 104px; }
+
+        .role-panel {
+            position: sticky;
+            top: 82px;
+            max-height: calc(100vh - 96px);
+            overflow: auto;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--surface);
+        }
+        .role-panel h2 { margin: 0; padding: 11px; border-bottom: 1px solid var(--line); font-size: 13px; }
+        #role-rail { display: grid; gap: 6px; padding: 8px; }
+        .role-card { padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+        .role-name { font: 800 12px/1.25 ui-monospace, Consolas, monospace; }
+        .role-detail { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+        .online-dot::before { content: "●"; margin-right: 5px; color: var(--green); }
+        .offline-dot::before { content: "○"; margin-right: 5px; color: var(--muted); }
+
+        dialog {
+            width: min(760px, calc(100vw - 24px));
+            max-height: calc(100vh - 24px);
+            padding: 0;
+            overflow: auto;
+            border: 1px solid var(--line-strong);
+            border-radius: 14px;
+            background: var(--surface);
+            color: var(--text);
+            box-shadow: var(--shadow);
+        }
+        dialog::backdrop { background: rgba(3, 7, 10, .74); backdrop-filter: blur(3px); }
+        .dialog-head { position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
+        .dialog-head h2 { margin: 0; font-size: 16px; }
+        .dialog-body { padding: 14px; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .field { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+        .field-wide { grid-column: 1 / -1; }
+        .dialog-actions { position: sticky; bottom: 0; display: flex; justify-content: flex-end; gap: 8px; padding: 11px 14px; border-top: 1px solid var(--line); background: var(--surface); }
+        .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+        .detail-block { padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+        .detail-block h3 { margin: 0 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .detail-block pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .event-list { display: grid; gap: 6px; }
+        .event-row { padding: 7px; border-left: 2px solid var(--line-strong); color: var(--muted); font-size: 11px; }
+
+        @media (max-width: 1100px) {
+            .workspace { grid-template-columns: 1fr; }
+            .role-panel { position: static; max-height: none; }
+            #role-rail { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+        }
+        @media (max-width: 820px) {
+            #dashboard-root { padding: 8px; }
+            .topbar { position: static; grid-template-columns: 1fr; }
+            .health-strip { justify-content: flex-start; }
+            .filters { grid-template-columns: 1fr 1fr; }
+            .column-head { top: 0; }
+            .form-grid, .detail-grid { grid-template-columns: 1fr; }
+            .field-wide { grid-column: auto; }
+        }
+        @media (max-width: 520px) { .filters { grid-template-columns: 1fr; } }
+        @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+    </style>
+</head>
+<body>
+<main id="dashboard-root" data-dashboard-version="5" data-stale="false">
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">SF</div>
+            <div>
+                <h1>Stable Flow Kanban</h1>
+                <p id="flow-summary">No active durable flow</p>
+            </div>
+        </div>
+        <div class="health-strip">
+            <span class="health-pill" id="connection-health"><span>Connection</span><strong>CHECKING</strong></span>
+            <span class="health-pill" id="scheduler-health"><span>Scheduler</span><strong>UNKNOWN</strong></span>
+            <span class="health-pill"><span>Refresh</span><strong id="refresh-age">—</strong></span>
+            <button id="create-task" class="primary" type="button">Create task</button>
+        </div>
+    </header>
+
+    <section class="filters" aria-label="Task filters">
+        <input id="filter-text" type="search" placeholder="Search title, objective, branch" aria-label="Search tasks">
+        <select id="filter-controller" aria-label="Filter by controller"><option value="">All controllers</option></select>
+        <select id="filter-repository" aria-label="Filter by repository"><option value="">All repositories</option></select>
+        <select id="filter-status" aria-label="Filter by status"><option value="">All states</option></select>
+        <select id="filter-schedule" aria-label="Filter by schedule"><option value="">All schedules</option><option value="manual">Manual</option><option value="scheduled">Scheduled</option></select>
+        <label class="filter-check"><input id="filter-archived" type="checkbox"> Show archived</label>
+    </section>
+
+    <div class="notice-stack" aria-live="polite">
+        <div id="connection-notice" class="notice" data-kind="error" hidden>Retaining last good dashboard data.</div>
+        <div id="task-store-error" class="notice" data-kind="error" hidden>Task store unavailable</div>
+        <div id="scheduler-error" class="notice" data-kind="error" hidden>Scheduler error</div>
+        <div id="conflict-notice" class="notice" hidden>Revision conflict. Your open edits were retained; review the refreshed task before retrying.</div>
+    </div>
+
+    <div class="workspace">
+        <section class="board" aria-label="Six-state task board">
+            <section class="kanban-column" data-kanban-state="BACKLOG">
+                <header class="column-head"><h2>BACKLOG</h2><span id="count-BACKLOG" class="column-count">0</span></header>
+                <div id="column-BACKLOG" class="task-list" data-drop-state="BACKLOG"></div>
+            </section>
+            <section class="kanban-column" data-kanban-state="READY">
+                <header class="column-head"><h2>READY</h2><span id="count-READY" class="column-count">0</span></header>
+                <div id="column-READY" class="task-list" data-drop-state="READY"></div>
+            </section>
+            <section class="kanban-column" data-kanban-state="RUNNING">
+                <header class="column-head"><h2>RUNNING</h2><span id="count-RUNNING" class="column-count">0</span></header>
+                <div id="column-RUNNING" class="task-list" data-drop-state="RUNNING"></div>
+            </section>
+            <section class="kanban-column" data-kanban-state="REVIEW">
+                <header class="column-head"><h2>REVIEW</h2><span id="count-REVIEW" class="column-count">0</span></header>
+                <div id="column-REVIEW" class="task-list" data-drop-state="REVIEW"></div>
+            </section>
+            <section class="kanban-column" data-kanban-state="BLOCKED">
+                <header class="column-head"><h2>BLOCKED</h2><span id="count-BLOCKED" class="column-count">0</span></header>
+                <div id="column-BLOCKED" class="task-list" data-drop-state="BLOCKED"></div>
+            </section>
+            <section class="kanban-column" data-kanban-state="DONE">
+                <header class="column-head"><h2>DONE</h2><span id="count-DONE" class="column-count">0</span></header>
+                <div id="column-DONE" class="task-list" data-drop-state="DONE"></div>
+            </section>
+        </section>
+
+        <aside class="role-panel" aria-label="Live role rail">
+            <h2>Live roles</h2>
+            <div id="role-rail"></div>
+        </aside>
+    </div>
+</main>
+
+<template id="task-card-template">
+    <article class="task-card" draggable="true" aria-grabbed="false">
+        <button class="task-title" type="button"></button>
+        <div class="task-path"></div>
+        <div class="task-meta"></div>
+        <div class="task-note" hidden></div>
+        <div class="task-actions">
+            <button class="run-action" type="button">Run now</button>
+            <button class="pause-action" type="button">Pause</button>
+            <button class="edit-action" type="button">Edit</button>
+            <button class="resolve-sent" type="button">Confirm sent</button>
+            <button class="resolve-not-sent" type="button">Confirm not sent</button>
+            <select class="move-select" aria-label="Move task"></select>
+            <button class="archive-action danger" type="button">Archive</button>
+        </div>
+    </article>
+</template>
+
+<dialog id="task-dialog" aria-labelledby="task-dialog-title">
+    <form id="task-form" method="dialog">
+        <header class="dialog-head">
+            <h2 id="task-dialog-title">Create task</h2>
+            <button class="quiet" type="button" data-close-dialog="task-dialog" aria-label="Close task editor">Close</button>
+        </header>
+        <div class="dialog-body form-grid">
+            <input id="task-id" type="hidden">
+            <input id="task-revision" type="hidden">
+            <label class="field field-wide">Title<input id="task-title" required maxlength="160"></label>
+            <label class="field">Target root<input id="task-root" required maxlength="500"></label>
+            <label class="field">Branch<input id="task-branch" required maxlength="200"></label>
+            <label class="field">Controller role<input id="task-controller" required maxlength="80" list="role-options"></label>
+            <label class="field">Initial state<select id="task-status"><option>BACKLOG</option><option>READY</option><option>BLOCKED</option></select></label>
+            <label class="field field-wide">Objective<textarea id="task-prompt" required maxlength="12000"></textarea></label>
+            <label class="field">Logical roles, comma-separated<input id="task-logical" required></label>
+            <label class="field">Finish roles, comma-separated<input id="task-finish" required></label>
+            <label class="field field-wide">Physical role map as JSON<textarea id="task-role-map" required spellcheck="false"></textarea></label>
+            <label class="field">Schedule kind<select id="task-schedule-kind"><option value="manual">Manual</option><option value="once">One time</option><option value="interval">Interval minutes</option><option value="cron">Five-field cron</option></select></label>
+            <label class="field schedule-field" data-schedule-field="once">Run at<input id="task-run-at" type="datetime-local"></label>
+            <label class="field schedule-field" data-schedule-field="interval">Interval minutes<input id="task-minutes" type="number" min="1" step="1" value="15"></label>
+            <label class="field schedule-field" data-schedule-field="interval">Start at<input id="task-start-at" type="datetime-local"></label>
+            <label class="field schedule-field" data-schedule-field="cron">Cron expression<input id="task-cron" value="0 9 * * 1-5"></label>
+            <label class="field schedule-field" data-schedule-field="cron">IANA timezone<input id="task-timezone" value="Asia/Tokyo"></label>
+            <label class="filter-check field-wide"><input id="task-enabled" type="checkbox" checked> Scheduling enabled</label>
+            <label class="field" data-edit-only>Last result status<input id="task-result-status" maxlength="80"></label>
+            <label class="field field-wide" data-edit-only>Last result summary<textarea id="task-result-summary" maxlength="2000"></textarea></label>
+            <label class="field field-wide" data-edit-only>Blocker<textarea id="task-blocker" maxlength="2000"></textarea></label>
+            <datalist id="role-options"></datalist>
+        </div>
+        <footer class="dialog-actions">
+            <button type="button" data-close-dialog="task-dialog">Cancel</button>
+            <button class="primary" type="submit">Save task</button>
+        </footer>
+    </form>
+</dialog>
+
+<dialog id="task-detail" aria-labelledby="task-detail-title">
+    <header class="dialog-head">
+        <h2 id="task-detail-title">Task details</h2>
+        <button class="quiet" type="button" data-close-dialog="task-detail" aria-label="Close task details">Close</button>
+    </header>
+    <div id="task-detail-body" class="dialog-body detail-grid"></div>
+</dialog>
+
+<script>
+(() => {
+    'use strict';
+    const DASHBOARD_CONTRACT_VERSION = 5;
+    const STATES = ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'BLOCKED', 'DONE'];
+    const MOVE_MATRIX = {
+        BACKLOG: ['READY', 'BLOCKED'],
+        READY: ['BACKLOG', 'RUNNING', 'BLOCKED'],
+        RUNNING: ['REVIEW', 'BLOCKED', 'DONE'],
+        REVIEW: ['RUNNING', 'BLOCKED', 'DONE'],
+        BLOCKED: ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'DONE'],
+        DONE: ['BACKLOG', 'READY']
+    };
+
+    let lastGoodTasks = [];
+    let lastGoodRoles = [];
+    let lastGoodFlow = null;
+    let lastGoodScheduler = null;
+    let lastSuccessfulAt = 0;
+    let refreshInFlight = false;
+    let sourceStale = { tasks: true, roles: true, flow: true };
+    let draggedTaskId = '';
+
+    const byId = (id) => document.getElementById(id);
+    const setText = (target, value) => { target.textContent = value == null ? '' : String(value); };
+    const clearNode = (target) => { while (target.firstChild) target.removeChild(target.firstChild); };
+    const textNode = (tag, value, className = '') => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        setText(element, value);
+        return element;
+    };
+    const normalizeList = (value) => String(value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
+    const taskById = (taskId) => lastGoodTasks.find((task) => task.task_id === taskId);
+    const isoFromLocal = (value) => value ? new Date(value).toISOString() : '';
+    const localFromIso = (value) => {
+        if (!value) return '';
+        const date = new Date(value);
+        const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+        return local.toISOString().slice(0, 16);
+    };
+    const formatAge = (timestamp) => {
+        if (!timestamp) return 'never';
+        const seconds = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000));
+        if (seconds < 60) return `${seconds}s`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+        if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+        return `${Math.floor(seconds / 86400)}d`;
+    };
+    const scheduleLabel = (task) => {
+        const schedule = task.schedule || { kind: 'manual' };
+        if (schedule.kind === 'manual') return 'manual';
+        if (schedule.kind === 'once') return `once · ${task.next_run_at || 'complete'}`;
+        if (schedule.kind === 'interval') return `every ${schedule.minutes}m`;
+        return `${schedule.expression} · ${schedule.timezone}`;
+    };
+
+    async function readJson(response) {
+        const body = await response.json().catch(() => ({}));
+        if (response.ok) return body;
+        const error = new Error(body.detail?.message || body.detail?.code || `Request failed: ${response.status}`);
+        error.status = response.status;
+        error.body = body;
+        if (response.status === 409) error.conflict = true;
+        throw error;
+    }
+
+    async function fetchTasks() {
+        const response = await fetch('/api/admin/tasks?include_archived=true');
+        return readJson(response);
+    }
+    async function fetchRoles() {
+        const response = await fetch('/api/admin/roles');
+        return readJson(response);
+    }
+    async function fetchFlow() {
+        const response = await fetch('/api/admin/flow');
+        return readJson(response);
+    }
+
+    async function retainEditsOnConflict(error) {
+        const notice = byId('conflict-notice');
+        notice.hidden = false;
+        setText(notice, `Revision conflict: ${error.message}. Your editor values remain unchanged; compare them with the refreshed task before retrying.`);
+        await refreshDashboard();
+        const editingTaskId = byId('task-id').value;
+        const latest = editingTaskId ? taskById(editingTaskId) : null;
+        if (latest && byId('task-dialog').open) byId('task-revision').value = latest.revision;
+    }
+
+    async function mutate(url, options) {
+        const response = await fetch(url, {
+            ...options,
+            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+        });
+        try {
+            const body = await readJson(response);
+            byId('conflict-notice').hidden = true;
+            await refreshDashboard();
+            return body;
+        } catch (error) {
+            if (error.conflict) await retainEditsOnConflict(error);
+            else announceError(error.message);
+            throw error;
+        }
+    }
+
+    function announceError(message) {
+        const notice = byId('connection-notice');
+        notice.hidden = false;
+        setText(notice, message || 'Dashboard request failed. Retaining last good dashboard data.');
+    }
+
+    function filteredTasks() {
+        const text = byId('filter-text').value.trim().toLowerCase();
+        const controller = byId('filter-controller').value;
+        const repository = byId('filter-repository').value;
+        const status = byId('filter-status').value;
+        const schedule = byId('filter-schedule').value;
+        const showArchived = byId('filter-archived').checked;
+        return lastGoodTasks.filter((task) => {
+            if (!showArchived && task.archived_at) return false;
+            if (controller && task.controller_role !== controller) return false;
+            if (repository && task.target_root !== repository) return false;
+            if (status && task.status !== status) return false;
+            if (schedule === 'manual' && task.schedule?.kind !== 'manual') return false;
+            if (schedule === 'scheduled' && task.schedule?.kind === 'manual') return false;
+            if (text) {
+                const haystack = [task.title, task.prompt, task.target_root, task.branch, task.controller_role, task.last_result_summary, task.blocker].join(' ').toLowerCase();
+                if (!haystack.includes(text)) return false;
+            }
+            return true;
+        });
+    }
+
+    function addTag(container, value, alert = false) {
+        const tag = textNode('span', value, 'tag');
+        if (alert) tag.dataset.alert = 'true';
+        container.appendChild(tag);
+    }
+
+    function cardForTask(task) {
+        const card = byId('task-card-template').content.firstElementChild.cloneNode(true);
+        card.dataset.taskId = task.task_id;
+        card.addEventListener('dragstart', (event) => {
+            draggedTaskId = task.task_id;
+            card.setAttribute('aria-grabbed', 'true');
+            event.dataTransfer.setData('text/plain', task.task_id);
+            event.dataTransfer.effectAllowed = 'move';
+        });
+        card.addEventListener('dragend', () => {
+            draggedTaskId = '';
+            card.setAttribute('aria-grabbed', 'false');
+        });
+
+        const title = card.querySelector('.task-title');
+        setText(title, task.title);
+        title.addEventListener('click', () => openDetails(task.task_id));
+        setText(card.querySelector('.task-path'), `${task.target_root} · ${task.branch}`);
+        const meta = card.querySelector('.task-meta');
+        addTag(meta, task.controller_role);
+        addTag(meta, task.logical_roles.join(' → '));
+        addTag(meta, scheduleLabel(task));
+        if (task.next_run_at) addTag(meta, `next ${task.next_run_at}`);
+        addTag(meta, `rev ${task.revision}`);
+        if (!task.enabled) addTag(meta, 'PAUSED', true);
+        if (task.active_request_id) addTag(meta, task.active_request_id, true);
+        if (task.wake?.state && task.wake.state !== 'IDLE') addTag(meta, `WAKE ${task.wake.state}`, ['UNCERTAIN', 'SENT'].includes(task.wake.state));
+        addTag(meta, `updated ${formatAge(task.updated_at)} ago`);
+
+        const note = card.querySelector('.task-note');
+        const noteValue = task.blocker || task.last_result_summary || task.wake?.error || '';
+        note.hidden = !noteValue;
+        setText(note, noteValue);
+
+        const archived = Boolean(task.archived_at);
+        const runButton = card.querySelector('.run-action');
+        runButton.disabled = archived || task.status !== 'READY' || !task.enabled || !['IDLE', 'DEFERRED'].includes(task.wake?.state || 'IDLE');
+        runButton.addEventListener('click', () => wakeTask(task.task_id));
+
+        const pauseButton = card.querySelector('.pause-action');
+        setText(pauseButton, task.enabled ? 'Pause' : 'Resume');
+        pauseButton.disabled = archived;
+        pauseButton.addEventListener('click', () => task.enabled ? pauseTask(task.task_id) : resumeTask(task.task_id));
+
+        const editButton = card.querySelector('.edit-action');
+        editButton.disabled = archived;
+        editButton.addEventListener('click', () => openEditor(task.task_id));
+        const resolveSent = card.querySelector('.resolve-sent');
+        const resolveNotSent = card.querySelector('.resolve-not-sent');
+        const uncertain = task.wake?.state === 'UNCERTAIN' && !archived;
+        resolveSent.hidden = !uncertain;
+        resolveNotSent.hidden = !uncertain;
+        resolveSent.addEventListener('click', () => resolveWake(task.task_id, 'sent'));
+        resolveNotSent.addEventListener('click', () => resolveWake(task.task_id, 'not_sent'));
+        const move = card.querySelector('.move-select');
+        move.appendChild(new Option('Move…', ''));
+        for (const destination of MOVE_MATRIX[task.status] || []) move.appendChild(new Option(destination, destination));
+        move.disabled = archived;
+        move.addEventListener('change', () => {
+            const destination = move.value;
+            move.value = '';
+            if (destination) moveTask(task.task_id, destination);
+        });
+
+        const archive = card.querySelector('.archive-action');
+        archive.hidden = task.status !== 'DONE' || archived;
+        archive.addEventListener('click', () => archiveTask(task.task_id));
+        return card;
+    }
+
+    function renderBoard() {
+        const tasks = filteredTasks();
+        for (const state of STATES) {
+            const column = byId(`column-${state}`);
+            clearNode(column);
+            const matches = tasks.filter((task) => task.status === state);
+            setText(byId(`count-${state}`), matches.length);
+            if (!matches.length) column.appendChild(textNode('div', 'No matching tasks', 'empty-column'));
+            for (const task of matches) column.appendChild(cardForTask(task));
+        }
+    }
+
+    function renderRoles() {
+        const rail = byId('role-rail');
+        clearNode(rail);
+        if (!lastGoodRoles.length) {
+            rail.appendChild(textNode('div', 'No role observations yet', 'role-detail'));
+            return;
+        }
+        for (const role of lastGoodRoles) {
+            const card = document.createElement('article');
+            card.className = 'role-card';
+            const name = textNode('div', role.role, `role-name ${role.online ? 'online-dot' : 'offline-dot'}`);
+            card.appendChild(name);
+            const details = [
+                role.current_logical_role ? `logical ${role.current_logical_role}` : '',
+                role.current_task_id ? `task ${role.current_task_id}` : '',
+                role.reservation_state ? `reserved ${role.reservation_state}` : '',
+                role.active_command ? `${role.active_command.action} · ${role.active_command.state}` : '',
+                role.page_path || '',
+                role.transport ? `transport ${role.transport}` : '',
+                role.external_target ? `target ${JSON.stringify(role.external_target)}` : ''
+            ].filter(Boolean);
+            card.appendChild(textNode('div', details.join('\n') || (role.online ? 'idle online role' : 'offline'), 'role-detail'));
+            rail.appendChild(card);
+        }
+    }
+
+    function renderHealth() {
+        const root = byId('dashboard-root');
+        const stale = sourceStale.tasks || sourceStale.roles || sourceStale.flow;
+        root.dataset.stale = String(stale);
+        const connection = byId('connection-health');
+        connection.dataset.tone = stale ? 'warn' : 'good';
+        setText(connection.querySelector('strong'), stale ? 'PARTIAL' : 'CONNECTED');
+        byId('connection-notice').hidden = !stale;
+        if (stale) setText(byId('connection-notice'), 'One or more data sources failed. Retaining last good task, role, and flow projections independently.');
+
+        const scheduler = byId('scheduler-health');
+        const running = Boolean(lastGoodScheduler?.running);
+        scheduler.dataset.tone = running ? 'good' : 'bad';
+        setText(scheduler.querySelector('strong'), running ? 'RUNNING' : 'STOPPED');
+        const schedulerError = byId('scheduler-error');
+        schedulerError.hidden = !lastGoodScheduler?.last_error;
+        if (lastGoodScheduler?.last_error) setText(schedulerError, `Scheduler error: ${lastGoodScheduler.last_error}`);
+        setText(byId('refresh-age'), lastSuccessfulAt ? `${Math.max(0, Math.floor((Date.now() - lastSuccessfulAt) / 1000))}s` : 'never');
+
+        const flow = lastGoodFlow?.flow;
+        setText(byId('flow-summary'), flow ? `Active flow ${flow.request_id} · ${flow.run_id}` : 'No active durable flow');
+    }
+
+    function updateFilterOptions() {
+        const update = (select, values, label) => {
+            const previous = select.value;
+            while (select.options.length > 1) select.remove(1);
+            for (const value of [...new Set(values.filter(Boolean))].sort()) select.appendChild(new Option(value, value));
+            select.value = [...select.options].some((option) => option.value === previous) ? previous : '';
+            select.options[0].textContent = label;
+        };
+        update(byId('filter-controller'), lastGoodTasks.map((task) => task.controller_role), 'All controllers');
+        update(byId('filter-repository'), lastGoodTasks.map((task) => task.target_root), 'All repositories');
+        update(byId('filter-status'), STATES, 'All states');
+        const datalist = byId('role-options');
+        clearNode(datalist);
+        for (const role of lastGoodRoles) datalist.appendChild(new Option(role.role, role.role));
+    }
+
+    function renderDashboard() {
+        updateFilterOptions();
+        renderBoard();
+        renderRoles();
+        renderHealth();
+    }
+
+    async function refreshDashboard() {
+        if (refreshInFlight) return;
+        refreshInFlight = true;
+        const results = await Promise.allSettled([fetchTasks(), fetchRoles(), fetchFlow()]);
+        const taskResult = results[0];
+        const roleResult = results[1];
+        const flowResult = results[2];
+        if (taskResult.status === 'fulfilled') {
+            lastGoodScheduler = taskResult.value.scheduler || lastGoodScheduler;
+            const loadError = taskResult.value.load_error;
+            byId('task-store-error').hidden = !loadError;
+            if (loadError) {
+                sourceStale.tasks = true;
+                setText(byId('task-store-error'), `Task store unavailable: ${loadError.message || loadError.code}. Retaining the last good task cards.`);
+            } else {
+                lastGoodTasks = taskResult.value.tasks || [];
+                sourceStale.tasks = false;
+            }
+        } else sourceStale.tasks = true;
+        if (roleResult.status === 'fulfilled') {
+            lastGoodRoles = roleResult.value.roles || [];
+            sourceStale.roles = false;
+        } else sourceStale.roles = true;
+        if (flowResult.status === 'fulfilled') {
+            lastGoodFlow = flowResult.value;
+            sourceStale.flow = false;
+        } else sourceStale.flow = true;
+        if (results.some((result) => result.status === 'fulfilled')) lastSuccessfulAt = Date.now();
+        refreshInFlight = false;
+        renderDashboard();
+    }
+
+    function currentTaskOrThrow(taskId) {
+        const task = taskById(taskId);
+        if (!task) throw new Error(`Task is no longer available: ${taskId}`);
+        return task;
+    }
+
+    async function moveTask(taskId, destination) {
+        const task = currentTaskOrThrow(taskId);
+        const actorRole = ['RUNNING', 'REVIEW', 'DONE'].includes(destination) ? task.controller_role : '';
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/move`, {
+            method: 'POST',
+            body: JSON.stringify({ expected_revision: task.revision, status: destination, actor_role: actorRole })
+        });
+    }
+    async function wakeTask(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/wake`, {
+            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
+        });
+    }
+    async function pauseTask(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/pause`, {
+            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
+        });
+    }
+    async function resumeTask(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/resume`, {
+            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
+        });
+    }
+    async function archiveTask(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
+            method: 'PATCH', body: JSON.stringify({ expected_revision: task.revision, changes: { archived: true } })
+        });
+    }
+    async function resolveWake(taskId, resolution) {
+        const task = currentTaskOrThrow(taskId);
+        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ expected_revision: task.revision, changes: {}, actor_role: task.controller_role, wake_resolution: resolution })
+        });
+    }
+
+    function scheduleFromForm() {
+        const kind = byId('task-schedule-kind').value;
+        if (kind === 'manual') return { kind: 'manual' };
+        if (kind === 'once') return { kind: 'once', run_at: isoFromLocal(byId('task-run-at').value) };
+        if (kind === 'interval') {
+            const schedule = { kind: 'interval', minutes: Number(byId('task-minutes').value) };
+            const start = byId('task-start-at').value;
+            if (start) schedule.start_at = isoFromLocal(start);
+            return schedule;
+        }
+        return { kind: 'cron', expression: byId('task-cron').value.trim(), timezone: byId('task-timezone').value.trim() };
+    }
+
+    function updateScheduleFields() {
+        const kind = byId('task-schedule-kind').value;
+        for (const field of document.querySelectorAll('[data-schedule-field]')) field.hidden = field.dataset.scheduleField !== kind;
+    }
+
+    function resetEditor() {
+        byId('task-form').reset();
+        byId('task-id').value = '';
+        byId('task-revision').value = '';
+        byId('task-status').disabled = false;
+        byId('task-enabled').checked = true;
+        byId('task-role-map').value = '{\n  "DEV": "WORKER_1",\n  "REVIEW": "WORKER_1",\n  "PLAN": "WORKER_1"\n}';
+        byId('task-logical').value = 'DEV, REVIEW, PLAN';
+        byId('task-finish').value = 'PLAN';
+        byId('task-controller').value = '';
+        byId('task-schedule-kind').value = 'manual';
+        byId('task-result-status').value = '';
+        byId('task-result-summary').value = '';
+        byId('task-blocker').value = '';
+        for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = true;
+        updateScheduleFields();
+    }
+
+    function openNewTask() {
+        resetEditor();
+        setText(byId('task-dialog-title'), 'Create task');
+        byId('task-dialog').showModal();
+        byId('task-title').focus();
+    }
+
+    function openEditor(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        resetEditor();
+        setText(byId('task-dialog-title'), 'Edit task');
+        for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = false;
+        byId('task-id').value = task.task_id;
+        byId('task-revision').value = task.revision;
+        byId('task-title').value = task.title;
+        byId('task-root').value = task.target_root;
+        byId('task-branch').value = task.branch;
+        byId('task-controller').value = task.controller_role;
+        byId('task-status').value = task.status;
+        byId('task-status').disabled = true;
+        byId('task-prompt').value = task.prompt;
+        byId('task-logical').value = task.logical_roles.join(', ');
+        byId('task-finish').value = task.finish_roles.join(', ');
+        byId('task-role-map').value = JSON.stringify(task.physical_role_map, null, 2);
+        byId('task-enabled').checked = task.enabled;
+        const schedule = task.schedule || { kind: 'manual' };
+        byId('task-schedule-kind').value = schedule.kind;
+        byId('task-run-at').value = localFromIso(schedule.run_at);
+        byId('task-minutes').value = schedule.minutes || 15;
+        byId('task-start-at').value = localFromIso(schedule.start_at);
+        byId('task-cron').value = schedule.expression || '0 9 * * 1-5';
+        byId('task-timezone').value = schedule.timezone || 'Asia/Tokyo';
+        byId('task-result-status').value = task.last_result_status || '';
+        byId('task-result-summary').value = task.last_result_summary || '';
+        byId('task-blocker').value = task.blocker || '';
+        updateScheduleFields();
+        byId('task-dialog').showModal();
+        byId('task-title').focus();
+    }
+
+    async function saveEditor(event) {
+        event.preventDefault();
+        const taskId = byId('task-id').value;
+        let roleMap;
+        try { roleMap = JSON.parse(byId('task-role-map').value); }
+        catch { announceError('Physical role map must be valid JSON.'); return; }
+        const values = {
+            title: byId('task-title').value.trim(),
+            target_root: byId('task-root').value.trim(),
+            branch: byId('task-branch').value.trim(),
+            prompt: byId('task-prompt').value.trim(),
+            controller_role: byId('task-controller').value.trim(),
+            logical_roles: normalizeList(byId('task-logical').value),
+            physical_role_map: roleMap,
+            finish_roles: normalizeList(byId('task-finish').value),
+            enabled: byId('task-enabled').checked,
+            schedule: scheduleFromForm()
+        };
+        try {
+            if (!taskId) {
+                const createValues = { ...values, skill_path: 'skills/ORCHESTRATOR.md', status: byId('task-status').value };
+                await mutate('/api/admin/tasks', { method: 'POST', body: JSON.stringify(createValues) });
+            } else {
+                const current = currentTaskOrThrow(taskId);
+                const candidates = {
+                    ...values,
+                    last_result_status: byId('task-result-status').value.trim(),
+                    last_result_summary: byId('task-result-summary').value.trim(),
+                    blocker: byId('task-blocker').value.trim()
+                };
+                const changes = {};
+                for (const [key, value] of Object.entries(candidates)) {
+                    if (JSON.stringify(value) !== JSON.stringify(current[key] ?? (key === 'last_result_status' ? '' : current[key]))) changes[key] = value;
+                }
+                if (!Object.keys(changes).length) {
+                    byId('task-dialog').close();
+                    return;
+                }
+                const executionKeys = ['last_result_status', 'last_result_summary', 'blocker'];
+                const actorRole = executionKeys.some((key) => Object.hasOwn(changes, key)) ? current.controller_role : '';
+                await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ expected_revision: Number(byId('task-revision').value), changes, actor_role: actorRole })
+                });
+            }
+            byId('task-dialog').close();
+        } catch (error) {
+            if (!error.conflict) announceError(error.message);
+        }
+    }
+
+    function detailBlock(title, value) {
+        const block = document.createElement('section');
+        block.className = 'detail-block';
+        block.appendChild(textNode('h3', title));
+        block.appendChild(textNode('pre', value));
+        return block;
+    }
+
+    function openDetails(taskId) {
+        const task = currentTaskOrThrow(taskId);
+        setText(byId('task-detail-title'), task.title);
+        const body = byId('task-detail-body');
+        clearNode(body);
+        body.appendChild(detailBlock('Task', `${task.task_id}\nrevision ${task.revision}\nstate ${task.status}\ncontroller ${task.controller_role}`));
+        body.appendChild(detailBlock('Target', `${task.target_root}\n${task.branch}`));
+        body.appendChild(detailBlock('Objective', task.prompt));
+        body.appendChild(detailBlock('Roles', `logical: ${task.logical_roles.join(', ')}\nphysical: ${JSON.stringify(task.physical_role_map, null, 2)}\nfinish: ${task.finish_roles.join(', ')}`));
+        body.appendChild(detailBlock('Schedule', `${JSON.stringify(task.schedule, null, 2)}\nnext: ${task.next_run_at || 'none'}\nenabled: ${task.enabled}`));
+        body.appendChild(detailBlock('Requests and result', `active: ${task.active_request_id || 'none'}\nlast: ${task.last_request_id || 'none'}\nstatus: ${task.last_result_status || 'none'}\nsummary: ${task.last_result_summary || 'none'}\nblocker: ${task.blocker || 'none'}`));
+        body.appendChild(detailBlock('Wake', JSON.stringify(task.wake, null, 2)));
+        const seam = [`transport: ${task.transport || 'userscript'}`];
+        if (task.external_target) seam.push(`external_target: ${JSON.stringify(task.external_target, null, 2)}`);
+        body.appendChild(detailBlock('Target seam', seam.join('\n')));
+        const events = document.createElement('section');
+        events.className = 'detail-block field-wide';
+        events.appendChild(textNode('h3', 'Recent events'));
+        const list = document.createElement('div');
+        list.className = 'event-list';
+        for (const event of task.events || []) list.appendChild(textNode('div', `${event.timestamp} · ${event.type}\n${event.summary}`, 'event-row'));
+        if (!list.firstChild) list.appendChild(textNode('div', 'No task events', 'event-row'));
+        events.appendChild(list);
+        body.appendChild(events);
+        byId('task-detail').showModal();
+    }
+
+    function installDropTargets() {
+        for (const target of document.querySelectorAll('[data-drop-state]')) {
+            target.addEventListener('dragover', (event) => {
+                event.preventDefault();
+                target.dataset.dragOver = 'true';
+                event.dataTransfer.dropEffect = 'move';
+            });
+            target.addEventListener('dragleave', () => { target.dataset.dragOver = 'false'; });
+            target.addEventListener('drop', (event) => {
+                event.preventDefault();
+                target.dataset.dragOver = 'false';
+                const taskId = event.dataTransfer.getData('text/plain') || draggedTaskId;
+                const task = taskById(taskId);
+                const destination = target.dataset.dropState;
+                if (task && destination !== task.status && (MOVE_MATRIX[task.status] || []).includes(destination)) moveTask(taskId, destination);
+            });
+        }
+    }
+
+    function installEvents() {
+        byId('create-task').addEventListener('click', openNewTask);
+        byId('task-form').addEventListener('submit', saveEditor);
+        byId('task-schedule-kind').addEventListener('change', updateScheduleFields);
+        for (const button of document.querySelectorAll('[data-close-dialog]')) {
+            button.addEventListener('click', () => byId(button.dataset.closeDialog).close());
+        }
+        for (const filter of document.querySelectorAll('.filters input, .filters select')) {
+            filter.addEventListener('input', renderBoard);
+            filter.addEventListener('change', renderBoard);
+        }
+        installDropTargets();
+    }
+
+    installEvents();
+    refreshDashboard();
+    setInterval(refreshDashboard, 2000);
+    setInterval(renderHealth, 1000);
+})();
+</script>
+</body>
+</html>

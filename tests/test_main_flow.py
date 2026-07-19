@@ -16,6 +16,25 @@ from apps.runtime_config import LoaderManifest, PromptProvenance, RuntimeRoleCon
 from main import Coordinator, parse_args, parse_route
 
 
+_REAL_UPDATE_FLOW_STATUSES = BridgeClient.update_flow_statuses
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_bridge_flow_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent unit tests from publishing semantic flow state to a live local server."""
+
+    def isolated_update_flow_statuses(
+        self: BridgeClient,
+        run_id: str,
+        updates: dict[str, dict[str, Any] | None],
+        **metadata: Any,
+    ) -> dict[str, Any]:
+        del self, run_id, updates, metadata
+        return {"status": "TEST_ISOLATED"}
+
+    monkeypatch.setattr(BridgeClient, "update_flow_statuses", isolated_update_flow_statuses)
+
+
 def make_args(*extra: str):
     return parse_args([
         "--role",
@@ -43,6 +62,7 @@ def response_snapshot(
     choice_candidates: list[dict[str, Any]] | None = None,
     page_instance_id: str = "page-1",
     page_path: str = "/c/existing",
+    observation_seq: int = 0,
 ) -> dict[str, Any]:
     dom_info: dict[str, Any] = {
             "page_instance_id": page_instance_id,
@@ -65,6 +85,24 @@ def response_snapshot(
     return {
         "last_response": text,
         "dom_info": dom_info,
+        "observation": {
+            "page_instance_id": page_instance_id,
+            "observation_seq": observation_seq,
+        },
+    }
+
+
+def assistant_done_command_result(text: str, *, composer: bool = True) -> dict[str, Any]:
+    snapshot = response_snapshot(text, assistant_count=1, observation_seq=2)
+    snapshot["dom_info"]["composer"] = composer
+    return {
+        "done": True,
+        "status": "ASSISTANT_DONE",
+        "result": {
+            "text": text,
+            "result": {"stable_samples": 2},
+            "dom_info": snapshot["dom_info"],
+        },
     }
 
 
@@ -72,8 +110,8 @@ class SnapshotClient:
     def __init__(self, snapshots: list[dict[str, Any]]):
         self.snapshots = list(snapshots)
 
-    def role_snapshot(self, role: str) -> dict[str, Any]:
-        del role
+    def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        del role, timeout_s
         if len(self.snapshots) > 1:
             return self.snapshots.pop(0)
         return self.snapshots[0]
@@ -105,15 +143,23 @@ class ScriptedBridge(BridgeClient):
         self.snapshot_calls = 0
         self.snapshot_calls_at_click: list[int] = []
 
-    def role_snapshot(self, role: str) -> dict[str, Any]:
-        del role
+    def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        del role, timeout_s
         self.snapshot_calls += 1
         if len(self.snapshots) > 1:
             return self.snapshots.pop(0)
         return self.snapshots[0]
 
-    def run_command(self, role: str, action: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        del role, timeout_s
+    def run_command(
+        self,
+        role: str,
+        action: str,
+        payload: dict[str, Any],
+        timeout_s: float,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        del role, timeout_s, _deadline
         self.commands.append((action, dict(payload)))
         if action == "CLICK_SEND":
             self.snapshot_calls_at_click.append(self.snapshot_calls)
@@ -125,11 +171,18 @@ class ScriptedBridge(BridgeClient):
         if action == "CLICK_SEND":
             return {"done": True, "status": "SEND_ACCEPTED"}
         if action == "WAIT_ASSISTANT_DONE":
-            return {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh response"}}
+            return assistant_done_command_result("fresh response")
         return {"done": True, "status": f"{action}_DONE"}
 
-    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
-        del role, timeout_s
+    def command_roundtrip(
+        self,
+        role: str,
+        action: str,
+        timeout_s: float = 20.0,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        del role, timeout_s, _deadline
         self.commands.append((action, {}))
         if action == "CLICK_CHOICE_PROMPT":
             return {"done": True, "status": "CHOICE_PROMPT_CLICKED"}
@@ -145,18 +198,32 @@ class LifecycleClient:
         self.calls: list[tuple[str, str]] = []
         self.reset_called = threading.Event()
 
-    def role_snapshot(self, role: str) -> dict[str, Any]:
+    def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        del timeout_s
         self.calls.append((role, "SNAPSHOT"))
         return response_snapshot("old", page_instance_id=f"before-{role}")
 
-    def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
-        del timeout_s
+    def new_chat(
+        self,
+        role: str,
+        timeout_s: float = 25.0,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        del timeout_s, _deadline
         self.calls.append((role, "NEW_CHAT"))
         self.reset_called.set()
         return self.reset_results.get(role, {"done": True, "status": "NEW_CHAT_DONE"})
 
-    def wait_new_chat_ready(self, role: str, before_snapshot: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        del before_snapshot, timeout_s
+    def wait_new_chat_ready(
+        self,
+        role: str,
+        before_snapshot: dict[str, Any],
+        timeout_s: float,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        del before_snapshot, timeout_s, _deadline
         self.calls.append((role, "WAIT_NEW_CHAT_READY"))
         configured = self.reset_results.get(f"{role}:READY")
         if isinstance(configured, Exception):
@@ -188,6 +255,41 @@ class FlowStatusClient:
         self.updates.append((run_id, updates))
         self.calls.append({"run_id": run_id, "updates": updates, **metadata})
         return {"status": "OK"}
+
+
+def test_default_coordinator_is_flow_status_isolated_by_test_harness() -> None:
+    coordinator = Coordinator(make_args("--max-turns", "2"))
+    network_paths: list[str] = []
+
+    def fail_if_called(
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        del method, payload, timeout_s
+        network_paths.append(path)
+        raise AssertionError(f"unexpected live request: {path}")
+
+    def fake_call(
+        prompt_role: str,
+        browser_role: str,
+        prompt: str,
+        instruction: str,
+        repair: bool = False,
+    ) -> str:
+        del browser_role, prompt, instruction, repair
+        if prompt_role == "DEV":
+            return '```json\n{"REVIEW":"verify"}\n```'
+        return '```json\n{"FINISH":"verified"}\n```'
+
+    coordinator.client.json_request = fail_if_called  # type: ignore[method-assign]
+    coordinator.call_or_synthetic = fake_call
+
+    result = coordinator.run("finish the task")
+
+    assert result["status"] == "complete"
+    assert network_paths == []
 
 
 def compatible_prompt(coordinator: Coordinator, role: str, goal: str) -> str:
@@ -380,7 +482,8 @@ def test_bridge_flow_status_publisher_uses_one_scoped_backend_request(monkeypatc
 
     monkeypatch.setattr(client, "json_request", fake_json_request)
 
-    client.update_flow_statuses(
+    _REAL_UPDATE_FLOW_STATUSES(
+        client,
         "run-test",
         {
             "TEST1": {"state": "RUNNING", "detail_label": "From", "detail_role": "User"},
@@ -414,7 +517,8 @@ def test_bridge_flow_status_publisher_sends_optional_durable_metadata(monkeypatc
 
     monkeypatch.setattr(client, "json_request", fake_json_request)
 
-    client.update_flow_statuses(
+    _REAL_UPDATE_FLOW_STATUSES(
+        client,
         "run-test",
         {"SHARED": {"state": "DONE", "logical_role": "PLAN"}},
         request_id="req-test",
@@ -1063,14 +1167,244 @@ def test_reset_cannot_run_during_active_transaction_on_same_physical_role() -> N
     assert client.reset_called.is_set()
 
 
+def test_wait_new_chat_ready_polls_new_generation_before_probe() -> None:
+    before = response_snapshot(
+        "old",
+        page_instance_id="page-old",
+        page_path="/c/old",
+        user_count=1,
+        assistant_count=1,
+    )
+    old_after_ack = response_snapshot(
+        "old",
+        page_instance_id="page-old",
+        page_path="/c/old",
+        user_count=1,
+        assistant_count=1,
+    )
+    clean_new = response_snapshot(
+        "",
+        page_instance_id="page-new",
+        page_path="/",
+        user_count=0,
+        assistant_count=0,
+    )
+
+    class NavigationBridge(BridgeClient):
+        def __init__(self) -> None:
+            super().__init__("http://127.0.0.1:8500")
+            self.snapshots = [old_after_ack, clean_new, clean_new]
+            self.operations: list[str] = []
+
+        def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+            del role, timeout_s
+            snapshot = self.snapshots.pop(0)
+            self.operations.append(f"snapshot:{self._snapshot_page_generation(snapshot)}")
+            return snapshot
+
+        def command_roundtrip(
+            self,
+            role: str,
+            action: str,
+            timeout_s: float = 20.0,
+            *,
+            _deadline: float | None = None,
+        ) -> dict[str, Any]:
+            del role, timeout_s, _deadline
+            self.operations.append(f"command:{action}")
+            return {"done": True, "status": "PROBE_DONE"}
+
+        def sleep(self, seconds: float) -> None:
+            del seconds
+
+    client = NavigationBridge()
+    result = client.wait_new_chat_ready("DEV", before, timeout_s=1.0, poll_s=0.01)
+
+    assert result["status"] == "NEW_CHAT_READY"
+    assert result["page_instance_id"] == "page-new"
+    assert client.operations == [
+        "snapshot:page-old",
+        "snapshot:page-new",
+        "command:PROBE",
+        "snapshot:page-new",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("action", "reason"),
+    [
+        ("PROBE", "probe_timeout"),
+        ("NEW_CHAT", "new_chat_timeout"),
+        ("RELOAD_PAGE", "reload_page_timeout"),
+    ],
+)
+def test_timed_out_readiness_or_recovery_command_is_expired_by_bridge(action: str, reason: str) -> None:
+    class TimeoutBridge(BridgeClient):
+        def __init__(self) -> None:
+            super().__init__("http://127.0.0.1:8500")
+            self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        def json_request(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any] | None = None,
+            timeout_s: float | None = None,
+        ) -> dict[str, Any]:
+            del timeout_s
+            self.requests.append((method, path, payload))
+            if method == "POST" and path == "/api/admin/command":
+                return {"command": {"command_id": "cmd-timeout"}}
+            if method == "GET":
+                return {"command_id": "cmd-timeout", "status": "DELIVERED", "done": False, "result": None}
+            if method == "POST" and path == "/api/admin/command/cmd-timeout/cancel":
+                return {
+                    "command_id": "cmd-timeout",
+                    "status": "EXPIRED",
+                    "done": True,
+                    "result": {"state": "EXPIRED", "result": {"reason": reason}},
+                }
+            raise AssertionError((method, path, payload))
+
+    client = TimeoutBridge()
+    result = client.command_roundtrip("DEV", action, timeout_s=0.0)
+
+    assert result["status"] == "EXPIRED"
+    assert result["done"] is True
+    assert client.requests[-1] == (
+        "POST",
+        "/api/admin/command/cmd-timeout/cancel",
+        {"state": "EXPIRED", "reason": reason},
+    )
+
+
+def test_clean_root_rule_rejects_offline_active_or_conflicting_snapshot() -> None:
+    clean = response_snapshot(
+        "",
+        page_instance_id="page-root",
+        page_path="/",
+        user_count=0,
+        assistant_count=0,
+    )
+
+    offline = {**clean, "online": False}
+    active = {**clean, "online": True, "active_command": {"command_id": "cmd-old", "action": "PROBE"}}
+    conflicting = {
+        **clean,
+        "online": True,
+        "active_command": None,
+        "observation": {"page_instance_id": "page-other"},
+    }
+
+    assert not BridgeClient.is_clean_root_snapshot(offline)
+    assert not BridgeClient.is_clean_root_snapshot(active)
+    assert not BridgeClient.is_clean_root_snapshot(conflicting)
+
+
+def test_new_chat_reset_reuses_one_deadline_across_ack_and_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator = Coordinator(make_args("--preflight-timeout", "10"))
+    clock = {"now": 0.0}
+    timeouts: list[tuple[str, float]] = []
+    deadlines: list[tuple[str, float | None]] = []
+    monkeypatch.setattr("apps.lifecycle.time.monotonic", lambda: clock["now"])
+
+    class BudgetClient(LifecycleClient):
+        def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+            timeouts.append(("snapshot", float(timeout_s or 0.0)))
+            clock["now"] += 2.0
+            return response_snapshot("old", page_instance_id=f"before-{role}")
+
+        def new_chat(
+            self,
+            role: str,
+            timeout_s: float = 25.0,
+            *,
+            _deadline: float | None = None,
+        ) -> dict[str, Any]:
+            del role
+            timeouts.append(("ack", timeout_s))
+            deadlines.append(("ack", _deadline))
+            clock["now"] += 3.0
+            return {"done": True, "status": "NEW_CHAT_NAVIGATING"}
+
+        def wait_new_chat_ready(
+            self,
+            role: str,
+            before_snapshot: dict[str, Any],
+            timeout_s: float,
+            *,
+            _deadline: float | None = None,
+        ) -> dict[str, Any]:
+            del role, before_snapshot
+            timeouts.append(("ready", timeout_s))
+            deadlines.append(("ready", _deadline))
+            return {
+                "done": True,
+                "status": "NEW_CHAT_READY",
+                "page_instance_id": "after",
+                "page_path": "/",
+            }
+
+    coordinator.client = BudgetClient()
+
+    result = coordinator._perform_browser_reset("DEV")
+
+    assert result["status"] == "NEW_CHAT_READY"
+    assert timeouts == [("snapshot", 10.0), ("ack", 8.0), ("ready", 5.0)]
+    assert deadlines == [("ack", 10.0), ("ready", 10.0)]
+
+
+def test_already_clean_root_skips_unnecessary_new_chat_navigation() -> None:
+    coordinator = Coordinator(make_args())
+
+    class CleanRootClient(LifecycleClient):
+        def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+            del timeout_s
+            self.calls.append((role, "SNAPSHOT"))
+            snapshot = response_snapshot(
+                "",
+                page_instance_id="page-root",
+                page_path="/",
+                user_count=0,
+                assistant_count=0,
+            )
+            snapshot.update({
+                "online": True,
+                "active_command": None,
+                "observation": {"page_instance_id": "page-root"},
+            })
+            return snapshot
+
+        def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
+            del role, timeout_s
+            raise AssertionError("clean root must not navigate again")
+
+    client = CleanRootClient()
+    coordinator.client = client
+
+    result = coordinator._perform_browser_reset("DEV")
+
+    assert result["done"] is True
+    assert result["status"] == "NEW_CHAT_READY"
+    assert result["readiness_rule"] == "already_clean_root"
+    assert client.calls == [("DEV", "SNAPSHOT")]
+
+
 def test_reset_waits_for_terminal_new_chat_readiness_before_phase_or_bootstrap_change() -> None:
     coordinator = Coordinator(make_args("--role-map", "DEV=SHARED REVIEW=SHARED"))
     ready_started = threading.Event()
     release_ready = threading.Event()
 
     class DelayedReadyClient(LifecycleClient):
-        def wait_new_chat_ready(self, role: str, before_snapshot: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-            del before_snapshot, timeout_s
+        def wait_new_chat_ready(
+            self,
+            role: str,
+            before_snapshot: dict[str, Any],
+            timeout_s: float,
+            *,
+            _deadline: float | None = None,
+        ) -> dict[str, Any]:
+            del before_snapshot, timeout_s, _deadline
             self.calls.append((role, "WAIT_NEW_CHAT_READY"))
             ready_started.set()
             release_ready.wait(timeout=2.0)
@@ -1220,7 +1554,7 @@ def test_existing_equal_composer_prompt_is_reused_and_sent() -> None:
     ]
     bridge = ScriptedBridge(snapshots)
 
-    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     assert response == "fresh response"
     actions = [action for action, _payload in bridge.commands]
@@ -1235,7 +1569,7 @@ def test_different_existing_composer_text_is_blocked_without_overwrite_or_reload
     ])
 
     with pytest.raises(ManualInputPendingError):
-        bridge.call_browser_role("DEV", "automated prompt", timeout_s=1.0)
+        bridge.call_browser_role("DEV", "automated prompt", timeout_s=3.0)
 
     actions = [action for action, _payload in bridge.commands]
     assert "SET_PROMPT" not in actions
@@ -1254,7 +1588,7 @@ def test_composer_is_verified_stable_and_send_ready_before_click() -> None:
         response_snapshot("old", composer_text=prompt, send_enabled=True),
     ])
 
-    bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+    bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     assert bridge.snapshot_calls_at_click
     assert bridge.snapshot_calls_at_click[0] >= 6
@@ -1321,7 +1655,7 @@ def test_first_click_failure_with_expected_prompt_retries_once_without_reload() 
         },
     )
 
-    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     assert response == "fresh response"
     actions = [action for action, _payload in bridge.commands]
@@ -1344,7 +1678,7 @@ def test_send_evidence_after_nominal_failure_waits_without_duplicate_send() -> N
         command_results={"CLICK_SEND": [{"done": True, "status": "SEND_FAILED"}]},
     )
 
-    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     assert response == "fresh response"
     actions = [action for action, _payload in bridge.commands]
@@ -1373,9 +1707,7 @@ def test_wait_assistant_done_passes_wall_clock_timeout_to_browser() -> None:
     bridge = ScriptedBridge(
         [response_snapshot("old")],
         command_results={
-            "WAIT_ASSISTANT_DONE": [
-                {"done": True, "status": "ASSISTANT_DONE", "result": {"text": "fresh response"}},
-            ],
+            "WAIT_ASSISTANT_DONE": [assistant_done_command_result("fresh response")],
         },
     )
 
@@ -1384,6 +1716,196 @@ def test_wait_assistant_done_passes_wall_clock_timeout_to_browser() -> None:
     assert response == "fresh response"
     payload = next(payload for action, payload in bridge.commands if action == "WAIT_ASSISTANT_DONE")
     assert payload["timeout_ms"] == 11_500
+
+
+def test_wait_assistant_done_uses_remaining_absolute_budget_minus_one_second(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: clock["now"])
+    bridge = ScriptedBridge(
+        [response_snapshot("old")],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [assistant_done_command_result("fresh response")],
+        },
+    )
+
+    response = bridge.wait_assistant_done("DEV", timeout_s=99.0, _deadline=108.0)
+
+    assert response == "fresh response"
+    payload = next(payload for action, payload in bridge.commands if action == "WAIT_ASSISTANT_DONE")
+    assert payload["timeout_ms"] == 7_000
+
+
+def test_wait_assistant_done_fails_before_dispatch_when_grace_cannot_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: clock["now"])
+    bridge = ScriptedBridge([response_snapshot("old")])
+
+    with pytest.raises(RuntimeError, match="remaining deadline budget"):
+        bridge.wait_assistant_done("DEV", timeout_s=99.0, _deadline=101.5)
+
+    assert [action for action, _payload in bridge.commands].count("WAIT_ASSISTANT_DONE") == 0
+
+
+def test_wait_assistant_done_preserves_exact_parent_deadline_through_nested_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    moments = iter([100.0, 101.0, 102.0])
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: next(moments))
+
+    class DeadlineBridge(BridgeClient):
+        def __init__(self) -> None:
+            super().__init__("http://127.0.0.1:8500")
+            self.created_timeout: float | None = None
+            self.wait_deadline: float | None = None
+            self.wait_payload: dict[str, Any] = {}
+
+        def create_command(
+            self,
+            role: str,
+            action: str,
+            payload: dict[str, Any] | None = None,
+            *,
+            timeout_s: float | None = None,
+        ) -> str:
+            del role, action
+            self.created_timeout = timeout_s
+            self.wait_payload = dict(payload or {})
+            return "cmd-deadline"
+
+        def wait_command(
+            self,
+            command_id: str,
+            timeout_s: float,
+            *,
+            expire_on_timeout: bool = False,
+            expire_reason: str = "command_timeout",
+            _deadline: float | None = None,
+        ) -> dict[str, Any]:
+            del command_id, timeout_s, expire_on_timeout, expire_reason
+            self.wait_deadline = _deadline
+            return assistant_done_command_result('{"PLAN":"ok"}')
+
+    bridge = DeadlineBridge()
+    response = bridge.wait_assistant_done("DEV", timeout_s=99.0, _deadline=108.0)
+
+    assert response == '{"PLAN":"ok"}'
+    assert bridge.wait_payload["timeout_ms"] == 7_000
+    assert bridge.created_timeout == 6.0
+    assert bridge.wait_deadline == 108.0
+
+
+@pytest.mark.parametrize(
+    "dom_info",
+    [
+        {},
+        {
+            "composer": False,
+            "composer_text": "",
+            "composer_text_len": 0,
+            "composer_attachments": [],
+            "stop_visible": False,
+        },
+    ],
+    ids=["missing-composer", "false-composer"],
+)
+def test_assistant_done_without_clean_composer_hydrates_two_role_observations(
+    dom_info: dict[str, Any],
+) -> None:
+    baseline = BridgeClient.response_activity(response_snapshot("old", assistant_count=1, observation_seq=1))
+    hydrated = '{"PLAN":"hydrated from clean observations"}'
+    bridge = ScriptedBridge(
+        [
+            response_snapshot(hydrated, assistant_count=2, observation_seq=2),
+            response_snapshot(hydrated, assistant_count=2, observation_seq=3),
+        ],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {
+                    "done": True,
+                    "status": "ASSISTANT_DONE",
+                    "result": {
+                        "text": '{"PLAN":"untrusted command text"}',
+                        "result": {"stable_samples": 2},
+                        "dom_info": dom_info,
+                    },
+                },
+            ],
+        },
+    )
+
+    response = bridge.wait_assistant_done("DEV", timeout_s=3.0, baseline=baseline)
+
+    assert response == hydrated
+    assert bridge.snapshot_calls >= 2
+
+
+def test_response_recovery_requires_two_identical_complete_observations() -> None:
+    complete = 'JSON\n{"PLAN":"continue"}'
+    bridge = ScriptedBridge([
+        response_snapshot("JSON", assistant_count=2, observation_seq=1),
+        response_snapshot(complete, assistant_count=2, observation_seq=2),
+        response_snapshot(complete, assistant_count=2, observation_seq=3),
+    ])
+
+    response = bridge.wait_for_current_response(
+        "DEV",
+        timeout_s=1.0,
+        active_wait_s=60.0,
+        poll_s=0.001,
+        require_response=True,
+    )
+
+    assert response == complete
+    assert bridge.snapshot_calls >= 3
+
+
+def test_response_recovery_does_not_downgrade_to_shorter_prefix() -> None:
+    complete = '{"PLAN":"continue with exact full response"}'
+    shorter = '{"PLAN":"continue"}'
+    bridge = ScriptedBridge([
+        response_snapshot(complete, assistant_count=2, observation_seq=1),
+        response_snapshot(shorter, assistant_count=2, observation_seq=2),
+        response_snapshot(complete, assistant_count=2, observation_seq=3),
+        response_snapshot(complete, assistant_count=2, observation_seq=4),
+    ])
+
+    response = bridge.wait_for_current_response(
+        "DEV",
+        timeout_s=1.0,
+        active_wait_s=60.0,
+        poll_s=0.001,
+        require_response=True,
+    )
+
+    assert response == complete
+    assert bridge.snapshot_calls >= 4
+
+
+def test_owner_page_replaced_wait_recovers_without_resend_or_second_wait() -> None:
+    baseline = BridgeClient.response_activity(response_snapshot("old", assistant_count=1, observation_seq=1))
+    complete = '{"REVIEW":"inspect"}'
+    bridge = ScriptedBridge(
+        [
+            response_snapshot(complete, assistant_count=2, page_instance_id="page-new", observation_seq=1),
+            response_snapshot(complete, assistant_count=2, page_instance_id="page-new", observation_seq=2),
+        ],
+        command_results={
+            "WAIT_ASSISTANT_DONE": [
+                {
+                    "done": True,
+                    "status": "CANCELLED",
+                    "result": {"result": {"reason": "owner_page_replaced"}},
+                },
+            ],
+        },
+    )
+
+    response = bridge.wait_assistant_done("DEV", timeout_s=3.0, baseline=baseline)
+
+    actions = [action for action, _payload in bridge.commands]
+    assert response == complete
+    assert actions.count("WAIT_ASSISTANT_DONE") == 1
+    assert actions.count("CLICK_SEND") == 0
 
 
 def test_bare_json_completion_waits_for_hydrated_route_response() -> None:
@@ -1397,7 +1919,7 @@ def test_bare_json_completion_waits_for_hydrated_route_response() -> None:
         },
     )
 
-    response = bridge.wait_assistant_done("REVIEW", timeout_s=1.0)
+    response = bridge.wait_assistant_done("REVIEW", timeout_s=3.0)
 
     assert BridgeClient.looks_incomplete_response("JSON")
     assert BridgeClient.looks_incomplete_response("```json\n```")
@@ -1431,7 +1953,7 @@ def test_second_nominal_send_failure_with_evidence_recovers_without_third_click(
         },
     )
 
-    response = bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+    response = bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     assert response == "fresh response"
     actions = [action for action, _payload in bridge.commands]
@@ -1462,7 +1984,7 @@ def test_second_nominal_send_failure_without_evidence_propagates_after_two_click
     )
 
     with pytest.raises(RuntimeError, match="CLICK_SEND failed"):
-        bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+        bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     actions = [action for action, _payload in bridge.commands]
     assert actions.count("CLICK_SEND") == 2
@@ -1485,7 +2007,7 @@ def test_changed_composer_after_paste_is_ownership_loss() -> None:
     )
 
     with pytest.raises(ManualInputPendingError):
-        bridge.call_browser_role("DEV", prompt, timeout_s=1.0)
+        bridge.call_browser_role("DEV", prompt, timeout_s=3.0)
 
     actions = [action for action, _payload in bridge.commands]
     assert actions.count("CLICK_SEND") == 1
@@ -1527,7 +2049,7 @@ def test_manual_attachment_blocks_automation() -> None:
     ])
 
     with pytest.raises(ManualInputPendingError):
-        bridge.call_browser_role("DEV", "prompt", timeout_s=1.0)
+        bridge.call_browser_role("DEV", "prompt", timeout_s=3.0)
 
 
 def test_offline_physical_role_fails_before_creating_browser_command() -> None:
@@ -1536,7 +2058,7 @@ def test_offline_physical_role_fails_before_creating_browser_command() -> None:
     bridge = ScriptedBridge([snapshot])
 
     with pytest.raises(RuntimeError, match="physical role DEV is offline"):
-        bridge.call_browser_role("DEV", "prompt", timeout_s=1.0)
+        bridge.call_browser_role("DEV", "prompt", timeout_s=3.0)
 
     assert bridge.commands == []
 

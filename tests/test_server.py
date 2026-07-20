@@ -654,6 +654,86 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertTrue(current_release["released"])
         self.assertNotIn("PLAN", controller.state.role_owners)
 
+    def test_admin_role_projects_configured_role_turn_responses_and_composer_counts(self):
+        role = "C1"
+        controller.state.role_seen_at[role] = time.time()
+        controller.state.last_user_message[role] = 'PROMPT_ROLE: DEV\nRUNTIME_PROVENANCE_JSON: {"prompt_role":"DEV"}'
+        controller.state.transcripts[role] = [
+            {"role": "user", "text": "goal"},
+            {"role": "assistant", "text": "first", "images": [{"src": "one"}]},
+            {"role": "assistant", "text": "second"},
+        ]
+        controller.state.dom_info[role] = {
+            "composer": True,
+            "composer_text_len": 7,
+            "composer_attachments": [{"label": "Remove file"}],
+            "messages": {"counts": {"user": 1, "assistant": 2, "images": 1}},
+            "page_path": "/c/example",
+        }
+
+        inventory = self.client.get("/api/admin/roles").json()["roles"]
+        card = next(item for item in inventory if item["role"] == role)
+        self.assertEqual(card["configured_role"], "DEV")
+        self.assertEqual(card["turn"], 2)
+        self.assertEqual(card["dom_summary"]["composer_attachment_count"], 1)
+
+        detail = self.client.get(f"/api/admin/role/{role}").json()
+        self.assertEqual(detail["configured_role"], "DEV")
+        self.assertEqual(detail["turn"], 2)
+        self.assertEqual([item["turn"] for item in detail["responses"]], [1, 2])
+        self.assertEqual(detail["responses"][0]["image_count"], 1)
+        self.assertEqual(detail["message_counts"]["assistant"], 2)
+
+    def test_admin_roles_excludes_stale_historical_cache_and_removes_released_role_immediately(self):
+        stale_role = "C3"
+        controller.state.status[stale_role] = "OFFLINE"
+        controller.state.role_seen_at[stale_role] = time.time() - 3600
+        controller.state.sessions[stale_role].add("session-stale")
+        controller.state.current_sessions[stale_role] = "session-stale"
+        controller.state.dom_info[stale_role] = {"page_path": "/c/stale"}
+        controller.state.transcripts[stale_role] = [{"role": "assistant", "text": "old"}]
+        controller.state.last_response[stale_role] = "old"
+
+        roles_before = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertNotIn(stale_role, roles_before)
+
+        claim = self.client.post("/api/reserve-role-claim", json={"role": "TEMP"}).json()["role_claim_id"]
+        identity = {
+            "role": "TEMP",
+            "session_id": "/c/temp",
+            "page_instance_id": "page-temp",
+            "role_owner_id": "tab-temp",
+            "role_claim_id": claim,
+        }
+        claimed = self.client.post("/api/status", json={**identity, "claim_role": True}).json()
+        self.assertFalse(claimed["clear_role"])
+        roles_claimed = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertIn("TEMP", roles_claimed)
+        temp_status = next(item for item in self.client.get("/api/admin/roles").json()["roles"] if item["role"] == "TEMP")
+        self.assertIn("dom_summary", temp_status)
+        self.assertIn("page_instance_id", temp_status)
+        self.assertIn("observation_seq", temp_status)
+        self.assertIn("bridge_version", temp_status)
+
+        released = self.client.post("/api/release-role", json=identity).json()
+        self.assertTrue(released["released"])
+        roles_released = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertNotIn("TEMP", roles_released)
+
+    def test_admin_roles_keeps_offline_role_only_when_it_has_active_work(self):
+        controller.state.create_command("COMMANDER", "PROBE", {})
+        controller.state.update_flow_statuses(
+            "run-active",
+            {"FLOWER": {"state": "RUNNING", "logical_role": "PLAN"}},
+            request_id="request-active",
+            activate=True,
+        )
+
+        roles = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
+
+        self.assertIn("COMMANDER", roles)
+        self.assertIn("FLOWER", roles)
+
     def test_current_claim_releases_after_normal_path_change(self):
         self.client.post(
             "/api/status",
@@ -844,6 +924,159 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.role_seen_at["A"], stale_seen_at)
         self.assertNotIn(command["command_id"], controller.state.command_results)
 
+    def _activate_running_flow(self, run_id="run-test", role="TEST1", logical_role="REVIEW"):
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "run_id": run_id,
+                "activate": True,
+                "updates": {role: {"state": "RUNNING", "logical_role": logical_role, "from_role": "User"}},
+            },
+        )
+
+    def test_flow_heartbeat_endpoint_records_runner_liveness(self):
+        self._activate_running_flow()
+        response = self.client.post(
+            "/api/admin/flow-heartbeat",
+            json={"run_id": "run-test", "pid": 4321},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["request_id"], "run-test")
+
+        liveness = self.client.get("/api/admin/flow").json()["liveness"]
+        self.assertEqual(liveness["runner"]["state"], "RUNNING")
+        self.assertEqual(liveness["runner"]["pid"], 4321)
+        self.assertIsNotNone(liveness["runner"]["last_heartbeat_age_s"])
+        self.assertFalse(liveness["stalled"])
+
+    def test_e09_stopped_runner_marks_active_flow_stalled(self):
+        # A durable flow left RUNNING by a runner that crashed before terminalizing
+        # must surface as STALLED once the heartbeat goes stale, never RUNNING.
+        self._activate_running_flow(role="TEST1", logical_role="REVIEW")
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test", "pid": 999})
+        # Simulate the runner process dying: the last heartbeat is now well past the window.
+        controller.state.runner_heartbeats["run-test"]["ts"] = time.time() - 10_000
+
+        liveness = self.client.get("/api/admin/flow").json()["liveness"]
+        self.assertTrue(liveness["stalled"])
+        self.assertEqual(liveness["runner"]["state"], "STOPPED")
+        self.assertEqual(liveness["role"], "TEST1")
+        self.assertEqual(liveness["logical_role"], "REVIEW")
+        self.assertEqual(liveness["reason"], "runner stopped before terminalizing flow")
+        self.assertEqual(liveness["next_action"], "recover existing flow")
+
+        # The single-tab overlay poll must also stop reporting a live RUNNING state.
+        poll = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
+        self.assertEqual(poll["flow_status"]["state"], "RUNNING")
+        self.assertTrue(poll["flow_status"]["stalled"])
+
+    def test_e08_stuck_delivered_command_marks_flow_stalled(self):
+        # A recovery command stuck in DELIVERED (e.g. SYNC_TRANSCRIPT whose
+        # TRANSCRIPT_SAVED never arrives) must surface STALLED even while the
+        # runner process is still alive and heartbeating.
+        self._activate_running_flow(role="TEST1", logical_role="REVIEW")
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test", "pid": 111})
+
+        command = controller.state.create_command("TEST1", "SYNC_TRANSCRIPT", {})
+        command["status"] = "DELIVERED"
+        command["delivered_at"] = time.time() - 10_000
+        controller.state.command_status[command["command_id"]] = "DELIVERED"
+
+        liveness = self.client.get("/api/admin/flow").json()["liveness"]
+        self.assertTrue(liveness["stalled"])
+        self.assertEqual(liveness["runner"]["state"], "RUNNING")
+        self.assertEqual(liveness["reason"], "SYNC_TRANSCRIPT command did not terminate")
+        self.assertEqual(liveness["last_command"]["action"], "SYNC_TRANSCRIPT")
+        self.assertEqual(liveness["last_command"]["state"], "DELIVERED")
+
+    def test_request_specific_liveness_does_not_leak_active_command_from_another_flow(self):
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "request_id": "old-flow",
+                "run_id": "old-run",
+                "activate": True,
+                "updates": {
+                    "DEV": {
+                        "state": "RUNNING",
+                        "logical_role": "REVIEW",
+                        "from_role": "PLAN",
+                    }
+                },
+            },
+        )
+        self.client.post(
+            "/api/admin/flow-status",
+            json={
+                "request_id": "new-flow",
+                "run_id": "new-run",
+                "activate": True,
+                "updates": {
+                    "DEV": {
+                        "state": "RUNNING",
+                        "logical_role": "PLAN",
+                        "from_role": "REVIEW",
+                    }
+                },
+            },
+        )
+        self.assertEqual(controller.state.flow_store.document["active_request_id"], "new-flow")
+        self.client.post(
+            "/api/admin/flow-heartbeat",
+            json={"request_id": "new-flow", "run_id": "new-run", "pid": 4321},
+        )
+        command = controller.state.create_command("DEV", "WAIT_ASSISTANT_DONE", {})
+        command["status"] = "DELIVERED"
+        command["delivered_at"] = time.time() - 10_000
+        controller.state.command_status[command["command_id"]] = "DELIVERED"
+
+        old_flow = self.client.get("/api/admin/flow", params={"request_id": "old-flow"}).json()
+        new_flow = self.client.get("/api/admin/flow", params={"request_id": "new-flow"}).json()
+
+        self.assertEqual(old_flow["flow"]["request_id"], "old-flow")
+        self.assertEqual(old_flow["active_request_id"], "new-flow")
+        self.assertEqual(old_flow["liveness"]["runner"]["state"], "UNKNOWN")
+        self.assertTrue(old_flow["liveness"]["stalled"])
+        self.assertEqual(
+            old_flow["liveness"]["reason"],
+            "runner heartbeat unavailable for active flow",
+        )
+        self.assertIsNone(old_flow["liveness"]["last_command"])
+        self.assertEqual(old_flow["liveness"]["role"], "DEV")
+        self.assertEqual(old_flow["liveness"]["logical_role"], "REVIEW")
+        self.assertEqual(old_flow["liveness"]["next_action"], "recover existing flow")
+
+        self.assertEqual(new_flow["flow"]["request_id"], "new-flow")
+        self.assertEqual(new_flow["liveness"]["runner"]["state"], "RUNNING")
+        self.assertTrue(new_flow["liveness"]["stalled"])
+        self.assertEqual(
+            new_flow["liveness"]["reason"],
+            "WAIT_ASSISTANT_DONE command did not terminate",
+        )
+        self.assertEqual(new_flow["liveness"]["last_command"]["action"], "WAIT_ASSISTANT_DONE")
+        self.assertEqual(new_flow["liveness"]["last_command"]["state"], "DELIVERED")
+        self.assertEqual(new_flow["liveness"]["role"], "DEV")
+        self.assertEqual(new_flow["liveness"]["logical_role"], "PLAN")
+
+    def test_terminal_flow_is_never_stalled(self):
+        self._activate_running_flow(role="TEST1", logical_role="REVIEW")
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test"})
+        controller.state.runner_heartbeats["run-test"]["ts"] = time.time() - 10_000
+        self.client.post(
+            "/api/admin/flow-status",
+            json={"run_id": "run-test", "terminal_status": "complete", "updates": {}},
+        )
+
+        liveness = self.client.get("/api/admin/flow").json()["liveness"]
+        self.assertFalse(liveness["stalled"])
+
+    def test_fresh_running_flow_is_not_stalled(self):
+        self._activate_running_flow(role="TEST1", logical_role="REVIEW")
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test"})
+        liveness = self.client.get("/api/admin/flow").json()["liveness"]
+        self.assertFalse(liveness["stalled"])
+        self.assertEqual(liveness["runner"]["state"], "RUNNING")
+
     def test_flow_status_is_returned_only_to_the_polling_role(self):
         response = self.client.post(
             "/api/admin/flow-status",
@@ -857,6 +1090,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test"})
         test1 = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
         test2 = self.client.post("/api/status", json={"role": "TEST2", "session_id": "/c/2"}).json()
         dev = self.client.post("/api/status", json={"role": "DEV", "session_id": "/c/dev"}).json()
@@ -866,10 +1100,11 @@ class DiagnosticControllerTests(unittest.TestCase):
             {
                 "run_id": "run-test",
                 "state": "RUNNING",
+                "stalled": False,
                 "from_role": "User",
             },
         )
-        self.assertEqual(test2["flow_status"], {"run_id": "run-test", "state": "WAITING"})
+        self.assertEqual(test2["flow_status"], {"run_id": "run-test", "state": "WAITING", "stalled": False})
         self.assertIsNone(dev["flow_status"])
 
     def test_flow_status_accepts_done_with_from_detail(self):
@@ -887,7 +1122,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         status = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
         self.assertEqual(
             status["flow_status"],
-            {"run_id": "run-test", "state": "DONE", "done_from": "A", "sent_to": "B"},
+            {"run_id": "run-test", "state": "DONE", "stalled": False, "done_from": "A", "sent_to": "B"},
         )
 
     def test_waiting_retains_only_the_same_runs_validated_destination(self):
@@ -899,9 +1134,10 @@ class DiagnosticControllerTests(unittest.TestCase):
             "/api/admin/flow-status",
             json={"run_id": "run-test", "updates": {"TEST1": {"state": "WAITING"}}},
         )
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "run-test"})
 
         status = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
-        self.assertEqual(status["flow_status"], {"run_id": "run-test", "state": "WAITING", "sent_to": "B"})
+        self.assertEqual(status["flow_status"], {"run_id": "run-test", "state": "WAITING", "stalled": False, "sent_to": "B"})
 
     def test_flow_status_cleanup_cannot_clear_a_newer_run(self):
         self.client.post(
@@ -912,6 +1148,7 @@ class DiagnosticControllerTests(unittest.TestCase):
             "/api/admin/flow-status",
             json={"run_id": "new-run", "activate": True, "updates": {"TEST1": {"state": "WAITING"}}},
         )
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "new-run"})
 
         stale_cleanup = self.client.post(
             "/api/admin/flow-status",
@@ -920,7 +1157,7 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertEqual(stale_cleanup.status_code, 200)
         payload = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
-        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING"})
+        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING", "stalled": False})
 
         self.client.post(
             "/api/admin/flow-status",
@@ -938,6 +1175,7 @@ class DiagnosticControllerTests(unittest.TestCase):
             "/api/admin/flow-status",
             json={"run_id": "new-run", "activate": True, "updates": {"TEST1": {"state": "WAITING"}}},
         )
+        self.client.post("/api/admin/flow-heartbeat", json={"run_id": "new-run"})
 
         self.client.post(
             "/api/admin/flow-status",
@@ -950,7 +1188,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         )
 
         payload = self.client.post("/api/status", json={"role": "TEST1", "session_id": "/c/1"}).json()
-        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING"})
+        self.assertEqual(payload["flow_status"], {"run_id": "new-run", "state": "WAITING", "stalled": False})
 
     def test_flow_status_rejects_invalid_state_without_touching_other_roles(self):
         response = self.client.post(
@@ -1059,22 +1297,64 @@ class DiagnosticControllerTests(unittest.TestCase):
                 },
             },
         )
+        self.client.post(
+            "/api/admin/flow-heartbeat",
+            json={"request_id": "req-restart", "run_id": "run-restart", "pid": 4321},
+        )
+        before_restart = self.client.get(
+            "/api/admin/flow", params={"request_id": "req-restart"}
+        ).json()
+        self.assertEqual(before_restart["liveness"]["runner"]["state"], "RUNNING")
+        self.assertFalse(before_restart["liveness"]["stalled"])
 
         controller.state = controller.DiagnosticState(flow_path=self.flow_path, task_path=self.task_path)
+
+        restarted = self.client.get(
+            "/api/admin/flow", params={"request_id": "req-restart"}
+        ).json()
+        self.assertEqual(restarted["flow"]["request_id"], "req-restart")
+        self.assertFalse(restarted["flow"]["terminal_status"])
+        self.assertEqual(restarted["liveness"]["runner"]["state"], "UNKNOWN")
+        self.assertTrue(restarted["liveness"]["stalled"])
+        self.assertEqual(
+            restarted["liveness"]["reason"],
+            "runner heartbeat unavailable for active flow",
+        )
+        self.assertEqual(restarted["liveness"]["role"], "SHARED")
+        self.assertEqual(restarted["liveness"]["logical_role"], "REVIEW")
+        self.assertEqual(restarted["liveness"]["next_action"], "recover existing flow")
+
         status = self.client.post(
             "/api/status",
             json={"role": "SHARED", "session_id": "/c/restart", "page_instance_id": "page-restart"},
         ).json()
-
         self.assertEqual(
             status["flow_status"],
             {
                 "run_id": "run-restart",
                 "state": "RUNNING",
+                "stalled": True,
                 "logical_role": "REVIEW",
                 "from_role": "DEV",
             },
         )
+
+        self.client.post(
+            "/api/admin/flow-heartbeat",
+            json={"request_id": "req-restart", "run_id": "run-restart", "pid": 9876},
+        )
+        recovered = self.client.get(
+            "/api/admin/flow", params={"request_id": "req-restart"}
+        ).json()
+        self.assertEqual(recovered["liveness"]["runner"]["state"], "RUNNING")
+        self.assertFalse(recovered["liveness"]["stalled"])
+        recovered_status = self.client.post(
+            "/api/status",
+            json={"role": "SHARED", "session_id": "/c/restart", "page_instance_id": "page-restart"},
+        ).json()
+        self.assertEqual(recovered_status["flow_status"]["state"], "RUNNING")
+        self.assertEqual(recovered_status["flow_status"]["logical_role"], "REVIEW")
+        self.assertFalse(recovered_status["flow_status"]["stalled"])
 
     def test_corrupt_flow_file_blocks_only_flow_mutation_and_remains_untouched(self):
         corrupt = b'{"version":1,"requests":'
@@ -1142,6 +1422,8 @@ class DiagnosticControllerTests(unittest.TestCase):
             "CHOICE_PROMPT_CLICKED",
             "CHOICE_PROMPT_CLICK_FAILED",
             "CHOICE_PROMPT_NOT_FOUND",
+            "COMPOSER_TEXT_CLEARED",
+            "COMPOSER_TEXT_CLEAR_FAILED",
         ):
             command = controller.state.create_command("A", "TEST", {})
             self.client.post(
@@ -1241,6 +1523,34 @@ class DiagnosticControllerTests(unittest.TestCase):
         events_payload = events_response.json()
         self.assertGreaterEqual(len(events_payload["events"]), 1)
 
+    def test_admin_role_timeline_filters_noise_before_limit_and_keeps_raw_events_separate(self):
+        for index in range(120):
+            controller.state.log("A", "SYNC", sequence=index)
+        controller.state.update_flow_statuses(
+            "run-timeline",
+            {"A": {"state": "RUNNING", "logical_role": "DEV", "from_role": "User"}},
+            request_id="request-timeline",
+            activate=True,
+        )
+        controller.state.log("A", "COMMAND_CREATED", command_id="cmd-1", action="RELOAD_PAGE")
+        controller.state.log("A", "ASSISTANT_DONE", command_id="cmd-2")
+        controller.state.log("B", "ASSISTANT_DONE", command_id="cmd-other")
+
+        timeline = self.client.get("/api/admin/role/A/timeline?limit=3")
+
+        self.assertEqual(timeline.status_code, 200)
+        payload = timeline.json()
+        self.assertEqual(payload["role"], "A")
+        self.assertEqual(
+            [event["event"] for event in payload["events"]],
+            ["FLOW_RUNNING", "COMMAND_CREATED", "ASSISTANT_DONE"],
+        )
+        self.assertTrue(all(event["role"] == "A" for event in payload["events"]))
+        self.assertGreaterEqual(payload["omitted_event_count"], 120)
+
+        raw = self.client.get("/api/admin/events?role=A&limit=200").json()["events"]
+        self.assertTrue(any(event["event"] == "SYNC" for event in raw))
+
     def test_admin_role_marks_never_seen_numbered_role_offline(self):
         role_response = self.client.get("/api/admin/role/REVIEW1")
 
@@ -1259,9 +1569,9 @@ class DiagnosticControllerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
-        self.assertIn("<title>Stable Flow Kanban</title>", response.text)
+        self.assertIn("<title>Stable Flow Runtime</title>", response.text)
         self.assertIn('id="dashboard-root"', response.text)
-        self.assertIn('data-dashboard-version="5"', response.text)
+        self.assertIn('data-dashboard-version="9"', response.text)
 
     def test_admin_routes_lists_samples(self):
         response = self.client.get("/api/admin/routes")
@@ -1270,6 +1580,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         samples = [route["sample"] for route in routes]
 
         self.assertIn("/api/admin/role/A", samples)
+        self.assertIn("/api/admin/role/A/timeline?limit=20", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
         dashboard_route = next(route for route in routes if route["path"] == "/dashboard")
         self.assertEqual(dashboard_route["method"], "GET")
@@ -2079,15 +2390,52 @@ class TaskControlPlaneTests(unittest.TestCase):
         listed = self.client.get("/api/admin/tasks").json()
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
         self.assertIn("scheduler", listed)
-        self.assertEqual(self.client.get(f"/api/admin/tasks/{task['task_id']}").status_code, 200)
+        detail = self.client.get(f"/api/admin/tasks/{task['task_id']}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["task"]["execution_options"]["request_timeout"], 1200.0)
+
+        options = {
+            "timeout": 900,
+            "request_timeout": 700,
+            "parallelism": 2,
+            "max_turns": 8,
+            "reload_after": 4,
+            "new_chat_on_handoff": True,
+            "handoff_command_policy": "always",
+        }
+        option_changed = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": task["revision"], "changes": {"execution_options": options}},
+        ).json()["task"]
+        self.assertEqual(option_changed["execution_options"]["parallelism"], 2)
+        self.assertTrue(option_changed["execution_options"]["new_chat_on_handoff"])
+
+        partial_options = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={"expected_revision": option_changed["revision"], "changes": {"execution_options": {"parallelism": 3}}},
+        ).json()["task"]
+        self.assertEqual(partial_options["execution_options"]["parallelism"], 3)
+        self.assertEqual(partial_options["execution_options"]["timeout"], 900.0)
+        self.assertEqual(partial_options["execution_options"]["request_timeout"], 700.0)
+        self.assertEqual(partial_options["execution_options"]["handoff_command_policy"], "always")
+
+        rejected_off = self.client.patch(
+            f"/api/admin/tasks/{task['task_id']}",
+            json={
+                "expected_revision": partial_options["revision"],
+                "changes": {"execution_options": {"handoff_command_policy": "off"}},
+            },
+        )
+        self.assertEqual(rejected_off.status_code, 400)
+        self.assertIn("auto or always", rejected_off.json()["detail"]["message"])
 
         changed = self.client.patch(
             f"/api/admin/tasks/{task['task_id']}",
-            json={"expected_revision": task["revision"], "changes": {"title": "Changed"}},
+            json={"expected_revision": partial_options["revision"], "changes": {"title": "Changed"}},
         ).json()["task"]
         stale = self.client.patch(
             f"/api/admin/tasks/{task['task_id']}",
-            json={"expected_revision": task["revision"], "changes": {"title": "Stale"}},
+            json={"expected_revision": option_changed["revision"], "changes": {"title": "Stale"}},
         )
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(stale.json()["detail"]["code"], "stale_revision")
@@ -2235,18 +2583,29 @@ class TaskControlPlaneTests(unittest.TestCase):
         self.assertEqual(current["wake"]["error"], "controller_offline")
         self.assertEqual(controller.state.commands, {})
 
-    def test_role_inventory_unions_opaque_assignments_and_userscript_seam(self):
+    def test_role_inventory_only_adds_task_assignments_while_task_reserves_controller(self):
         task = self.create(controller_role="ops_a", physical_role_map={"dev1": "box_7", "review2": "worker-12", "plan_z": "box_7"})
         controller.state.role_seen_at["OPS_A"] = time.time()
         controller.state.dom_info["OPS_A"] = {"composer": True, "page_path": "/c/controller"}
-        roles = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
-        self.assertIn("OPS_A", roles)
-        self.assertIn("BOX_7", roles)
-        self.assertIn("WORKER-12", roles)
-        self.assertEqual(roles["OPS_A"]["transport"], "userscript")
-        self.assertIsNone(roles["OPS_A"]["external_target"])
-        self.assertEqual(roles["OPS_A"]["page_path"], "/c/controller")
-        self.assertIsNone(roles["OPS_A"]["current_task_id"])
+
+        ready_roles = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertIn("OPS_A", ready_roles)
+        self.assertNotIn("BOX_7", ready_roles)
+        self.assertNotIn("WORKER-12", ready_roles)
+        self.assertEqual(ready_roles["OPS_A"]["transport"], "userscript")
+        self.assertIsNone(ready_roles["OPS_A"]["external_target"])
+        self.assertEqual(ready_roles["OPS_A"]["page_path"], "/c/controller")
+        self.assertIsNone(ready_roles["OPS_A"]["current_task_id"])
+
+        moved = self.client.post(
+            f"/api/admin/tasks/{task['task_id']}/move",
+            json={"expected_revision": task["revision"], "status": "RUNNING", "actor_role": "OPS_A"},
+        )
+        self.assertEqual(moved.status_code, 200)
+        running_roles = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertIn("BOX_7", running_roles)
+        self.assertIn("WORKER-12", running_roles)
+        self.assertEqual(running_roles["OPS_A"]["current_task_id"], task["task_id"])
 
     def test_lifespan_starts_and_stops_exact_scheduler_instance(self):
         active = controller.state

@@ -43,6 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reload-after", nargs="?", const=10.0, default=10.0, type=float, help="After routing to a different role, reload the previous role's browser tab after N seconds; 0 disables it.")
     parser.add_argument("--preflight", action="store_true", help="Test PROBE, RELOAD_PAGE, NEW_CHAT for physical browser roles before running")
     parser.add_argument("--preflight-timeout", type=float, default=20.0)
+    parser.add_argument("--heartbeat-interval", type=float, default=5.0, help="Seconds between runner liveness heartbeats while a flow is active.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     raw_argv = list(sys.argv[1:] if argv is None else argv)

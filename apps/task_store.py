@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import tempfile
@@ -38,7 +39,16 @@ ALLOWED_TRANSITIONS = {
     "DONE": {"BACKLOG", "READY"},
 }
 EXECUTION_FIELDS = {"active_request_id", "last_request_id", "last_result_status", "last_result_summary", "blocker"}
-REASSIGNMENT_FIELDS = {"controller_role", "logical_roles", "physical_role_map", "finish_roles", "schedule"}
+REASSIGNMENT_FIELDS = {"controller_role", "logical_roles", "physical_role_map", "finish_roles", "schedule", "execution_options"}
+EXECUTION_OPTION_DEFAULTS = {
+    "timeout": 1800.0,
+    "request_timeout": 1200.0,
+    "parallelism": 4,
+    "max_turns": 0,
+    "reload_after": 10.0,
+    "new_chat_on_handoff": False,
+    "handoff_command_policy": "auto",
+}
 _WAKE_FIELD_UNSET = object()
 
 
@@ -96,6 +106,57 @@ def bounded_text(value: Any, *, field: str, limit: int, allow_empty: bool = True
     if len(text) > limit:
         raise ValueError(f"{field} exceeds {limit} characters")
     return text
+
+
+def default_execution_options() -> dict[str, Any]:
+    return copy.deepcopy(EXECUTION_OPTION_DEFAULTS)
+
+
+def normalize_execution_options(raw: Any) -> dict[str, Any]:
+    if raw is None or raw == {}:
+        return default_execution_options()
+    if not isinstance(raw, dict):
+        raise ValueError("execution_options must be an object")
+    unknown = set(raw) - set(EXECUTION_OPTION_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unsupported execution_options fields: {', '.join(sorted(unknown))}")
+    options = {**EXECUTION_OPTION_DEFAULTS, **raw}
+
+    def finite_number(name: str, *, minimum: float, maximum: float) -> float:
+        value = options[name]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+            raise ValueError(f"execution_options.{name} must be a finite number")
+        value = float(value)
+        if value < minimum or value > maximum:
+            raise ValueError(f"execution_options.{name} must be between {minimum:g} and {maximum:g}")
+        return value
+
+    timeout = finite_number("timeout", minimum=1, maximum=86400)
+    request_timeout = finite_number("request_timeout", minimum=1, maximum=86400)
+    reload_after = finite_number("reload_after", minimum=0, maximum=3600)
+    for name, minimum, maximum in (("parallelism", 1, 32), ("max_turns", 0, 100000)):
+        value = options[name]
+        if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+            raise ValueError(f"execution_options.{name} must be a whole number between {minimum} and {maximum}")
+    if not isinstance(options["new_chat_on_handoff"], bool):
+        raise ValueError("execution_options.new_chat_on_handoff must be a boolean")
+    policy = bounded_text(
+        options["handoff_command_policy"],
+        field="execution_options.handoff_command_policy",
+        limit=16,
+        allow_empty=False,
+    ).lower()
+    if policy not in {"auto", "always"}:
+        raise ValueError("execution_options.handoff_command_policy must be auto or always")
+    return {
+        "timeout": timeout,
+        "request_timeout": request_timeout,
+        "parallelism": options["parallelism"],
+        "max_turns": options["max_turns"],
+        "reload_after": reload_after,
+        "new_chat_on_handoff": options["new_chat_on_handoff"],
+        "handoff_command_policy": policy,
+    }
 
 
 def load_timezone(name: str):
@@ -254,7 +315,7 @@ def validate_task(raw: Any) -> dict[str, Any]:
     task_keys = {
         "task_id", "revision", "title", "target_root", "branch", "prompt", "skill_path",
         "controller_role", "logical_roles", "physical_role_map", "finish_roles", "status", "enabled",
-        "schedule", "next_run_at", "active_request_id", "last_request_id", "last_result_status",
+        "schedule", "execution_options", "next_run_at", "active_request_id", "last_request_id", "last_result_status",
         "last_result_summary", "blocker", "wake", "events", "created_at", "updated_at", "archived_at",
         "transport", "external_target",
     }
@@ -315,6 +376,7 @@ def validate_task(raw: Any) -> dict[str, Any]:
         "status": status,
         "enabled": enabled,
         "schedule": schedule,
+        "execution_options": normalize_execution_options(raw.get("execution_options")),
         "next_run_at": normalized_next,
         "active_request_id": bounded_text(active_request_id, field="active_request_id", limit=160) if active_request_id else None,
         "last_request_id": bounded_text(last_request_id, field="last_request_id", limit=160) if last_request_id else None,
@@ -358,7 +420,10 @@ def validate_document(raw: Any) -> dict[str, Any]:
     normalized_tasks: dict[str, Any] = {}
     reserved_controllers: dict[str, str] = {}
     for key, value in tasks.items():
-        task = validate_task(value)
+        migrated = copy.deepcopy(value) if isinstance(value, dict) else value
+        if isinstance(migrated, dict):
+            migrated.setdefault("execution_options", default_execution_options())
+        task = validate_task(migrated)
         if key != task["task_id"]:
             raise ValueError("task map key must match task_id")
         if not task.get("archived_at") and task_reserves_controller(task):
@@ -492,6 +557,7 @@ class TaskStore:
                 "status": raw.get("status", "BACKLOG"),
                 "enabled": raw.get("enabled", True),
                 "schedule": schedule,
+                "execution_options": normalize_execution_options(raw.get("execution_options")),
                 "next_run_at": next_run_at,
                 "active_request_id": None,
                 "last_request_id": None,
@@ -542,7 +608,7 @@ class TaskStore:
                 raise ValueError("changes must be an object")
             allowed = {
                 "title", "target_root", "branch", "prompt", "controller_role", "logical_roles", "physical_role_map",
-                "finish_roles", "enabled", "schedule", "active_request_id", "last_request_id", "last_result_status",
+                "finish_roles", "enabled", "schedule", "execution_options", "active_request_id", "last_request_id", "last_result_status",
                 "last_result_summary", "blocker", "archived",
             }
             unknown = set(changes) - allowed
@@ -577,6 +643,10 @@ class TaskStore:
                         task["archived_at"] = None
                 elif key == "schedule":
                     task["schedule"], task["next_run_at"] = normalize_schedule(value, self._now())
+                elif key == "execution_options":
+                    if not isinstance(value, dict):
+                        raise ValueError("execution_options must be an object")
+                    task[key] = normalize_execution_options({**task["execution_options"], **value})
                 elif key == "controller_role":
                     task[key] = normalize_role(value, field=key)
                 elif key == "logical_roles":

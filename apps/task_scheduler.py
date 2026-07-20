@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable
 
 from apps.task_store import (
@@ -22,10 +24,77 @@ SET_SUCCESS = "PASTE_CONFIRMED"
 SEND_SUCCESS = "SEND_ACCEPTED"
 
 
+def _command_number(value: Any) -> str:
+    numeric = float(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    text = repr(numeric).lower()
+    if "e" not in text:
+        return text
+    mantissa, raw_exponent = text.split("e", 1)
+    exponent = int(raw_exponent)
+    if -6 <= exponent < 0:
+        return format(Decimal(text), "f").rstrip("0").rstrip(".")
+    return f"{mantissa}e{exponent:+d}"
+
+
+def _quote_cli(value: Any) -> str:
+    text = str(value)
+    result = ['"']
+    backslashes = 0
+    for char in text:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            result.append("\\" * (backslashes * 2 + 1))
+            result.append('"')
+            backslashes = 0
+            continue
+        if backslashes:
+            result.append("\\" * backslashes)
+            backslashes = 0
+        result.append(char)
+    if backslashes:
+        result.append("\\" * (backslashes * 2))
+    result.append('"')
+    return "".join(result)
+
+
+def build_main_command(task: dict[str, Any]) -> str:
+    logical_roles = list(task["logical_roles"])
+    physical_roles = list(dict.fromkeys(task["physical_role_map"][role] for role in logical_roles))
+    role_map = " ".join(f"{role}={task['physical_role_map'][role]}" for role in logical_roles)
+    options = task["execution_options"]
+    policy = str(options["handoff_command_policy"])
+    if policy not in {"auto", "always"}:
+        raise ValueError("execution_options.handoff_command_policy must be auto or always")
+    parts = [
+        "uv run python main.py",
+        f"--role {_quote_cli(','.join(logical_roles))}",
+        f"--browser-roles {_quote_cli(','.join(physical_roles))}",
+        f"--role-map {_quote_cli(role_map)}",
+        f"--finish-roles {_quote_cli(','.join(task['finish_roles']))}",
+        f"--timeout {_command_number(options['timeout'])}",
+        f"--request-timeout {_command_number(options['request_timeout'])}",
+        f"--parallelism {options['parallelism']}",
+        f"--max-turns {options['max_turns']}",
+        f"--reload-after {_command_number(options['reload_after'])}",
+    ]
+    if options["new_chat_on_handoff"]:
+        parts.append("--new-chat-on-handoff")
+    if policy == "always":
+        parts.append("--handoff-command-policy always")
+    parts.append(f"--goal {_quote_cli(task['prompt'])}")
+    return " ".join(parts)
+
+
 def build_wake_prompt(task: dict[str, Any]) -> str:
     logical_roles = ", ".join(task["logical_roles"])
     role_map = ", ".join(f"{logical}={physical}" for logical, physical in task["physical_role_map"].items())
     finish_roles = ", ".join(task["finish_roles"])
+    command = build_main_command(task)
+    options_json = json.dumps(task["execution_options"], sort_keys=True, separators=(",", ":"))
     return (
         f"DASHBOARD_TASK_WAKE\n"
         f"Task ID: {task['task_id']}\n"
@@ -37,7 +106,9 @@ def build_wake_prompt(task: dict[str, Any]) -> str:
         f"Target branch: {task['branch']}\n"
         f"Logical roles: {logical_roles}\n"
         f"Physical role map: {role_map}\n"
-        f"Finish roles: {finish_roles}\n\n"
+        f"Finish roles: {finish_roles}\n"
+        f"Execution options: {options_json}\n"
+        f"Generated main.py command: {command}\n\n"
         f"User-authorized task objective:\n{task['prompt']}\n\n"
         "Controller contract:\n"
         "1. This is a wake snapshot/audit revision; scheduler wake stages may advance the task revision after this prompt is built.\n"
@@ -45,7 +116,7 @@ def build_wake_prompt(task: dict[str, Any]) -> str:
         "3. Inspect existing process, durable flow, browser command, exact report, and result evidence before starting anything.\n"
         "4. Claim the task with an optimistic READY -> RUNNING move as this exact assigned controller before launching work.\n"
         "5. Do not create a duplicate active workflow; reuse or recover the existing flow when evidence shows one already exists.\n"
-        "6. Read skills/ORCHESTRATOR.md and choose main.py or role.py from current evidence; this wake contains no executable command.\n"
+        "6. Read skills/ORCHESTRATOR.md and use the persisted generated command as exact launch evidence unless recovery evidence proves the flow already exists.\n"
         "7. PATCH active_request_id, blocker, review/result status, and final summary as evidence changes.\n"
         "8. Never claim, run, or modify another controller's task. Resolve an UNCERTAIN wake only after checking whether work already started.\n"
     )

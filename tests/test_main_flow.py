@@ -32,7 +32,16 @@ def isolate_default_bridge_flow_status(monkeypatch: pytest.MonkeyPatch) -> None:
         del self, run_id, updates, metadata
         return {"status": "TEST_ISOLATED"}
 
+    def isolated_send_flow_heartbeat(
+        self: BridgeClient,
+        run_id: str,
+        **metadata: Any,
+    ) -> dict[str, Any]:
+        del self, run_id, metadata
+        return {"status": "TEST_ISOLATED"}
+
     monkeypatch.setattr(BridgeClient, "update_flow_statuses", isolated_update_flow_statuses)
+    monkeypatch.setattr(BridgeClient, "send_flow_heartbeat", isolated_send_flow_heartbeat)
 
 
 def make_args(*extra: str):
@@ -316,6 +325,45 @@ def flow_ui_coordinator() -> tuple[Coordinator, FlowStatusClient]:
     client = FlowStatusClient()
     coordinator.client = client  # type: ignore[assignment]
     return coordinator, client
+
+
+def test_runner_heartbeat_emits_while_flow_active_and_stops_on_finalize() -> None:
+    coordinator = Coordinator(make_args("--max-turns", "2"))
+    beats: list[dict[str, Any]] = []
+
+    class HeartbeatClient:
+        def send_flow_heartbeat(self, run_id: str, *, request_id: str = "", pid: int | None = None, timeout_s: float | None = None) -> dict[str, Any]:
+            del timeout_s
+            beats.append({"run_id": run_id, "request_id": request_id, "pid": pid})
+            return {"status": "OK"}
+
+    coordinator.client = HeartbeatClient()  # type: ignore[assignment]
+    coordinator._start_runner_heartbeat()
+    try:
+        assert coordinator._heartbeat_thread is not None
+        assert beats, "an immediate heartbeat must be emitted the moment a flow starts"
+        assert beats[0]["run_id"] == coordinator.flow_run_id
+        assert beats[0]["request_id"] == coordinator.flow_run_id
+        assert isinstance(beats[0]["pid"], int)
+    finally:
+        coordinator.finalize_flow_status("complete")
+    assert coordinator._heartbeat_thread is None
+
+
+def test_runner_heartbeat_is_disabled_in_dry_run() -> None:
+    coordinator = Coordinator(make_args("--dry-run"))
+    beats: list[int] = []
+
+    class HeartbeatClient:
+        def send_flow_heartbeat(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            del args, kwargs
+            beats.append(1)
+            return {}
+
+    coordinator.client = HeartbeatClient()  # type: ignore[assignment]
+    coordinator._start_runner_heartbeat()
+    assert coordinator._heartbeat_thread is None
+    assert beats == []
 
 
 def test_flow_ui_initial_turn_marks_start_running_and_all_other_members_waiting() -> None:

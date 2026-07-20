@@ -197,7 +197,17 @@ def test_exact_prompt_and_set_then_single_click_payloads(tmp_path: Path):
     assert "scheduler wake stages may advance the task revision" in prompt
     assert "fresh GET" in prompt
     assert "Expected task revision:" not in prompt
-    assert "uv run" not in prompt and "powershell" not in prompt.lower()
+    assert "Execution options:" in prompt
+    assert "uv run python main.py" in prompt
+    assert '--role "DEV1,REVIEW2,PLAN_Z"' in prompt
+    assert '--browser-roles "WORKER-A,WORKER-B"' in prompt
+    assert '--role-map "DEV1=WORKER-A REVIEW2=WORKER-B PLAN_Z=WORKER-A"' in prompt
+    assert "--timeout 1800" in prompt
+    assert "--request-timeout 1200" in prompt
+    assert "--parallelism 4" in prompt
+    assert "--max-turns 0" in prompt
+    assert "--reload-after 10" in prompt
+    assert "powershell" not in prompt.lower()
 
     transport.results[set_command["command_id"]] = {"state": "PASTE_CONFIRMED"}
     transport.snapshots["CONTROL-X9"] = {

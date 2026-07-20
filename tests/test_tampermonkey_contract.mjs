@@ -8,13 +8,16 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 const metadataVersion = source.match(/\/\/ @version\s+([^\s]+)/)?.[1];
 const bridgeVersion = source.match(/const BRIDGE_VERSION = 'standalone-([^']+)'/)?.[1];
 assert.equal(bridgeVersion, metadataVersion, 'userscript metadata and bridge runtime versions must stay in sync');
-assert.equal(metadataVersion, '1.0.5', 'flow dashboard release must identify itself as version 1.0.5');
+assert.equal(metadataVersion, '1.0.7', 'role-board release must identify itself as version 1.0.7');
 assert.match(source, /bridge_version:\s*BRIDGE_VERSION/, 'domSnapshot must expose the active userscript version');
 assert.match(source, /let flowStatus = null;/, 'browser poll state must retain only this tab flow status');
 assert.match(source, /function hydrateFlowStatus\(status,\s*physicalRole\)/, 'flow status hydration must be isolated in a pure helper');
 assert.match(source, /flowStatus = hydrateFlowStatus\(response && response\.flow_status,\s*requestRole\);/, 'status poll must hydrate only the exact requested physical role response');
 assert.match(source, /function flowStatusMarkup\(status,\s*physicalRole\)/, 'flow status rendering must receive the physical role explicitly');
 assert.doesNotMatch(source, />QUEUED</, 'flow UI must never render a QUEUED state');
+assert.match(source, /stalled:\s*status\.stalled === true/, 'flow hydration must carry the server stall verdict');
+assert.match(source, /const effectiveState = stalled \? 'STALLED' : state;/, 'overlay must render STALLED instead of a stale RUNNING state');
+assert.match(source, /Runner unavailable · recover existing flow/, 'overlay must surface the recovery hint when the flow is stalled');
 assert.match(source, /composer_watchdog_ms:\s*60000/, 'stale composer watchdog must use a 60 second window');
 assert.match(source, /composer_watchdog_poll_ms:\s*20000/, 'stale composer watchdog must sample every 20 seconds');
 assert.match(source, /let composerWatchdogTimer = null;/, 'watchdog must run independently from command polling');
@@ -139,6 +142,11 @@ assert.doesNotMatch(source, /setRole\(urlRole\)/, 'bridge must not persist URL-p
 assert.doesNotMatch(source, /searchParams\.set\('mauto_role'/, 'bridge must not write role into URL');
 assert.match(source, /api\/claim-role/, 'bridge must claim queued roles through the local server');
 assert.match(source, /function clearRole\(\)/, 'bridge must define an explicit role clear path');
+assert.match(source, /function handleClearComposerText\(command\)/, 'bridge must implement text-only composer clearing');
+assert.match(source, /action === 'CLEAR_COMPOSER_TEXT'/, 'text-only composer clearing must be routed');
+assert.match(source, /COMPOSER_TEXT_CLEARED/, 'text-only clear must report explicit success');
+assert.match(source, /COMPOSER_TEXT_CLEAR_FAILED/, 'text-only clear must report explicit failure');
+assert.match(source, /attachments_preserved:/, 'text-only clear must prove attachment preservation');
 assert.match(source, /sessionStorage\.removeItem\('chatgpt_agent_role'\)/, 'clearing role must remove per-tab session role');
 assert.match(source, /localStorage\.removeItem\('chatgpt_agent_role'\)/, 'clearing role must remove legacy persisted localStorage role');
 assert.doesNotMatch(source, /localStorage\.setItem\('chatgpt_agent_role'/, 'role must not be shared across tabs through localStorage');
@@ -242,11 +250,18 @@ const hydratedFlow = JSON.parse(JSON.stringify(hydrateFlowStatus({
 assert.deepEqual(hydratedFlow, {
     run_id: 'run-1',
     state: 'RUNNING',
+    stalled: false,
     logical_role: 'PLAN',
     from_role: 'User',
     done_from: 'REVIEW',
     sent_to: 'DEV',
 }, 'hydration must normalize state/logical role and copy only the display whitelist');
+const stalledHydrated = hydrateFlowStatus({ state: 'RUNNING', logical_role: 'REVIEW', stalled: true }, 'DEV');
+assert.equal(stalledHydrated.stalled, true, 'hydration must carry the server stall verdict for a non-terminal role');
+const stalledMarkup = flowStatusMarkup({ state: 'RUNNING', logical_role: 'REVIEW', stalled: true }, 'DEV');
+assert.match(stalledMarkup, /REVIEW · STALLED/, 'a stalled running role must render STALLED, never a stale RUNNING');
+assert.match(stalledMarkup, /recover existing flow/, 'a stalled role must render the recovery hint');
+assert.doesNotMatch(flowStatusMarkup({ state: 'DONE', logical_role: 'PLAN', stalled: true }, 'DEV'), /STALLED/, 'a terminal DONE role must never be reinterpreted as STALLED');
 assert.equal(hydrateFlowStatus(null, 'DEV'), null, 'missing flow state must clear the local display');
 assert.equal(hydrateFlowStatus([], 'DEV'), null, 'array payloads are not valid flow status objects');
 assert.equal(hydrateFlowStatus({ state: 'QUEUED' }, 'DEV'), null, 'unknown semantic states must clear the local display');
@@ -941,7 +956,9 @@ for (const badReservation of [{}, { role_claim_id: '' }, null]) {
     assert.equal(bad.role, 'A'); assert.equal(bad.a, 'g-0-a'); assert.equal(bad.b, ''); assert.equal(bad.pending, false); assert.equal(bad.releases, 0); assert.equal(bad.scheduleCalls, 0);
     assert.equal(bad.requests.filter((item) => item.url.endsWith('/api/status') && item.payload?.role === 'B' && item.payload?.claim_role === true).length, 0);
 }
-const unguardedAssignRole = extractFunction('assignRole').replace(/\s*if \(intentGeneration !== roleAssignmentIntentGeneration\) return '';\n/, '\n');
+const guardedAssignRole = extractFunction('assignRole');
+const unguardedAssignRole = guardedAssignRole.replace(/\s*if \(intentGeneration !== roleAssignmentIntentGeneration\) return '';\r?\n/, '\n');
+assert.notEqual(unguardedAssignRole, guardedAssignRole, 'the behavioral mutant must actually remove the generation guard');
 const behavioralRed = await runReservationHandlerScenario(async (h) => { const b = h.start('B'); const c = h.start('C'); h.resolve(1, 'g-2-c'); await c; h.resolve(0, 'g-1-b'); await b; return h.state(); }, unguardedAssignRole);
 assert.throws(() => assert.equal(behavioralRed.role, 'C', 'late older reservation must not mutate the newer role'), /late older reservation must not mutate the newer role/, 'the unguarded mutant must fail the normal final-role-C invariant');
 
@@ -1043,7 +1060,7 @@ assert.equal(assignmentPollRace.visibleRole, 'B', 'the real assignment handler m
 assert.equal(assignmentPollRace.pendingAfterAssignment, 1, 'the real assignment callback must schedule one poll');
 assert.equal(assignmentPollRace.pendingAfterOldResponse, 1, 'the stale in-flight poll must leave exactly one pending next poll');
 assert.equal(assignmentPollRace.flowAfterOldResponse, null, 'a delayed response for physical role A must return before hydrating role B UI');
-assert.deepEqual(JSON.parse(JSON.stringify(assignmentPollRace.flowStatus)), { state: 'WAITING', logical_role: 'PLAN' }, 'the current physical role response must hydrate only normalized display fields');
+assert.deepEqual(JSON.parse(JSON.stringify(assignmentPollRace.flowStatus)), { state: 'WAITING', stalled: false, logical_role: 'PLAN' }, 'the current physical role response must hydrate only normalized display fields');
 const assignmentReserveIndex = assignmentPollRace.requests.findIndex((item) => item.url.endsWith('/api/reserve-role-claim'));
 const assignmentClaimIndex = assignmentPollRace.requests.findIndex((item) => item.url.endsWith('/api/status') && item.payload.role === 'B');
 assert.ok(assignmentReserveIndex >= 0 && assignmentClaimIndex > assignmentReserveIndex, 'new assignment must reserve then persist and publish its claimed status poll');
@@ -1173,3 +1190,34 @@ assert.equal(heartbeatFailurePoll.activeCommandId, 'cmd-heartbeat', 'handled fai
 assert.equal(heartbeatFailurePoll.activeCommandRole, '');
 assert.equal(heartbeatFailurePoll.activeCommandAction, '');
 assert.equal(heartbeatFailurePoll.clockMs, 30000, 'duplicate delivery must not execute the completed browser command twice');
+
+
+const composerClearContext = {};
+vm.runInNewContext(
+    `${extractFunction('isRealComposerAttachment')}; ${extractFunction('realComposerAttachmentCount')}; ${extractFunction('composerTextClearVerdict')}; globalThis.composerTextClearVerdict = composerTextClearVerdict;`,
+    composerClearContext,
+);
+const clearOk = composerClearContext.composerTextClearVerdict(
+    { composer_text_len: 12, composer_attachments: [{ label: 'Remove file' }] },
+    { composer_text_len: 0, composer_attachments: [{ label: 'Remove file' }] },
+);
+assert.deepEqual(JSON.parse(JSON.stringify(clearOk)), {
+    ok: true,
+    text_cleared: true,
+    attachments_before: 1,
+    attachments_after: 1,
+    attachments_preserved: true,
+    reason: '',
+}, 'text-only clear succeeds only when text is empty and attachments are preserved');
+const clearLostAttachment = composerClearContext.composerTextClearVerdict(
+    { composer_text_len: 12, composer_attachments: [{ label: 'Remove file' }] },
+    { composer_text_len: 0, composer_attachments: [] },
+);
+assert.equal(clearLostAttachment.ok, false, 'attachment removal must fail the text-only clear command');
+assert.equal(clearLostAttachment.reason, 'attachment_count_changed');
+const clearTextRemains = composerClearContext.composerTextClearVerdict(
+    { composer_text_len: 12, composer_attachments: [] },
+    { composer_text_len: 2, composer_attachments: [] },
+);
+assert.equal(clearTextRemains.ok, false, 'non-empty text must fail the text-only clear command');
+assert.equal(clearTextRemains.reason, 'composer_text_not_empty');

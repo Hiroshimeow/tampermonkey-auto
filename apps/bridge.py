@@ -568,6 +568,21 @@ class BridgeClient:
             payload["activate"] = True
         return self.json_request("POST", "/api/admin/flow-status", payload)
 
+    def send_flow_heartbeat(
+        self,
+        run_id: str,
+        *,
+        request_id: str = "",
+        pid: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"run_id": run_id}
+        if request_id:
+            payload["request_id"] = request_id
+        if pid is not None:
+            payload["pid"] = pid
+        return self.json_request("POST", "/api/admin/flow-heartbeat", payload, timeout_s=timeout_s)
+
     def cancel_command(
         self,
         command_id: str,

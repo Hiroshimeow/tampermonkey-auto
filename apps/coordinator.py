@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
 import uuid
@@ -58,6 +59,8 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.current_goal = ""
         self.flow_run_id = f"main-{uuid.uuid4()}"
         self.flow_status_active = False
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def has_turn_budget(self) -> bool:
         return self.max_turns <= 0 or self.turn_count < self.max_turns
@@ -67,6 +70,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.current_goal = goal
         try:
             self.begin_flow_status()
+            self._start_runner_heartbeat()
             loader_errors = self.runtime_config.loader_errors()
             if loader_errors:
                 raise FlowStopError(
@@ -120,6 +124,44 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             )
         except Exception as exc:
             print(f"[flow-ui] status update failed: {exc}", flush=True)
+
+    def _runner_heartbeat_interval_s(self) -> float:
+        return max(1.0, float(getattr(self.args, "heartbeat_interval", 5.0) or 5.0))
+
+    def _emit_runner_heartbeat(self) -> None:
+        send = getattr(self.client, "send_flow_heartbeat", None)
+        if not callable(send):
+            return
+        try:
+            send(
+                self.flow_run_id,
+                request_id=self.flow_run_id,
+                pid=os.getpid(),
+                timeout_s=min(10.0, self._runner_heartbeat_interval_s()),
+            )
+        except Exception as exc:
+            print(f"[flow-ui] heartbeat failed: {exc}", flush=True)
+
+    def _start_runner_heartbeat(self) -> None:
+        if self.dry_run or self._heartbeat_thread is not None:
+            return
+        self._heartbeat_stop.clear()
+        self._emit_runner_heartbeat()
+        thread = threading.Thread(target=self._runner_heartbeat_loop, name="flow-heartbeat", daemon=True)
+        self._heartbeat_thread = thread
+        thread.start()
+
+    def _runner_heartbeat_loop(self) -> None:
+        interval = self._runner_heartbeat_interval_s()
+        while not self._heartbeat_stop.wait(interval):
+            self._emit_runner_heartbeat()
+
+    def _stop_runner_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        self._heartbeat_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
     def begin_flow_status(self) -> None:
         self.flow_status_active = True
@@ -193,6 +235,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.publish_flow_statuses(updates)
 
     def finalize_flow_status(self, terminal_status: str, *, finishing_role: str = "") -> None:
+        self._stop_runner_heartbeat()
         if not self.flow_status_active:
             return
         self.flow_status_active = False

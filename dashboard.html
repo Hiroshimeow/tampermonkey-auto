@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Stable Flow Kanban</title>
+    <title>Stable Flow Runtime</title>
     <style>
         :root {
             color-scheme: dark;
@@ -104,7 +104,7 @@
 
         .filters {
             display: grid;
-            grid-template-columns: minmax(190px, 2fr) repeat(4, minmax(130px, 1fr)) auto;
+            grid-template-columns: minmax(220px, 2fr) minmax(150px, 1fr) auto;
             gap: 8px;
             margin: 12px 0;
             padding: 10px;
@@ -114,6 +114,17 @@
         }
         .filter-check { display: flex; gap: 7px; align-items: center; padding: 0 8px; color: var(--muted); font-size: 12px; }
         .filter-check input { width: auto; }
+        .advanced-filters { min-width: 150px; }
+        .advanced-filters > summary, .task-more > summary, .form-section > summary {
+            cursor: pointer;
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .advanced-filters > summary { min-height: 36px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); }
+        .filter-advanced { display: grid; grid-template-columns: repeat(3, minmax(140px, 1fr)) auto; gap: 8px; padding-top: 8px; }
+        .advanced-filters[open] { grid-column: 1 / -1; }
+
         .notice-stack { display: grid; gap: 7px; margin-bottom: 10px; }
         .notice {
             padding: 9px 11px;
@@ -124,8 +135,45 @@
             font: 600 12px/1.4 ui-monospace, Consolas, monospace;
         }
         .notice[data-kind="error"] { border-color: var(--red); background: rgba(239, 124, 119, .09); color: #ffc1be; }
+        .notice[data-kind="stall"] { border-color: var(--amber); background: rgba(239, 187, 98, .12); color: #ffdca2; white-space: pre-line; }
+        #dashboard-root[data-stalled="true"] .topbar { border-color: var(--amber); }
 
-        .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 10px; align-items: start; }
+        .runtime-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
+            gap: 10px;
+            margin: 12px 0;
+        }
+        .panel {
+            min-width: 0;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--surface);
+            overflow: hidden;
+        }
+        .panel-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--line);
+        }
+        .panel-head h2 { margin: 0; font-size: 13px; }
+        .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+        .panel-count { min-width: 28px; padding: 4px 7px; border-radius: 99px; background: var(--surface-3); text-align: center; font: 700 11px/1 ui-monospace, Consolas, monospace; }
+        .roles-panel, .events-panel { grid-column: 1 / -1; }
+        .runtime-kv { display: grid; grid-template-columns: minmax(110px, .6fr) minmax(0, 1.4fr); gap: 0; padding: 4px 12px 10px; }
+        .runtime-kv dt, .runtime-kv dd { margin: 0; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); overflow-wrap: anywhere; }
+        .runtime-kv dt { color: var(--muted); font: 650 10px/1.35 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .runtime-kv dd { color: var(--text); font: 11px/1.4 ui-monospace, Consolas, monospace; }
+        .flow-role-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 12px; }
+        .flow-role-chip { padding: 5px 7px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); font: 650 10px/1.3 ui-monospace, Consolas, monospace; }
+        .task-shell { margin-top: 10px; }
+        .task-shell > .panel-head { position: sticky; top: 82px; z-index: 7; background: var(--surface); }
+        .empty-state { padding: 34px 18px; color: var(--muted); text-align: center; }
+        .empty-state strong { display: block; margin-bottom: 6px; color: var(--text); font-size: 15px; }
+        #task-workspace { padding: 0 10px 10px; }
         .board {
             display: grid;
             grid-template-columns: repeat(6, minmax(245px, 1fr));
@@ -135,7 +183,7 @@
             padding-bottom: 14px;
         }
         .kanban-column {
-            min-height: 68vh;
+            min-height: 220px;
             border: 1px solid var(--line);
             border-top: 3px solid var(--state-accent, var(--line-strong));
             border-radius: var(--radius);
@@ -148,9 +196,6 @@
         .kanban-column[data-kanban-state="BLOCKED"] { --state-accent: var(--red); }
         .kanban-column[data-kanban-state="DONE"] { --state-accent: var(--green); }
         .column-head {
-            position: sticky;
-            top: 82px;
-            z-index: 6;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -160,9 +205,8 @@
         }
         .column-head h2 { margin: 0; font: 800 12px/1 ui-monospace, Consolas, monospace; letter-spacing: .08em; }
         .column-count { min-width: 24px; padding: 3px 6px; border-radius: 99px; background: var(--surface-3); text-align: center; font-size: 11px; }
-        .task-list { min-height: 60vh; padding: 8px; }
+        .task-list { min-height: 160px; padding: 8px; }
         .task-list[data-drag-over="true"] { outline: 2px dashed var(--cyan); outline-offset: -5px; background: rgba(103, 217, 232, .05); }
-        .empty-column { padding: 18px 8px; color: var(--muted); text-align: center; font-size: 12px; }
 
         .task-card {
             display: grid;
@@ -192,26 +236,34 @@
         .tag { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); font: 650 10px/1.2 ui-monospace, Consolas, monospace; }
         .tag[data-alert="true"] { border-color: var(--red); color: #ffaaa6; }
         .task-note { color: #ffd1ce; font-size: 11px; line-height: 1.35; }
-        .task-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+        .task-actions { display: flex; flex-wrap: wrap; gap: 5px; align-items: flex-start; }
         .task-actions button, .task-actions select { width: auto; min-height: 30px; padding: 5px 7px; font-size: 11px; }
-        .move-select { max-width: 104px; }
+        .task-more { position: relative; }
+        .task-more > summary { min-height: 30px; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); list-style: none; }
+        .task-more > summary::-webkit-details-marker { display: none; }
+        .task-more-menu { display: flex; flex-wrap: wrap; gap: 5px; width: 100%; padding-top: 5px; }
+        .move-select { max-width: 116px; }
 
-        .role-panel {
-            position: sticky;
-            top: 82px;
-            max-height: calc(100vh - 96px);
-            overflow: auto;
-            border: 1px solid var(--line);
-            border-radius: var(--radius);
-            background: var(--surface);
-        }
-        .role-panel h2 { margin: 0; padding: 11px; border-bottom: 1px solid var(--line); font-size: 13px; }
-        #role-rail { display: grid; gap: 6px; padding: 8px; }
-        .role-card { padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
-        .role-name { font: 800 12px/1.25 ui-monospace, Consolas, monospace; }
-        .role-detail { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
-        .online-dot::before { content: "●"; margin-right: 5px; color: var(--green); }
-        .offline-dot::before { content: "○"; margin-right: 5px; color: var(--muted); }
+        #role-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 8px; padding: 10px; }
+        .role-card { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .role-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+        .role-name { font: 800 13px/1.25 ui-monospace, Consolas, monospace; }
+        .role-state { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 99px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
+        .role-state[data-tone="good"] { border-color: var(--green); color: var(--green); }
+        .role-state[data-tone="warn"] { border-color: var(--amber); color: var(--amber); }
+        .role-state[data-tone="bad"] { border-color: var(--red); color: var(--red); }
+        .role-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+        .role-detail-grid { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 4px 8px; }
+        .role-detail-grid dt, .role-detail-grid dd { margin: 0; overflow-wrap: anywhere; }
+        .role-detail-grid dt { color: var(--muted); font: 650 9px/1.4 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .role-detail-grid dd { color: var(--text); font: 10px/1.4 ui-monospace, Consolas, monospace; }
+        .role-empty { padding: 24px; color: var(--muted); text-align: center; }
+        #runtime-events { display: grid; max-height: 360px; overflow: auto; }
+        .runtime-event { display: grid; grid-template-columns: 138px 74px minmax(130px, .6fr) minmax(0, 1.4fr); gap: 8px; padding: 8px 12px; border-bottom: 1px solid rgba(65, 86, 103, .35); align-items: baseline; }
+        .runtime-event time, .runtime-event-role, .runtime-event-name { font: 650 10px/1.35 ui-monospace, Consolas, monospace; }
+        .runtime-event time, .runtime-event-role { color: var(--muted); }
+        .runtime-event-name { color: var(--cyan); }
+        .runtime-event-detail { color: var(--muted); font: 10px/1.4 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
 
         dialog {
             width: min(760px, calc(100vw - 24px));
@@ -231,6 +283,10 @@
         .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .field { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
         .field-wide { grid-column: 1 / -1; }
+        .form-section { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 9px; background: rgba(23, 33, 43, .5); }
+        .form-section > summary { padding: 10px 11px; }
+        .form-section[open] > summary { border-bottom: 1px solid var(--line); }
+        .form-section-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 11px; }
         .dialog-actions { position: sticky; bottom: 0; display: flex; justify-content: flex-end; gap: 8px; padding: 11px 14px; border-top: 1px solid var(--line); background: var(--surface); }
         .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
         .detail-block { padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
@@ -239,91 +295,162 @@
         .event-list { display: grid; gap: 6px; }
         .event-row { padding: 7px; border-left: 2px solid var(--line-strong); color: var(--muted); font-size: 11px; }
 
+        .role-board-panel { margin: 12px 0 10px; }
+        #role-rail.role-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 9px; padding: 10px; }
+        .role-card.selectable { min-height: 224px; cursor: pointer; transition: border-color .12s ease, box-shadow .12s ease; }
+        .role-card.selectable:hover, .role-card.selected { border-color: var(--cyan); }
+        .role-card.selected { box-shadow: 0 0 0 1px rgba(103, 217, 232, .45) inset; }
+        .role-title-link { color: var(--text); text-decoration: none; font: 800 15px/1.25 ui-monospace, Consolas, monospace; }
+        .role-title-link:hover { color: var(--cyan); text-decoration: underline; }
+        .role-subtitle, .role-chat-id { color: var(--muted); font: 10px/1.4 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+        .role-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+        .role-composer { padding-top: 8px; border-top: 1px solid rgba(65, 86, 103, .35); color: var(--muted); font: 11px/1.4 ui-monospace, Consolas, monospace; }
+        .role-composer strong[data-ready="true"] { color: var(--green); }
+        .role-card-actions { display: flex; gap: 6px; margin-top: auto; }
+        .role-card-actions button { flex: 1; min-width: 0; padding: 7px 6px; font-size: 11px; }
+        .selected-role-layout { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(360px, .88fr); gap: 10px; margin-bottom: 12px; }
+        .selected-role-layout .timeline-panel { grid-column: 1 / -1; }
+        .role-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px 12px 0; }
+        .role-metric { padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .role-metric span { display: block; color: var(--muted); font: 700 9px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .role-metric strong { display: block; margin-top: 5px; font: 800 14px/1.25 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+        .role-metric[data-tone="good"] strong { color: var(--green); }
+        #role-responses { display: grid; gap: 8px; height: 300px; overflow: auto; padding: 12px; }
+        .role-response { padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
+        .role-response[data-latest="true"] { border-color: var(--cyan); }
+        .role-response header { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font: 10px/1.3 ui-monospace, Consolas, monospace; }
+        .role-response pre { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .role-order, .available-roles, .browser-targets { display: flex; flex-wrap: wrap; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .role-order { margin-bottom: 7px; }
+        .role-chip { display: inline-flex; gap: 5px; align-items: center; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-3); font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
+        .role-chip button { width: auto; min-height: 24px; padding: 2px 5px; }
+        .role-chip[data-source="true"] { border-color: var(--green); color: var(--green); }
+        .mapping-grid { display: grid; gap: 7px; }
+        .mapping-row { display: grid; grid-template-columns: minmax(90px, .5fr) 24px minmax(0, 1.5fr); gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font: 700 11px/1.3 ui-monospace, Consolas, monospace; }
+        .mapping-row .arrow { color: var(--cyan); text-align: center; }
+        .mapping-row select { width: 100%; }
+        .mapping-row[data-invalid="true"], select[data-invalid="true"] { border-color: var(--bad); }
+        .execution-grid { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 9px; }
+        .toggle-grid { display: grid; gap: 7px; }
+        .toggle-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .toggle-row strong { display: block; font: 700 11px/1.35 ui-monospace, Consolas, monospace; }
+        .toggle-row small { color: var(--muted); font-size: 10px; }
+        .toggle-button.selected { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
+        .command-preview { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; color: #cfe8ee; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .prompt-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+        .prompt-samples { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+        #task-prompt { min-height: 58px; max-height: 218px; overflow-y: auto; line-height: 20px; }
+        .section-label { margin: 0 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
         @media (max-width: 1100px) {
-            .workspace { grid-template-columns: 1fr; }
-            .role-panel { position: static; max-height: none; }
-            #role-rail { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+            .runtime-layout, .selected-role-layout { grid-template-columns: 1fr; }
+            .selected-role-layout .timeline-panel { grid-column: auto; }
+            .roles-panel, .events-panel { grid-column: auto; }
+            #role-rail { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
         }
         @media (max-width: 820px) {
             #dashboard-root { padding: 8px; }
             .topbar { position: static; grid-template-columns: 1fr; }
             .health-strip { justify-content: flex-start; }
             .filters { grid-template-columns: 1fr 1fr; }
+            .filter-advanced { grid-template-columns: 1fr 1fr; }
             .column-head { top: 0; }
-            .form-grid, .detail-grid { grid-template-columns: 1fr; }
+            .form-grid, .form-section-grid, .detail-grid, .execution-grid { grid-template-columns: 1fr; }
+            .role-metrics { grid-template-columns: 1fr 1fr; }
+            .runtime-event { grid-template-columns: 1fr; gap: 2px; }
+            .runtime-kv { grid-template-columns: 1fr; }
             .field-wide { grid-column: auto; }
         }
-        @media (max-width: 520px) { .filters { grid-template-columns: 1fr; } }
+        @media (max-width: 520px) { .filters, .filter-advanced { grid-template-columns: 1fr; } }
         @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
     </style>
 </head>
 <body>
-<main id="dashboard-root" data-dashboard-version="5" data-stale="false">
+<main id="dashboard-root" data-dashboard-version="9" data-stale="false" data-stalled="false">
     <header class="topbar">
         <div class="brand">
             <div class="brand-mark" aria-hidden="true">SF</div>
             <div>
-                <h1>Stable Flow Kanban</h1>
-                <p id="flow-summary">No active durable flow</p>
+                <h1>Stable Flow Runtime</h1>
+                <p id="flow-summary">Loading runtime state</p>
             </div>
         </div>
         <div class="health-strip">
             <span class="health-pill" id="connection-health"><span>Connection</span><strong>CHECKING</strong></span>
             <span class="health-pill" id="scheduler-health"><span>Scheduler</span><strong>UNKNOWN</strong></span>
-            <span class="health-pill"><span>Refresh</span><strong id="refresh-age">—</strong></span>
-            <button id="create-task" class="primary" type="button">Create task</button>
+            <span class="health-pill" id="runner-health"><span>Runner</span><strong>UNKNOWN</strong></span>
+            <span class="health-pill"><span>Refresh</span><strong id="refresh-age">--</strong></span>
         </div>
     </header>
-
-    <section class="filters" aria-label="Task filters">
-        <input id="filter-text" type="search" placeholder="Search title, objective, branch" aria-label="Search tasks">
-        <select id="filter-controller" aria-label="Filter by controller"><option value="">All controllers</option></select>
-        <select id="filter-repository" aria-label="Filter by repository"><option value="">All repositories</option></select>
-        <select id="filter-status" aria-label="Filter by status"><option value="">All states</option></select>
-        <select id="filter-schedule" aria-label="Filter by schedule"><option value="">All schedules</option><option value="manual">Manual</option><option value="scheduled">Scheduled</option></select>
-        <label class="filter-check"><input id="filter-archived" type="checkbox"> Show archived</label>
-    </section>
 
     <div class="notice-stack" aria-live="polite">
         <div id="connection-notice" class="notice" data-kind="error" hidden>Retaining last good dashboard data.</div>
         <div id="task-store-error" class="notice" data-kind="error" hidden>Task store unavailable</div>
         <div id="scheduler-error" class="notice" data-kind="error" hidden>Scheduler error</div>
         <div id="conflict-notice" class="notice" hidden>Revision conflict. Your open edits were retained; review the refreshed task before retrying.</div>
+        <div id="role-action-notice" class="notice" hidden></div>
+        <div id="flow-stall-notice" class="notice" data-kind="stall" hidden></div>
     </div>
 
-    <div class="workspace">
-        <section class="board" aria-label="Six-state task board">
-            <section class="kanban-column" data-kanban-state="BACKLOG">
-                <header class="column-head"><h2>BACKLOG</h2><span id="count-BACKLOG" class="column-count">0</span></header>
-                <div id="column-BACKLOG" class="task-list" data-drop-state="BACKLOG"></div>
-            </section>
-            <section class="kanban-column" data-kanban-state="READY">
-                <header class="column-head"><h2>READY</h2><span id="count-READY" class="column-count">0</span></header>
-                <div id="column-READY" class="task-list" data-drop-state="READY"></div>
-            </section>
-            <section class="kanban-column" data-kanban-state="RUNNING">
-                <header class="column-head"><h2>RUNNING</h2><span id="count-RUNNING" class="column-count">0</span></header>
-                <div id="column-RUNNING" class="task-list" data-drop-state="RUNNING"></div>
-            </section>
-            <section class="kanban-column" data-kanban-state="REVIEW">
-                <header class="column-head"><h2>REVIEW</h2><span id="count-REVIEW" class="column-count">0</span></header>
-                <div id="column-REVIEW" class="task-list" data-drop-state="REVIEW"></div>
-            </section>
-            <section class="kanban-column" data-kanban-state="BLOCKED">
-                <header class="column-head"><h2>BLOCKED</h2><span id="count-BLOCKED" class="column-count">0</span></header>
-                <div id="column-BLOCKED" class="task-list" data-drop-state="BLOCKED"></div>
-            </section>
-            <section class="kanban-column" data-kanban-state="DONE">
-                <header class="column-head"><h2>DONE</h2><span id="count-DONE" class="column-count">0</span></header>
-                <div id="column-DONE" class="task-list" data-drop-state="DONE"></div>
-            </section>
+    <section class="panel role-board-panel" aria-label="Online role board">
+        <header class="panel-head">
+            <div><h2>Role board</h2><p>Online physical browser roles; select a card for response and routing evidence</p></div>
+            <span id="role-count" class="panel-count">0</span>
+        </header>
+        <div id="role-rail" class="role-board"></div>
+    </section>
+
+    <section class="selected-role-layout" aria-label="Selected role details">
+        <section class="panel">
+            <header class="panel-head">
+                <div><h2 id="role-detail-title">No online role selected</h2><p>Role status, request, browser and transport evidence</p></div>
+                <span id="selected-role-state" class="role-state">OFFLINE</span>
+            </header>
+            <div id="role-metrics" class="role-metrics"></div>
+            <dl id="selected-role-detail" class="runtime-kv"></dl>
         </section>
+        <section class="panel">
+            <header class="panel-head"><div><h2>Responses</h2><p>Newest assistant response is focused on initial load and role selection</p></div><span id="response-count" class="panel-count">0</span></header>
+            <div id="role-responses"></div>
+        </section>
+        <section class="panel timeline-panel">
+            <header class="panel-head"><div><h2>Role timeline</h2><p>Routing, command, response, lifecycle and error events</p></div><span id="event-count" class="panel-count">0</span></header>
+            <div id="runtime-events"></div>
+        </section>
+    </section>
 
-        <aside class="role-panel" aria-label="Live role rail">
-            <h2>Live roles</h2>
-            <div id="role-rail"></div>
-        </aside>
-    </div>
+    <section class="panel task-shell" aria-label="Task control">
+        <header class="panel-head">
+            <div><h2>Task control</h2><p>Kanban appears only when tasks are configured</p></div>
+            <button id="create-task" class="primary" type="button">Create task</button>
+        </header>
+        <div id="no-tasks-state" class="empty-state" hidden>
+            <strong>No tasks configured</strong>
+            Runtime state remains visible above. Create a task only when you need scheduling or Kanban control.
+        </div>
+        <div id="task-workspace" hidden>
+            <section class="filters" aria-label="Task filters">
+                <input id="filter-text" type="search" placeholder="Search title, objective, branch" aria-label="Search tasks">
+                <select id="filter-status" aria-label="Filter by status"><option value="">All states</option></select>
+                <details id="advanced-filters" class="advanced-filters">
+                    <summary>More filters</summary>
+                    <div class="filter-advanced">
+                        <select id="filter-controller" aria-label="Filter by controller"><option value="">All controllers</option></select>
+                        <select id="filter-repository" aria-label="Filter by repository"><option value="">All repositories</option></select>
+                        <select id="filter-schedule" aria-label="Filter by schedule"><option value="">All schedules</option><option value="manual">Manual</option><option value="scheduled">Scheduled</option></select>
+                        <label class="filter-check"><input id="filter-archived" type="checkbox"> Show archived</label>
+                    </div>
+                </details>
+            </section>
+            <section class="board" aria-label="Six-state task board">
+                <section class="kanban-column" data-kanban-state="BACKLOG"><header class="column-head"><h2>BACKLOG</h2><span id="count-BACKLOG" class="column-count">0</span></header><div id="column-BACKLOG" class="task-list" data-drop-state="BACKLOG"></div></section>
+                <section class="kanban-column" data-kanban-state="READY"><header class="column-head"><h2>READY</h2><span id="count-READY" class="column-count">0</span></header><div id="column-READY" class="task-list" data-drop-state="READY"></div></section>
+                <section class="kanban-column" data-kanban-state="RUNNING"><header class="column-head"><h2>RUNNING</h2><span id="count-RUNNING" class="column-count">0</span></header><div id="column-RUNNING" class="task-list" data-drop-state="RUNNING"></div></section>
+                <section class="kanban-column" data-kanban-state="REVIEW"><header class="column-head"><h2>REVIEW</h2><span id="count-REVIEW" class="column-count">0</span></header><div id="column-REVIEW" class="task-list" data-drop-state="REVIEW"></div></section>
+                <section class="kanban-column" data-kanban-state="BLOCKED"><header class="column-head"><h2>BLOCKED</h2><span id="count-BLOCKED" class="column-count">0</span></header><div id="column-BLOCKED" class="task-list" data-drop-state="BLOCKED"></div></section>
+                <section class="kanban-column" data-kanban-state="DONE"><header class="column-head"><h2>DONE</h2><span id="count-DONE" class="column-count">0</span></header><div id="column-DONE" class="task-list" data-drop-state="DONE"></div></section>
+            </section>
+        </div>
+    </section>
 </main>
 
 <template id="task-card-template">
@@ -335,11 +462,16 @@
         <div class="task-actions">
             <button class="run-action" type="button">Run now</button>
             <button class="pause-action" type="button">Pause</button>
-            <button class="edit-action" type="button">Edit</button>
-            <button class="resolve-sent" type="button">Confirm sent</button>
-            <button class="resolve-not-sent" type="button">Confirm not sent</button>
-            <select class="move-select" aria-label="Move task"></select>
-            <button class="archive-action danger" type="button">Archive</button>
+            <details class="task-more">
+                <summary>More actions</summary>
+                <div class="task-more-menu">
+                    <button class="edit-action" type="button">Edit</button>
+                    <button class="resolve-sent" type="button">Confirm sent</button>
+                    <button class="resolve-not-sent" type="button">Confirm not sent</button>
+                    <select class="move-select" aria-label="Move task"></select>
+                    <button class="archive-action danger" type="button">Archive</button>
+                </div>
+            </details>
         </div>
     </article>
 </template>
@@ -356,23 +488,68 @@
             <label class="field field-wide">Title<input id="task-title" required maxlength="160"></label>
             <label class="field">Target root<input id="task-root" required maxlength="500"></label>
             <label class="field">Branch<input id="task-branch" required maxlength="200"></label>
-            <label class="field">Controller role<input id="task-controller" required maxlength="80" list="role-options"></label>
+            <label class="field">Controller role<select id="task-controller" required></select></label>
             <label class="field">Initial state<select id="task-status"><option>BACKLOG</option><option>READY</option><option>BLOCKED</option></select></label>
-            <label class="field field-wide">Objective<textarea id="task-prompt" required maxlength="12000"></textarea></label>
-            <label class="field">Logical roles, comma-separated<input id="task-logical" required></label>
-            <label class="field">Finish roles, comma-separated<input id="task-finish" required></label>
-            <label class="field field-wide">Physical role map as JSON<textarea id="task-role-map" required spellcheck="false"></textarea></label>
-            <label class="field">Schedule kind<select id="task-schedule-kind"><option value="manual">Manual</option><option value="once">One time</option><option value="interval">Interval minutes</option><option value="cron">Five-field cron</option></select></label>
-            <label class="field schedule-field" data-schedule-field="once">Run at<input id="task-run-at" type="datetime-local"></label>
-            <label class="field schedule-field" data-schedule-field="interval">Interval minutes<input id="task-minutes" type="number" min="1" step="1" value="15"></label>
-            <label class="field schedule-field" data-schedule-field="interval">Start at<input id="task-start-at" type="datetime-local"></label>
-            <label class="field schedule-field" data-schedule-field="cron">Cron expression<input id="task-cron" value="0 9 * * 1-5"></label>
-            <label class="field schedule-field" data-schedule-field="cron">IANA timezone<input id="task-timezone" value="Asia/Tokyo"></label>
-            <label class="filter-check field-wide"><input id="task-enabled" type="checkbox" checked> Scheduling enabled</label>
-            <label class="field" data-edit-only>Last result status<input id="task-result-status" maxlength="80"></label>
-            <label class="field field-wide" data-edit-only>Last result summary<textarea id="task-result-summary" maxlength="2000"></textarea></label>
-            <label class="field field-wide" data-edit-only>Blocker<textarea id="task-blocker" maxlength="2000"></textarea></label>
-            <datalist id="role-options"></datalist>
+            <label class="field field-wide"><span class="prompt-head"><span>Objective</span><button id="toggle-prompt-samples" type="button">Prompt samples</button></span><div id="prompt-samples" class="prompt-samples" hidden></div><textarea id="task-prompt" rows="2" required maxlength="12000"></textarea></label>
+            <details id="task-advanced" class="form-section" open>
+                <summary>Workflow and execution</summary>
+                <div class="form-section-grid">
+                    <section class="field-wide">
+                        <p class="section-label">Logical roles ? execution order</p>
+                        <div id="task-logical-order" class="role-order"></div>
+                        <div id="task-logical-available" class="available-roles"></div>
+                    </section>
+                    <section class="field-wide">
+                        <p class="section-label">Online browser targets</p>
+                        <div id="task-browser-targets" class="browser-targets"></div>
+                    </section>
+                    <section class="field-wide">
+                        <p class="section-label">Logical ? physical mapping</p>
+                        <div id="task-role-mapping" class="mapping-grid"></div>
+                    </section>
+                    <section class="field-wide">
+                        <p class="section-label">Execution options</p>
+                        <div class="execution-grid">
+                            <label class="field">Timeout<input id="task-timeout" type="number" min="1" max="86400" step="any" value="1800" required></label>
+                            <label class="field">Request timeout<input id="task-request-timeout" type="number" min="1" max="86400" step="any" value="1200" required></label>
+                            <label class="field">Parallelism<input id="task-parallelism" type="number" min="1" max="32" step="1" value="4" required></label>
+                            <label class="field">Max turns<input id="task-max-turns" type="number" min="0" max="100000" step="1" value="0" required></label>
+                            <label class="field">Reload after<input id="task-reload-after" type="number" min="0" max="3600" step="any" value="10" required></label>
+                        </div>
+                    </section>
+                    <section class="field-wide">
+                        <p class="section-label">Behavior toggles</p>
+                        <div class="toggle-grid">
+                            <div class="toggle-row"><div><strong>--new-chat-on-handoff</strong><small>Open a clean ChatGPT conversation when handoff policy permits.</small></div><button id="task-new-chat" class="toggle-button" type="button" aria-pressed="false">OFF</button></div>
+                            <div class="toggle-row"><div><strong>--handoff-command-policy always</strong><small>Always honor a valid HANDOFF block and command pair.</small></div><button id="task-handoff-always" class="toggle-button" type="button" aria-pressed="false">OFF</button></div>
+                        </div>
+                    </section>
+                    <section class="field-wide">
+                        <p class="section-label">Generated main.py command</p>
+                        <pre id="task-command-preview" class="command-preview"></pre>
+                    </section>
+                </div>
+            </details>
+            <details id="task-scheduling" class="form-section">
+                <summary>Scheduling</summary>
+                <div class="form-section-grid">
+                    <label class="field">Schedule kind<select id="task-schedule-kind"><option value="manual">Manual</option><option value="once">One time</option><option value="interval">Interval minutes</option><option value="cron">Five-field cron</option></select></label>
+                    <label class="field schedule-field" data-schedule-field="once">Run at<input id="task-run-at" type="datetime-local"></label>
+                    <label class="field schedule-field" data-schedule-field="interval">Interval minutes<input id="task-minutes" type="number" min="1" step="1" value="15"></label>
+                    <label class="field schedule-field" data-schedule-field="interval">Start at<input id="task-start-at" type="datetime-local"></label>
+                    <label class="field schedule-field" data-schedule-field="cron">Cron expression<input id="task-cron" value="0 9 * * 1-5"></label>
+                    <label class="field schedule-field" data-schedule-field="cron">IANA timezone<input id="task-timezone" value="Asia/Tokyo"></label>
+                    <label class="filter-check field-wide"><input id="task-enabled" type="checkbox" checked> Scheduling enabled</label>
+                </div>
+            </details>
+            <details id="task-results" class="form-section" data-edit-only hidden>
+                <summary>Execution result</summary>
+                <div class="form-section-grid">
+                    <label class="field">Last result status<input id="task-result-status" maxlength="80"></label>
+                    <label class="field field-wide">Last result summary<textarea id="task-result-summary" maxlength="2000"></textarea></label>
+                    <label class="field field-wide">Blocker<textarea id="task-blocker" maxlength="2000"></textarea></label>
+                </div>
+            </details>
         </div>
         <footer class="dialog-actions">
             <button type="button" data-close-dialog="task-dialog">Cancel</button>
@@ -392,7 +569,7 @@
 <script>
 (() => {
     'use strict';
-    const DASHBOARD_CONTRACT_VERSION = 5;
+    const DASHBOARD_CONTRACT_VERSION = 9;
     const STATES = ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'BLOCKED', 'DONE'];
     const MOVE_MATRIX = {
         BACKLOG: ['READY', 'BLOCKED'],
@@ -403,14 +580,41 @@
         DONE: ['BACKLOG', 'READY']
     };
 
+    const BASE_LOGICAL_ROLES = ['MANAGER', 'PLAN', 'DEV', 'REVIEW', 'AUDIT', 'A', 'B'];
+    const DEFAULT_EXECUTION_OPTIONS = {
+        timeout: 1800,
+        request_timeout: 1200,
+        parallelism: 4,
+        max_turns: 0,
+        reload_after: 10,
+        new_chat_on_handoff: false,
+        handoff_command_policy: 'auto'
+    };
+    const PROMPT_SAMPLES = [
+        ['Plan → DEV → REVIEW', 'Create an implementation plan, hand it to DEV, then have REVIEW verify the implementation and return blockers first.'],
+        ['Review current changes', 'Review the current repository changes for bugs, regressions, security issues, and missing tests. Return blockers first.'],
+        ['Continue exact plan', 'Read the exact .plan file provided, continue the authorized work, verify the result, and report the final status.']
+    ];
+
     let lastGoodTasks = [];
+    let lastGoodTaskMeta = null;
     let lastGoodRoles = [];
     let lastGoodFlow = null;
+    let lastGoodRoleDetail = null;
+    let lastGoodRoleEvents = [];
     let lastGoodScheduler = null;
     let lastSuccessfulAt = 0;
     let refreshInFlight = false;
-    let sourceStale = { tasks: true, roles: true, flow: true };
+    let sourceStale = { tasks: true, roles: true, flow: true, events: true };
     let draggedTaskId = '';
+    let selectedRole = '';
+    let selectedRoleRefreshGeneration = 0;
+    let focusNewestResponse = true;
+    let editorOriginRole = '';
+    let editorControllerRole = '';
+    let editorLogicalOrder = [];
+    let editorRoleMap = {};
+    let editorBehavior = { newChat: false, handoffAlways: false };
 
     const byId = (id) => document.getElementById(id);
     const setText = (target, value) => { target.textContent = value == null ? '' : String(value); };
@@ -422,6 +626,23 @@
         return element;
     };
     const normalizeList = (value) => String(value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
+    const onlineRoles = () => lastGoodRoles.filter((role) => role.online === true);
+    const roleByName = (roleName) => lastGoodRoles.find((role) => role.role === roleName);
+    const formatRoleAge = (seconds) => {
+        if (seconds == null || !Number.isFinite(Number(seconds))) return 'unknown';
+        const value = Math.max(0, Math.round(Number(seconds)));
+        if (value < 60) return `${value}s`;
+        if (value < 3600) return `${Math.floor(value / 60)}m`;
+        return `${Math.floor(value / 3600)}h`;
+    };
+    const chatPath = (role) => String(role?.page_path || '');
+    const chatHref = (role) => chatPath(role).startsWith('/') ? `https://chatgpt.com${chatPath(role)}` : 'https://chatgpt.com/';
+    const shortConversationId = (role) => {
+        const path = chatPath(role);
+        const match = path.match(/^\/c\/([^/?#]+)/);
+        return match ? match[1].slice(0, 12) : (path === '/' ? 'new chat' : 'unobserved');
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const taskById = (taskId) => lastGoodTasks.find((task) => task.task_id === taskId);
     const isoFromLocal = (value) => value ? new Date(value).toISOString() : '';
     const localFromIso = (value) => {
@@ -466,6 +687,14 @@
     }
     async function fetchFlow() {
         const response = await fetch('/api/admin/flow');
+        return readJson(response);
+    }
+    async function fetchRoleDetail(role) {
+        const response = await fetch(`/api/admin/role/${encodeURIComponent(role)}`);
+        return readJson(response);
+    }
+    async function fetchRoleEvents(role) {
+        const response = await fetch(`/api/admin/role/${encodeURIComponent(role)}/timeline?limit=100`);
         return readJson(response);
     }
 
@@ -601,52 +830,315 @@
     }
 
     function renderBoard() {
-        const tasks = filteredTasks();
+        const hasTasks = lastGoodTasks.length > 0;
+        const taskWorkspace = byId('task-workspace');
+        const noTasksState = byId('no-tasks-state');
+        taskWorkspace.hidden = !hasTasks;
+        noTasksState.hidden = hasTasks;
+        const tasks = hasTasks ? filteredTasks() : [];
         for (const state of STATES) {
             const column = byId(`column-${state}`);
             clearNode(column);
             const matches = tasks.filter((task) => task.status === state);
             setText(byId(`count-${state}`), matches.length);
-            if (!matches.length) column.appendChild(textNode('div', 'No matching tasks', 'empty-column'));
             for (const task of matches) column.appendChild(cardForTask(task));
         }
+    }
+
+    function addDefinition(list, label, value) {
+        list.appendChild(textNode('dt', label));
+        list.appendChild(textNode('dd', value == null || value === '' ? 'not available' : value));
+    }
+
+    function compactJson(value, limit = 360) {
+        if (value == null) return '';
+        const text = typeof value === 'string' ? value : JSON.stringify(value);
+        return text.length > limit ? `${text.slice(0, limit)}...` : text;
+    }
+
+    function roleState(role) {
+        if (role.current_flow_state) return String(role.current_flow_state).toUpperCase();
+        if (role.active_command) return String(role.active_command.state || role.active_command.action || 'ACTIVE').toUpperCase();
+        return 'IDLE';
+    }
+
+    function stateTone(state) {
+        if (['RUNNING', 'ONLINE'].includes(state)) return 'good';
+        if (['WAITING', 'DELIVERED', 'PENDING'].includes(state)) return 'warn';
+        if (['FAILED', 'STALLED', 'OFFLINE'].includes(state)) return 'bad';
+        return '';
+    }
+
+    function showRoleNotice(message, error = false) {
+        const notice = byId('role-action-notice');
+        notice.hidden = !message;
+        notice.dataset.kind = error ? 'error' : '';
+        setText(notice, message);
+    }
+
+    async function refreshSelectedRoleData() {
+        const requestedRole = selectedRole;
+        const generation = ++selectedRoleRefreshGeneration;
+        if (!requestedRole) {
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+            sourceStale.events = false;
+            return;
+        }
+        const results = await Promise.allSettled([fetchRoleDetail(requestedRole), fetchRoleEvents(requestedRole)]);
+        if (generation !== selectedRoleRefreshGeneration || requestedRole !== selectedRole) return;
+        if (results[0].status === 'fulfilled' && results[0].value.role === requestedRole) {
+            lastGoodRoleDetail = results[0].value;
+        }
+        if (results[1].status === 'fulfilled') {
+            const payload = results[1].value || {};
+            const events = Array.isArray(payload.events) ? payload.events : [];
+            const exactRole = payload.role === requestedRole && events.every((event) => event?.role === requestedRole);
+            lastGoodRoleEvents = exactRole ? events : [];
+            sourceStale.events = !exactRole;
+        } else {
+            sourceStale.events = true;
+        }
+    }
+
+    async function selectRole(roleName) {
+        if (selectedRole !== roleName) {
+            focusNewestResponse = true;
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+        }
+        selectedRole = roleName;
+        showRoleNotice('');
+        await refreshSelectedRoleData();
+        renderRoles();
+        renderSelectedRole();
+        renderEvents();
+    }
+
+    function commandTerminalOutcome(action, terminal) {
+        const normalizedAction = String(action || '').toUpperCase();
+        const normalizedTerminal = String(terminal || '').toUpperCase();
+        const expected = {
+            CLEAR_COMPOSER_TEXT: 'COMPOSER_TEXT_CLEARED',
+            RELOAD_PAGE: 'PAGE_RELOADING'
+        };
+        const expectedTerminal = expected[normalizedAction] || '';
+        return {
+            ok: Boolean(expectedTerminal && normalizedTerminal === expectedTerminal),
+            terminal: normalizedTerminal || 'UNKNOWN',
+            expected: expectedTerminal
+        };
+    }
+
+    async function runRoleCommand(roleName, action) {
+        const label = action === 'CLEAR_COMPOSER_TEXT' ? 'Clear txt' : 'F5';
+        try {
+            const body = await readJson(await fetch('/api/admin/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: roleName, action, payload: {} })
+            }));
+            const commandId = body.command?.command_id;
+            if (!commandId) throw new Error('Server did not return a command ID.');
+            showRoleNotice(`${roleName}: ${label} queued (${commandId}).`);
+            for (let attempt = 0; attempt < 60; attempt += 1) {
+                await sleep(500);
+                const status = await readJson(await fetch(`/api/admin/command/${encodeURIComponent(commandId)}`));
+                if (!status.done) continue;
+                const terminal = status.result?.state || status.status || 'UNKNOWN';
+                const outcome = commandTerminalOutcome(action, terminal);
+                const suffix = outcome.ok ? '' : ` Expected ${outcome.expected || 'an action-specific success state'}.`;
+                showRoleNotice(`${roleName}: ${outcome.terminal}.${suffix}`, !outcome.ok);
+                await refreshDashboard();
+                return;
+            }
+            showRoleNotice(`${roleName}: ${label} command is still pending; inspect command ${commandId}.`, true);
+        } catch (error) {
+            showRoleNotice(`${roleName}: ${label} failed — ${error.message}`, true);
+        }
+    }
+
+    function roleCard(role) {
+        const card = document.createElement('article');
+        card.className = `role-card selectable${role.role === selectedRole ? ' selected' : ''}`;
+        card.tabIndex = 0;
+        card.dataset.role = role.role;
+        card.addEventListener('click', () => selectRole(role.role));
+        card.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                selectRole(role.role);
+            }
+        });
+
+        const head = document.createElement('div');
+        head.className = 'role-head';
+        const heading = document.createElement('div');
+        const link = document.createElement('a');
+        link.className = 'role-title-link';
+        link.href = chatHref(role);
+        link.target = '_blank';
+        link.rel = 'noreferrer';
+        setText(link, `${role.role} · ${role.configured_role || role.role} ↗`);
+        link.addEventListener('click', (event) => event.stopPropagation());
+        heading.appendChild(link);
+        heading.appendChild(textNode('div', `logical ${role.current_logical_role || 'idle'}`, 'role-subtitle'));
+        head.appendChild(heading);
+        const state = textNode('span', roleState(role), 'role-state');
+        state.dataset.tone = stateTone(roleState(role));
+        head.appendChild(state);
+        card.appendChild(head);
+
+        const meta = document.createElement('div');
+        meta.className = 'role-meta';
+        addTag(meta, `turn ${Number(role.turn || 0)}`);
+        addTag(meta, `seen ${formatRoleAge(role.last_seen_age_s)}`);
+        if (role.current_task_id) addTag(meta, `task ${role.current_task_id}`, true);
+        card.appendChild(meta);
+        card.appendChild(textNode('div', `${role.role} — ${shortConversationId(role)}`, 'role-chat-id'));
+
+        const dom = role.dom_summary || {};
+        const composer = document.createElement('div');
+        composer.className = 'role-composer';
+        composer.appendChild(document.createTextNode('Composer: '));
+        const composerValue = document.createElement('strong');
+        composerValue.dataset.ready = String(Boolean(dom.composer));
+        setText(composerValue, dom.composer
+            ? `ready · ${Number(dom.composer_text_len || 0)} chars · ${Number(dom.composer_attachment_count || 0)} files`
+            : 'not observed');
+        composer.appendChild(composerValue);
+        card.appendChild(composer);
+
+        const actions = document.createElement('div');
+        actions.className = 'role-card-actions';
+        const clearButton = textNode('button', 'Clear txt');
+        clearButton.type = 'button';
+        clearButton.disabled = !dom.composer || Number(dom.composer_text_len || 0) === 0;
+        clearButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'CLEAR_COMPOSER_TEXT'); });
+        const reloadButton = textNode('button', 'F5');
+        reloadButton.type = 'button';
+        reloadButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'RELOAD_PAGE'); });
+        const taskButton = textNode('button', '+ task', 'primary');
+        taskButton.type = 'button';
+        taskButton.addEventListener('click', (event) => { event.stopPropagation(); openNewTask(role.role); });
+        actions.append(clearButton, reloadButton, taskButton);
+        card.appendChild(actions);
+        return card;
     }
 
     function renderRoles() {
         const rail = byId('role-rail');
         clearNode(rail);
-        if (!lastGoodRoles.length) {
-            rail.appendChild(textNode('div', 'No role observations yet', 'role-detail'));
+        const roles = onlineRoles();
+        setText(byId('role-count'), roles.length);
+        if (!roles.length) {
+            rail.appendChild(textNode('div', 'No online physical browser roles.', 'role-empty'));
             return;
         }
-        for (const role of lastGoodRoles) {
-            const card = document.createElement('article');
-            card.className = 'role-card';
-            const name = textNode('div', role.role, `role-name ${role.online ? 'online-dot' : 'offline-dot'}`);
-            card.appendChild(name);
-            const details = [
-                role.current_logical_role ? `logical ${role.current_logical_role}` : '',
-                role.current_task_id ? `task ${role.current_task_id}` : '',
-                role.reservation_state ? `reserved ${role.reservation_state}` : '',
-                role.active_command ? `${role.active_command.action} · ${role.active_command.state}` : '',
-                role.page_path || '',
-                role.transport ? `transport ${role.transport}` : '',
-                role.external_target ? `target ${JSON.stringify(role.external_target)}` : ''
-            ].filter(Boolean);
-            card.appendChild(textNode('div', details.join('\n') || (role.online ? 'idle online role' : 'offline'), 'role-detail'));
-            rail.appendChild(card);
+        for (const role of roles) rail.appendChild(roleCard(role));
+    }
+
+    function addMetric(container, label, value, tone = '') {
+        const metric = document.createElement('div');
+        metric.className = 'role-metric';
+        if (tone) metric.dataset.tone = tone;
+        metric.appendChild(textNode('span', label));
+        metric.appendChild(textNode('strong', value));
+        container.appendChild(metric);
+    }
+
+    function renderSelectedRole() {
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        const inventory = roleByName(selectedRole);
+        const metrics = byId('role-metrics');
+        const definitions = byId('selected-role-detail');
+        const responses = byId('role-responses');
+        clearNode(metrics);
+        clearNode(definitions);
+        clearNode(responses);
+        if (!selectedRole || !inventory || !detail) {
+            setText(byId('role-detail-title'), selectedRole ? `${selectedRole} · loading` : 'No online role selected');
+            setText(byId('selected-role-state'), selectedRole ? 'LOADING' : 'OFFLINE');
+            setText(byId('response-count'), 0);
+            responses.appendChild(textNode('div', 'No selected-role response evidence.', 'role-empty'));
+            return;
+        }
+        const state = roleState(inventory);
+        setText(byId('role-detail-title'), `${detail.role} · ${detail.configured_role} — logical ${detail.current_logical_role || 'idle'}`);
+        const statePill = byId('selected-role-state');
+        setText(statePill, state);
+        statePill.dataset.tone = stateTone(state);
+        const dom = detail.observation?.dom_info || {};
+        addMetric(metrics, 'Status', state, stateTone(state));
+        addMetric(metrics, 'Turn', Number(detail.turn || 0));
+        addMetric(metrics, 'Last seen', formatRoleAge(detail.presence?.last_seen_age_s));
+        addMetric(metrics, 'Composer', `${Number(dom.composer_text_len || 0)} chars`);
+        addDefinition(definitions, 'Task / request', `${detail.current_task_id || 'none'} · ${detail.current_request_id || 'none'}`);
+        addDefinition(definitions, 'Chat', `${detail.role} — ${shortConversationId(inventory)} · ${inventory.page_path || 'unobserved'}`);
+        const counts = detail.message_counts || {};
+        addDefinition(definitions, 'Messages', `user ${Number(counts.user || 0)} · assistant ${Number(counts.assistant || 0)} · images ${Number(counts.images || 0)}`);
+        addDefinition(definitions, 'Observation', detail.observation?.page_instance_id ? `${detail.observation.page_instance_id} · seq ${Number(detail.observation.observation_seq || 0)}` : 'none');
+        addDefinition(definitions, 'Composer', dom.composer ? `ready · text ${Number(dom.composer_text_len || 0)} · attachments ${Array.isArray(dom.composer_attachments) ? dom.composer_attachments.length : 0}` : 'not observed');
+        addDefinition(definitions, 'Active command', detail.active_command ? `${detail.active_command.action} · ${detail.active_command.state}` : 'none');
+        addDefinition(definitions, 'Transport', inventory.transport || 'userscript');
+        addDefinition(definitions, 'Flow', compactJson(detail.flow_status || {}, 600) || 'none');
+
+        const projected = detail.responses || [];
+        setText(byId('response-count'), projected.length);
+        if (!projected.length) responses.appendChild(textNode('div', 'No assistant responses retained for this role.', 'role-empty'));
+        projected.forEach((response, index) => {
+            const article = document.createElement('article');
+            article.className = 'role-response';
+            article.dataset.latest = String(index === projected.length - 1);
+            const head = document.createElement('header');
+            head.appendChild(textNode('span', `turn ${response.turn}`));
+            head.appendChild(textNode('span', `${response.text_len} chars · ${response.image_count} images`));
+            article.appendChild(head);
+            article.appendChild(textNode('pre', response.text || '(empty response)'));
+            responses.appendChild(article);
+        });
+        if (focusNewestResponse) {
+            focusNewestResponse = false;
+            requestAnimationFrame(() => { responses.scrollTop = responses.scrollHeight; });
+        }
+    }
+
+    function renderEvents() {
+        const container = byId('runtime-events');
+        clearNode(container);
+        setText(byId('event-count'), lastGoodRoleEvents.length);
+        if (!selectedRole) {
+            container.appendChild(textNode('div', 'Select an online role to inspect its timeline.', 'role-empty'));
+            return;
+        }
+        if (!lastGoodRoleEvents.length) {
+            container.appendChild(textNode('div', `No runtime events retained for ${selectedRole}.`, 'role-empty'));
+            return;
+        }
+        for (const event of [...lastGoodRoleEvents].reverse()) {
+            const row = document.createElement('article');
+            row.className = 'runtime-event';
+            row.appendChild(textNode('time', event.ts || ''));
+            row.appendChild(textNode('span', event.role || selectedRole, 'runtime-event-role'));
+            row.appendChild(textNode('span', event.event || 'EVENT', 'runtime-event-name'));
+            const evidence = { ...event };
+            delete evidence.ts;
+            delete evidence.role;
+            delete evidence.event;
+            row.appendChild(textNode('span', compactJson(evidence), 'runtime-event-detail'));
+            container.appendChild(row);
         }
     }
 
     function renderHealth() {
         const root = byId('dashboard-root');
-        const stale = sourceStale.tasks || sourceStale.roles || sourceStale.flow;
+        const stale = sourceStale.tasks || sourceStale.roles || sourceStale.flow || sourceStale.events;
         root.dataset.stale = String(stale);
         const connection = byId('connection-health');
         connection.dataset.tone = stale ? 'warn' : 'good';
         setText(connection.querySelector('strong'), stale ? 'PARTIAL' : 'CONNECTED');
         byId('connection-notice').hidden = !stale;
-        if (stale) setText(byId('connection-notice'), 'One or more data sources failed. Retaining last good task, role, and flow projections independently.');
+        if (stale) setText(byId('connection-notice'), 'One or more data sources failed. Retaining last good task, role, flow, and event projections independently.');
 
         const scheduler = byId('scheduler-health');
         const running = Boolean(lastGoodScheduler?.running);
@@ -658,7 +1150,39 @@
         setText(byId('refresh-age'), lastSuccessfulAt ? `${Math.max(0, Math.floor((Date.now() - lastSuccessfulAt) / 1000))}s` : 'never');
 
         const flow = lastGoodFlow?.flow;
-        setText(byId('flow-summary'), flow ? `Active flow ${flow.request_id} · ${flow.run_id}` : 'No active durable flow');
+        const liveness = lastGoodFlow?.liveness;
+        const runnerHealth = byId('runner-health');
+        const runner = liveness?.runner || {};
+        const terminalFlow = Boolean(flow?.terminal_status);
+        const runnerState = terminalFlow ? 'IDLE' : (runner.state || 'UNKNOWN');
+        const runnerHeartbeat = runner.last_heartbeat_age_s == null ? 'no heartbeat' : `${Math.round(runner.last_heartbeat_age_s)}s`;
+        const runnerPid = runner.pid == null ? '' : ` | PID ${runner.pid}`;
+        setText(runnerHealth.querySelector('strong'), `${runnerState}${runnerPid} | ${runnerHeartbeat}`);
+        runnerHealth.dataset.tone = terminalFlow || runnerState === 'RUNNING' ? 'good' : (runnerState === 'STOPPED' || liveness?.stalled ? 'bad' : 'warn');
+        runnerHealth.title = terminalFlow ? `Flow ${flow.terminal_status}; no runner expected` : `Runner ${runnerState}; heartbeat ${runnerHeartbeat}`;
+
+        const stallNotice = byId('flow-stall-notice');
+        if (liveness?.stalled) {
+            const runner = liveness.runner || {};
+            const command = liveness.last_command;
+            const heartbeat = runner.last_heartbeat_age_s == null ? 'never' : `${Math.round(runner.last_heartbeat_age_s)}s ago`;
+            const lines = [
+                `${liveness.logical_role || flow?.request_id || 'flow'} · STALLED`,
+                `Reason: ${liveness.reason || 'flow did not terminate'}`
+            ];
+            if (command) lines.push(`Last command: ${command.action} · ${command.state}${command.age_s == null ? '' : ` (${Math.round(command.age_s)}s)`}`);
+            lines.push(`Runner: ${runner.state || 'UNKNOWN'}`);
+            lines.push(`Last heartbeat: ${heartbeat}`);
+            lines.push(`Next action: ${liveness.next_action || 'recover existing flow'}`);
+            setText(stallNotice, lines.join('\n'));
+            stallNotice.hidden = false;
+            root.dataset.stalled = 'true';
+            setText(byId('flow-summary'), `${liveness.logical_role || 'flow'} · STALLED — ${liveness.reason || 'flow did not terminate'}`);
+        } else {
+            stallNotice.hidden = true;
+            root.dataset.stalled = 'false';
+            setText(byId('flow-summary'), flow ? `Active flow ${flow.request_id} · ${flow.run_id}` : 'No active durable flow');
+        }
     }
 
     function updateFilterOptions() {
@@ -672,48 +1196,59 @@
         update(byId('filter-controller'), lastGoodTasks.map((task) => task.controller_role), 'All controllers');
         update(byId('filter-repository'), lastGoodTasks.map((task) => task.target_root), 'All repositories');
         update(byId('filter-status'), STATES, 'All states');
-        const datalist = byId('role-options');
-        clearNode(datalist);
-        for (const role of lastGoodRoles) datalist.appendChild(new Option(role.role, role.role));
     }
 
     function renderDashboard() {
         updateFilterOptions();
         renderBoard();
         renderRoles();
+        renderSelectedRole();
+        renderEvents();
         renderHealth();
     }
 
     async function refreshDashboard() {
         if (refreshInFlight) return;
         refreshInFlight = true;
-        const results = await Promise.allSettled([fetchTasks(), fetchRoles(), fetchFlow()]);
-        const taskResult = results[0];
-        const roleResult = results[1];
-        const flowResult = results[2];
-        if (taskResult.status === 'fulfilled') {
-            lastGoodScheduler = taskResult.value.scheduler || lastGoodScheduler;
-            const loadError = taskResult.value.load_error;
-            byId('task-store-error').hidden = !loadError;
-            if (loadError) {
-                sourceStale.tasks = true;
-                setText(byId('task-store-error'), `Task store unavailable: ${loadError.message || loadError.code}. Retaining the last good task cards.`);
-            } else {
-                lastGoodTasks = taskResult.value.tasks || [];
-                sourceStale.tasks = false;
-            }
-        } else sourceStale.tasks = true;
-        if (roleResult.status === 'fulfilled') {
-            lastGoodRoles = roleResult.value.roles || [];
-            sourceStale.roles = false;
-        } else sourceStale.roles = true;
-        if (flowResult.status === 'fulfilled') {
-            lastGoodFlow = flowResult.value;
-            sourceStale.flow = false;
-        } else sourceStale.flow = true;
-        if (results.some((result) => result.status === 'fulfilled')) lastSuccessfulAt = Date.now();
-        refreshInFlight = false;
-        renderDashboard();
+        try {
+            const results = await Promise.allSettled([fetchTasks(), fetchRoles(), fetchFlow()]);
+            const taskResult = results[0];
+            const roleResult = results[1];
+            const flowResult = results[2];
+            if (taskResult.status === 'fulfilled') {
+                lastGoodTaskMeta = taskResult.value;
+                lastGoodScheduler = taskResult.value.scheduler || lastGoodScheduler;
+                const loadError = taskResult.value.load_error;
+                byId('task-store-error').hidden = !loadError;
+                if (loadError) {
+                    sourceStale.tasks = true;
+                    setText(byId('task-store-error'), `Task store unavailable: ${loadError.message || loadError.code}. Retaining the last good task data.`);
+                } else {
+                    lastGoodTasks = taskResult.value.tasks || [];
+                    sourceStale.tasks = false;
+                }
+            } else sourceStale.tasks = true;
+            if (roleResult.status === 'fulfilled') {
+                lastGoodRoles = roleResult.value.roles || [];
+                sourceStale.roles = false;
+                const live = onlineRoles();
+                if (!live.some((role) => role.role === selectedRole)) {
+                    selectedRole = live[0]?.role || '';
+                    focusNewestResponse = true;
+                    lastGoodRoleDetail = null;
+                    lastGoodRoleEvents = [];
+                }
+            } else sourceStale.roles = true;
+            if (flowResult.status === 'fulfilled') {
+                lastGoodFlow = flowResult.value;
+                sourceStale.flow = false;
+            } else sourceStale.flow = true;
+            await refreshSelectedRoleData();
+            if (results.some((result) => result.status === 'fulfilled')) lastSuccessfulAt = Date.now();
+        } finally {
+            refreshInFlight = false;
+            renderDashboard();
+        }
     }
 
     function currentTaskOrThrow(taskId) {
@@ -780,34 +1315,344 @@
         for (const field of document.querySelectorAll('[data-schedule-field]')) field.hidden = field.dataset.scheduleField !== kind;
     }
 
-    function resetEditor() {
+    function logicalChoices() {
+        return [...new Set([
+            ...BASE_LOGICAL_ROLES,
+            ...onlineRoles().map((role) => role.configured_role).filter(Boolean),
+            ...onlineRoles().map((role) => role.role),
+            ...editorLogicalOrder
+        ])];
+    }
+
+    function editorPhysicalTargets() {
+        return [...new Set(onlineRoles().map((role) => role.role).filter(Boolean))];
+    }
+
+    function validateOnlineTaskTargets(controllerRole, roleMap, onlineRoleNames) {
+        const online = new Set(onlineRoleNames);
+        if (!online.has(controllerRole)) throw new Error(`Controller role ${controllerRole || '<empty>'} is offline; select an online physical role.`);
+        for (const [logicalRole, physicalRole] of Object.entries(roleMap)) {
+            if (!online.has(physicalRole)) throw new Error(`${logicalRole} maps to ${physicalRole || '<empty>'}, which is offline; remap it to an online physical role.`);
+        }
+    }
+
+    function defaultPhysicalFor(logicalRole) {
+        const live = onlineRoles();
+        const exact = live.find((role) => role.role === logicalRole);
+        if (exact) return exact.role;
+        if (editorOriginRole && live.some((role) => role.role === editorOriginRole)) return editorOriginRole;
+        return live[0]?.role || '';
+    }
+
+    function deriveFinishRoles(logicalRoles) {
+        for (const preferred of ['MANAGER', 'PLAN', 'REVIEW']) {
+            if (logicalRoles.includes(preferred)) return [preferred];
+        }
+        return logicalRoles.length ? [logicalRoles[0]] : [];
+    }
+
+    function commandNumber(value) {
+        const number = Number(value);
+        return Number.isInteger(number) ? String(number) : String(number);
+    }
+
+    function quoteCli(value) {
+        const text = String(value ?? '');
+        let result = '"';
+        let backslashes = 0;
+        for (const char of text) {
+            if (char === '\\') {
+                backslashes += 1;
+                continue;
+            }
+            if (char === '"') {
+                result += '\\'.repeat(backslashes * 2 + 1) + '"';
+                backslashes = 0;
+                continue;
+            }
+            if (backslashes) {
+                result += '\\'.repeat(backslashes);
+                backslashes = 0;
+            }
+            result += char;
+        }
+        if (backslashes) result += '\\'.repeat(backslashes * 2);
+        return `${result}"`;
+    }
+
+    function executionOptionsFromForm() {
+        const options = {
+            timeout: Number(byId('task-timeout').value),
+            request_timeout: Number(byId('task-request-timeout').value),
+            parallelism: Number(byId('task-parallelism').value),
+            max_turns: Number(byId('task-max-turns').value),
+            reload_after: Number(byId('task-reload-after').value),
+            new_chat_on_handoff: editorBehavior.newChat,
+            handoff_command_policy: editorBehavior.handoffAlways ? 'always' : 'auto'
+        };
+        for (const name of ['timeout', 'request_timeout', 'reload_after']) {
+            if (!Number.isFinite(options[name])) throw new Error(`${name} must be a finite number.`);
+        }
+        for (const name of ['parallelism', 'max_turns']) {
+            if (!Number.isInteger(options[name])) throw new Error(`${name} must be a whole number.`);
+        }
+        if (options.timeout < 1 || options.timeout > 86400) throw new Error('timeout must be between 1 and 86400.');
+        if (options.request_timeout < 1 || options.request_timeout > 86400) throw new Error('request_timeout must be between 1 and 86400.');
+        if (options.parallelism < 1 || options.parallelism > 32) throw new Error('parallelism must be between 1 and 32.');
+        if (options.max_turns < 0 || options.max_turns > 100000) throw new Error('max_turns must be between 0 and 100000.');
+        if (options.reload_after < 0 || options.reload_after > 3600) throw new Error('reload_after must be between 0 and 3600.');
+        return options;
+    }
+
+    function buildMainCommand(logicalRoles, roleMap, finishRoles, options, prompt) {
+        const policy = String(options.handoff_command_policy || '').toLowerCase();
+        if (!['auto', 'always'].includes(policy)) throw new Error('handoff_command_policy must be auto or always.');
+        const physicalRoles = [...new Set(logicalRoles.map((role) => roleMap[role]).filter(Boolean))];
+        const roleMapText = logicalRoles.map((role) => `${role}=${roleMap[role] || ''}`).join(' ');
+        const parts = [
+            'uv run python main.py',
+            `--role ${quoteCli(logicalRoles.join(','))}`,
+            `--browser-roles ${quoteCli(physicalRoles.join(','))}`,
+            `--role-map ${quoteCli(roleMapText)}`,
+            `--finish-roles ${quoteCli(finishRoles.join(','))}`,
+            `--timeout ${commandNumber(options.timeout)}`,
+            `--request-timeout ${commandNumber(options.request_timeout)}`,
+            `--parallelism ${options.parallelism}`,
+            `--max-turns ${options.max_turns}`,
+            `--reload-after ${commandNumber(options.reload_after)}`
+        ];
+        if (options.new_chat_on_handoff) parts.push('--new-chat-on-handoff');
+        if (policy === 'always') parts.push('--handoff-command-policy always');
+        parts.push(`--goal ${quoteCli(prompt || '<task prompt>')}`);
+        return parts.join(' ');
+    }
+
+    function addLogicalRole(roleName) {
+        const normalized = String(roleName || '').trim().toUpperCase();
+        if (!normalized || editorLogicalOrder.includes(normalized)) return;
+        editorLogicalOrder.push(normalized);
+        editorRoleMap[normalized] = defaultPhysicalFor(normalized);
+        renderWorkflowEditor();
+    }
+
+    function removeLogicalRole(roleName) {
+        editorLogicalOrder = editorLogicalOrder.filter((role) => role !== roleName);
+        delete editorRoleMap[roleName];
+        renderWorkflowEditor();
+    }
+
+    function moveLogicalRole(roleName, delta) {
+        const index = editorLogicalOrder.indexOf(roleName);
+        const destination = index + delta;
+        if (index < 0 || destination < 0 || destination >= editorLogicalOrder.length) return;
+        [editorLogicalOrder[index], editorLogicalOrder[destination]] = [editorLogicalOrder[destination], editorLogicalOrder[index]];
+        renderWorkflowEditor();
+    }
+
+    function mapLogicalRole(roleName, physicalRole) {
+        editorRoleMap[roleName] = physicalRole;
+        renderWorkflowEditor();
+    }
+
+    function setToggle(button, active) {
+        button.classList.toggle('selected', active);
+        button.setAttribute('aria-pressed', String(active));
+        setText(button, active ? 'ON' : 'OFF');
+    }
+
+    function renderWorkflowEditor() {
+        const order = byId('task-logical-order');
+        const available = byId('task-logical-available');
+        const targets = byId('task-browser-targets');
+        const mapping = byId('task-role-mapping');
+        clearNode(order);
+        clearNode(available);
+        clearNode(targets);
+        clearNode(mapping);
+
+        const liveTargets = editorPhysicalTargets();
+        const controller = byId('task-controller');
+        clearNode(controller);
+        if (editorControllerRole && !liveTargets.includes(editorControllerRole)) {
+            const stale = new Option(`${editorControllerRole} — offline, select a replacement`, editorControllerRole);
+            stale.disabled = true;
+            stale.selected = true;
+            controller.appendChild(stale);
+        }
+        for (const roleName of liveTargets) controller.appendChild(new Option(roleName, roleName));
+        if (!editorControllerRole && liveTargets.length) editorControllerRole = liveTargets[0];
+        if (!controller.firstChild) {
+            const unavailable = new Option('No online physical roles', '');
+            unavailable.disabled = true;
+            unavailable.selected = true;
+            controller.appendChild(unavailable);
+        } else {
+            controller.value = editorControllerRole;
+        }
+        controller.dataset.invalid = String(!liveTargets.includes(editorControllerRole));
+
+        editorLogicalOrder.forEach((roleName, index) => {
+            const chip = document.createElement('span');
+            chip.className = 'role-chip';
+            chip.appendChild(textNode('strong', `${index + 1}. ${roleName}`));
+            const left = textNode('button', '←');
+            left.type = 'button';
+            left.disabled = index === 0;
+            left.addEventListener('click', () => moveLogicalRole(roleName, -1));
+            const right = textNode('button', '→');
+            right.type = 'button';
+            right.disabled = index === editorLogicalOrder.length - 1;
+            right.addEventListener('click', () => moveLogicalRole(roleName, 1));
+            const remove = textNode('button', '×');
+            remove.type = 'button';
+            remove.addEventListener('click', () => removeLogicalRole(roleName));
+            chip.append(left, right, remove);
+            order.appendChild(chip);
+        });
+        if (!order.firstChild) order.appendChild(textNode('span', 'Select at least one logical role.', 'role-empty'));
+
+        logicalChoices().filter((role) => !editorLogicalOrder.includes(role)).forEach((roleName) => {
+            const button = textNode('button', `+ ${roleName}`, 'role-chip');
+            button.type = 'button';
+            button.addEventListener('click', () => addLogicalRole(roleName));
+            available.appendChild(button);
+        });
+        if (!available.firstChild) available.appendChild(textNode('span', 'All available roles selected.', 'role-empty'));
+
+        liveTargets.forEach((roleName) => {
+            const chip = textNode('span', `${roleName} · online`, 'role-chip');
+            chip.dataset.source = 'true';
+            targets.appendChild(chip);
+        });
+        if (!targets.firstChild) targets.appendChild(textNode('span', 'No online browser targets.', 'role-empty'));
+
+        const physicalTargets = liveTargets;
+        editorLogicalOrder.forEach((roleName) => {
+            if (!editorRoleMap[roleName]) editorRoleMap[roleName] = defaultPhysicalFor(roleName);
+            const currentPhysical = editorRoleMap[roleName] || '';
+            const validPhysical = physicalTargets.includes(currentPhysical);
+            const row = document.createElement('div');
+            row.className = 'mapping-row';
+            row.dataset.invalid = String(!validPhysical);
+            row.appendChild(textNode('span', roleName));
+            row.appendChild(textNode('span', '→', 'arrow'));
+            const select = document.createElement('select');
+            select.setAttribute('aria-label', `Map ${roleName} to physical browser role`);
+            if (currentPhysical && !validPhysical) {
+                const stale = new Option(`${currentPhysical} — offline, remap required`, currentPhysical);
+                stale.disabled = true;
+                stale.selected = true;
+                select.appendChild(stale);
+            }
+            physicalTargets.forEach((physicalRole) => select.appendChild(new Option(physicalRole, physicalRole)));
+            if (!select.firstChild) {
+                const unavailable = new Option('No online physical roles', '');
+                unavailable.disabled = true;
+                unavailable.selected = true;
+                select.appendChild(unavailable);
+            } else {
+                select.value = currentPhysical;
+            }
+            select.dataset.invalid = String(!validPhysical);
+            select.addEventListener('change', () => mapLogicalRole(roleName, select.value));
+            row.appendChild(select);
+            mapping.appendChild(row);
+        });
+
+        setToggle(byId('task-new-chat'), editorBehavior.newChat);
+        setToggle(byId('task-handoff-always'), editorBehavior.handoffAlways);
+        updateCommandPreview();
+    }
+
+    function updateCommandPreview() {
+        try {
+            const previewMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
+            validateOnlineTaskTargets(editorControllerRole, previewMap, editorPhysicalTargets());
+            const options = executionOptionsFromForm();
+            const finishRoles = deriveFinishRoles(editorLogicalOrder);
+            setText(byId('task-command-preview'), buildMainCommand(
+                editorLogicalOrder,
+                previewMap,
+                finishRoles,
+                options,
+                byId('task-prompt').value.trim()
+            ));
+        } catch (error) {
+            setText(byId('task-command-preview'), `Invalid execution options: ${error.message}`);
+        }
+    }
+
+    function autoSizePrompt() {
+        const textarea = byId('task-prompt');
+        textarea.style.height = 'auto';
+        const lineHeight = 20;
+        const minimum = lineHeight * 2 + 18;
+        const maximum = lineHeight * 10 + 18;
+        textarea.style.height = `${Math.min(maximum, Math.max(minimum, textarea.scrollHeight))}px`;
+        textarea.style.overflowY = textarea.scrollHeight > maximum ? 'auto' : 'hidden';
+    }
+
+    function renderPromptSamples() {
+        const container = byId('prompt-samples');
+        clearNode(container);
+        PROMPT_SAMPLES.forEach(([label, prompt]) => {
+            const button = textNode('button', label);
+            button.type = 'button';
+            button.addEventListener('click', () => {
+                byId('task-prompt').value = prompt;
+                container.hidden = true;
+                autoSizePrompt();
+                updateCommandPreview();
+            });
+            container.appendChild(button);
+        });
+    }
+
+    function resetEditor(originRole = '') {
         byId('task-form').reset();
         byId('task-id').value = '';
         byId('task-revision').value = '';
         byId('task-status').disabled = false;
         byId('task-enabled').checked = true;
-        byId('task-role-map').value = '{\n  "DEV": "WORKER_1",\n  "REVIEW": "WORKER_1",\n  "PLAN": "WORKER_1"\n}';
-        byId('task-logical').value = 'DEV, REVIEW, PLAN';
-        byId('task-finish').value = 'PLAN';
-        byId('task-controller').value = '';
+        editorOriginRole = String(originRole || '').trim().toUpperCase();
+        if (!onlineRoles().some((role) => role.role === editorOriginRole)) editorOriginRole = onlineRoles()[0]?.role || '';
+        const origin = roleByName(editorOriginRole);
+        const initialLogical = origin?.configured_role || editorOriginRole || BASE_LOGICAL_ROLES[0];
+        editorLogicalOrder = initialLogical ? [initialLogical] : [];
+        editorRoleMap = initialLogical ? { [initialLogical]: defaultPhysicalFor(initialLogical) } : {};
+        editorBehavior = { newChat: false, handoffAlways: false };
+        editorControllerRole = editorOriginRole;
+        byId('task-timeout').value = DEFAULT_EXECUTION_OPTIONS.timeout;
+        byId('task-request-timeout').value = DEFAULT_EXECUTION_OPTIONS.request_timeout;
+        byId('task-parallelism').value = DEFAULT_EXECUTION_OPTIONS.parallelism;
+        byId('task-max-turns').value = DEFAULT_EXECUTION_OPTIONS.max_turns;
+        byId('task-reload-after').value = DEFAULT_EXECUTION_OPTIONS.reload_after;
         byId('task-schedule-kind').value = 'manual';
         byId('task-result-status').value = '';
         byId('task-result-summary').value = '';
         byId('task-blocker').value = '';
+        byId('prompt-samples').hidden = true;
         for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = true;
+        byId('task-advanced').open = true;
+        byId('task-scheduling').open = false;
+        byId('task-results').open = false;
         updateScheduleFields();
+        renderWorkflowEditor();
+        renderPromptSamples();
+        autoSizePrompt();
     }
 
-    function openNewTask() {
-        resetEditor();
-        setText(byId('task-dialog-title'), 'Create task');
+    function openNewTask(originRole = '') {
+        resetEditor(originRole);
+        setText(byId('task-dialog-title'), editorOriginRole ? `Create task from ${editorOriginRole}` : 'Create task');
         byId('task-dialog').showModal();
+        requestAnimationFrame(autoSizePrompt);
         byId('task-title').focus();
     }
 
     function openEditor(taskId) {
         const task = currentTaskOrThrow(taskId);
-        resetEditor();
+        resetEditor(task.controller_role);
         setText(byId('task-dialog-title'), 'Edit task');
         for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = false;
         byId('task-id').value = task.task_id;
@@ -815,13 +1660,23 @@
         byId('task-title').value = task.title;
         byId('task-root').value = task.target_root;
         byId('task-branch').value = task.branch;
-        byId('task-controller').value = task.controller_role;
+        editorControllerRole = task.controller_role;
         byId('task-status').value = task.status;
         byId('task-status').disabled = true;
         byId('task-prompt').value = task.prompt;
-        byId('task-logical').value = task.logical_roles.join(', ');
-        byId('task-finish').value = task.finish_roles.join(', ');
-        byId('task-role-map').value = JSON.stringify(task.physical_role_map, null, 2);
+        editorOriginRole = task.controller_role;
+        editorLogicalOrder = [...task.logical_roles];
+        editorRoleMap = { ...task.physical_role_map };
+        const options = { ...DEFAULT_EXECUTION_OPTIONS, ...(task.execution_options || {}) };
+        editorBehavior = {
+            newChat: options.new_chat_on_handoff === true,
+            handoffAlways: options.handoff_command_policy === 'always'
+        };
+        byId('task-timeout').value = options.timeout;
+        byId('task-request-timeout').value = options.request_timeout;
+        byId('task-parallelism').value = options.parallelism;
+        byId('task-max-turns').value = options.max_turns;
+        byId('task-reload-after').value = options.reload_after;
         byId('task-enabled').checked = task.enabled;
         const schedule = task.schedule || { kind: 'manual' };
         byId('task-schedule-kind').value = schedule.kind;
@@ -834,25 +1689,61 @@
         byId('task-result-summary').value = task.last_result_summary || '';
         byId('task-blocker').value = task.blocker || '';
         updateScheduleFields();
+        renderWorkflowEditor();
+        autoSizePrompt();
         byId('task-dialog').showModal();
+        requestAnimationFrame(autoSizePrompt);
         byId('task-title').focus();
     }
 
     async function saveEditor(event) {
         event.preventDefault();
         const taskId = byId('task-id').value;
-        let roleMap;
-        try { roleMap = JSON.parse(byId('task-role-map').value); }
-        catch { announceError('Physical role map must be valid JSON.'); return; }
+        if (!editorLogicalOrder.length) {
+            announceError('Select at least one logical role.');
+            return;
+        }
+
+        let freshRolePayload;
+        try {
+            freshRolePayload = await fetchRoles();
+        } catch (error) {
+            announceError(`Cannot verify online physical roles before save: ${error.message}`);
+            return;
+        }
+        lastGoodRoles = Array.isArray(freshRolePayload.roles) ? freshRolePayload.roles : [];
+        sourceStale.roles = false;
+        renderWorkflowEditor();
+        const onlineRoleNames = editorPhysicalTargets();
+        const controllerRole = String(editorControllerRole || '').trim().toUpperCase();
+        const roleMap = {};
+        for (const logicalRole of editorLogicalOrder) {
+            roleMap[logicalRole] = String(editorRoleMap[logicalRole] || '').trim().toUpperCase();
+        }
+        try {
+            validateOnlineTaskTargets(controllerRole, roleMap, onlineRoleNames);
+        } catch (error) {
+            announceError(error.message);
+            return;
+        }
+
+        let executionOptions;
+        try {
+            executionOptions = executionOptionsFromForm();
+        } catch (error) {
+            announceError(error.message);
+            return;
+        }
         const values = {
             title: byId('task-title').value.trim(),
             target_root: byId('task-root').value.trim(),
             branch: byId('task-branch').value.trim(),
             prompt: byId('task-prompt').value.trim(),
-            controller_role: byId('task-controller').value.trim(),
-            logical_roles: normalizeList(byId('task-logical').value),
+            controller_role: controllerRole,
+            logical_roles: [...editorLogicalOrder],
             physical_role_map: roleMap,
-            finish_roles: normalizeList(byId('task-finish').value),
+            finish_roles: deriveFinishRoles(editorLogicalOrder),
+            execution_options: executionOptions,
             enabled: byId('task-enabled').checked,
             schedule: scheduleFromForm()
         };
@@ -907,6 +1798,7 @@
         body.appendChild(detailBlock('Objective', task.prompt));
         body.appendChild(detailBlock('Roles', `logical: ${task.logical_roles.join(', ')}\nphysical: ${JSON.stringify(task.physical_role_map, null, 2)}\nfinish: ${task.finish_roles.join(', ')}`));
         body.appendChild(detailBlock('Schedule', `${JSON.stringify(task.schedule, null, 2)}\nnext: ${task.next_run_at || 'none'}\nenabled: ${task.enabled}`));
+        body.appendChild(detailBlock('Execution options', `${JSON.stringify(task.execution_options, null, 2)}\n\n${buildMainCommand(task.logical_roles, task.physical_role_map, task.finish_roles, task.execution_options || DEFAULT_EXECUTION_OPTIONS, task.prompt)}`));
         body.appendChild(detailBlock('Requests and result', `active: ${task.active_request_id || 'none'}\nlast: ${task.last_request_id || 'none'}\nstatus: ${task.last_result_status || 'none'}\nsummary: ${task.last_result_summary || 'none'}\nblocker: ${task.blocker || 'none'}`));
         body.appendChild(detailBlock('Wake', JSON.stringify(task.wake, null, 2)));
         const seam = [`transport: ${task.transport || 'userscript'}`];
@@ -944,9 +1836,33 @@
     }
 
     function installEvents() {
-        byId('create-task').addEventListener('click', openNewTask);
+        byId('create-task').addEventListener('click', () => openNewTask());
         byId('task-form').addEventListener('submit', saveEditor);
         byId('task-schedule-kind').addEventListener('change', updateScheduleFields);
+        byId('task-controller').addEventListener('change', () => {
+            editorControllerRole = byId('task-controller').value.trim().toUpperCase();
+            updateCommandPreview();
+        });
+        byId('toggle-prompt-samples').addEventListener('click', () => {
+            const samples = byId('prompt-samples');
+            samples.hidden = !samples.hidden;
+        });
+        byId('task-new-chat').addEventListener('click', () => {
+            editorBehavior.newChat = !editorBehavior.newChat;
+            renderWorkflowEditor();
+        });
+        byId('task-handoff-always').addEventListener('click', () => {
+            editorBehavior.handoffAlways = !editorBehavior.handoffAlways;
+            renderWorkflowEditor();
+        });
+        byId('task-prompt').addEventListener('input', () => {
+            autoSizePrompt();
+            updateCommandPreview();
+        });
+        for (const id of ['task-timeout', 'task-request-timeout', 'task-parallelism', 'task-max-turns', 'task-reload-after']) {
+            byId(id).addEventListener('input', updateCommandPreview);
+            byId(id).addEventListener('change', updateCommandPreview);
+        }
         for (const button of document.querySelectorAll('[data-close-dialog]')) {
             button.addEventListener('click', () => byId(button.dataset.closeDialog).close());
         }
@@ -954,6 +1870,7 @@
             filter.addEventListener('input', renderBoard);
             filter.addEventListener('change', renderBoard);
         }
+        renderPromptSamples();
         installDropTargets();
     }
 

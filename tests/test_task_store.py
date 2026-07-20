@@ -50,6 +50,81 @@ def test_empty_create_atomic_restart_and_deep_copy(tmp_path: Path):
     assert TaskStore(path).get(task["task_id"])["controller_role"] == "CONTROL_A"
 
 
+def test_execution_options_default_validate_patch_and_migrate(tmp_path: Path):
+    path = tmp_path / "tasks.json"
+    store = TaskStore(path)
+    task = store.create(payload())
+    assert task["execution_options"] == {
+        "timeout": 1800.0,
+        "request_timeout": 1200.0,
+        "parallelism": 4,
+        "max_turns": 0,
+        "reload_after": 10.0,
+        "new_chat_on_handoff": False,
+        "handoff_command_policy": "auto",
+    }
+
+    custom = {
+        "timeout": 900,
+        "request_timeout": 600,
+        "parallelism": 2,
+        "max_turns": 12,
+        "reload_after": 5,
+        "new_chat_on_handoff": True,
+        "handoff_command_policy": "always",
+    }
+    changed = store.patch(task["task_id"], task["revision"], {"execution_options": custom})
+    assert changed["execution_options"] == {
+        **custom,
+        "timeout": 900.0,
+        "request_timeout": 600.0,
+        "reload_after": 5.0,
+    }
+
+    legacy = store.document
+    legacy["tasks"][task["task_id"]].pop("execution_options")
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    migrated = TaskStore(path)
+    assert migrated.load_error is None
+    assert migrated.get(task["task_id"])["execution_options"]["request_timeout"] == 1200.0
+
+    with pytest.raises(ValueError, match="unsupported execution_options"):
+        store.patch(changed["task_id"], changed["revision"], {"execution_options": {**custom, "shell": "pwsh"}})
+    with pytest.raises(ValueError, match="parallelism"):
+        store.create(payload(controller_role="other", execution_options={**custom, "parallelism": 0}))
+
+
+def test_execution_options_partial_patch_merges_over_persisted_values(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks.json")
+    custom = {
+        "timeout": 4321,
+        "request_timeout": 2345,
+        "parallelism": 7,
+        "max_turns": 99,
+        "reload_after": 17,
+        "new_chat_on_handoff": True,
+        "handoff_command_policy": "always",
+    }
+    task = store.create(payload(execution_options=custom))
+
+    changed = store.patch(task["task_id"], task["revision"], {"execution_options": {"parallelism": 8}})
+
+    assert changed["execution_options"] == {
+        **custom,
+        "timeout": 4321.0,
+        "request_timeout": 2345.0,
+        "parallelism": 8,
+        "reload_after": 17.0,
+    }
+
+
+def test_execution_options_rejects_cli_only_off_policy(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks.json")
+
+    with pytest.raises(ValueError, match="auto or always"):
+        store.create(payload(execution_options={"handoff_command_policy": "off"}))
+
+
 def test_existing_corruption_preserves_bytes_and_blocks_mutation(tmp_path: Path):
     path = tmp_path / "tasks.json"
     original = b'{"version":1,"tasks":'

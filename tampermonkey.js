@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAuto Diagnostic Bridge Standalone
 // @namespace    http://tampermonkey.net/
-// @version      1.0.5
+// @version      1.0.7
 // @description  Standalone MAuto bridge without unsafe-eval or hot reload.
 // @match        https://chatgpt.com/*
 // @match        https://*.chatgpt.com/*
@@ -15,7 +15,7 @@
     'use strict';
 
     const SERVER_URL = 'http://127.0.0.1:8500';
-    const BRIDGE_VERSION = 'standalone-1.0.5';
+    const BRIDGE_VERSION = 'standalone-1.0.7';
     const PAGE_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     let observationSeq = 0;
     function nextObservationSeq() { observationSeq += 1; return observationSeq; }
@@ -577,6 +577,49 @@
         } catch (error) {
             console.warn('[MAuto Bridge] clearComposerText failed', error);
         }
+    }
+
+
+    function composerTextClearVerdict(before, after) {
+        const beforeAttachmentCount = realComposerAttachmentCount(before);
+        const afterAttachmentCount = realComposerAttachmentCount(after);
+        const textCleared = !!after && Number(after.composer_text_len || 0) === 0;
+        const attachmentsPreserved = beforeAttachmentCount === afterAttachmentCount;
+        return {
+            ok: textCleared && attachmentsPreserved,
+            text_cleared: textCleared,
+            attachments_before: beforeAttachmentCount,
+            attachments_after: afterAttachmentCount,
+            attachments_preserved: attachmentsPreserved,
+            reason: !textCleared ? 'composer_text_not_empty' : !attachmentsPreserved ? 'attachment_count_changed' : ''
+        };
+    }
+
+    async function handleClearComposerText(command) {
+        const before = domSnapshot();
+        const composer = composerElement();
+        if (!composer) {
+            await report('COMPOSER_TEXT_CLEAR_FAILED', command.command_id, {
+                result: {
+                    ok: false,
+                    text_cleared: false,
+                    attachments_before: realComposerAttachmentCount(before),
+                    attachments_after: realComposerAttachmentCount(before),
+                    attachments_preserved: true,
+                    reason: 'composer_not_found'
+                },
+                dom_info: before
+            });
+            return;
+        }
+        clearComposerText(composer);
+        await sleep(Math.min(120, Math.max(20, Number(config.action_delay_min_ms || 20))));
+        const after = domSnapshot();
+        const verdict = composerTextClearVerdict(before, after);
+        await report(verdict.ok ? 'COMPOSER_TEXT_CLEARED' : 'COMPOSER_TEXT_CLEAR_FAILED', command.command_id, {
+            result: verdict,
+            dom_info: after
+        });
     }
 
     function setComposerText(el, text, method) {
@@ -2405,6 +2448,8 @@
             await handleWaitComposerStable(command);
         } else if (action === 'SET_PROMPT') {
             await handleSetPrompt(command);
+        } else if (action === 'CLEAR_COMPOSER_TEXT') {
+            await handleClearComposerText(command);
         } else if (action === 'UPLOAD_FILE' || action === 'UPLOAD_FILES' || action === 'PASTE_IMAGE' || action === 'PASTE_FILES') {
             await handleUploadFiles(command);
         } else if (action === 'FIND_SEND') {
@@ -2531,6 +2576,7 @@
         const normalizedPhysicalRole = String(physicalRole || '').trim().toUpperCase().slice(0, 80);
         const hydrated = {
             state,
+            stalled: status.stalled === true,
             logical_role: (String(status.logical_role || '').trim().toUpperCase() || normalizedPhysicalRole).slice(0, 80)
         };
         const fieldLimits = { run_id: 256, from_role: 80, done_from: 80, sent_to: 80 };
@@ -2549,8 +2595,12 @@
             return '';
         }
         const state = hydrated.state;
+        const stalled = hydrated.stalled === true && (state === 'RUNNING' || state === 'WAITING');
+        const effectiveState = stalled ? 'STALLED' : state;
         let color = '#d6a84b';
-        if (state === 'RUNNING') {
+        if (stalled) {
+            color = '#efbb62';
+        } else if (state === 'RUNNING') {
             color = '#ff5c5c';
         } else if (state === 'DONE') {
             color = '#10a37f';
@@ -2565,12 +2615,14 @@
         const normalizedPhysicalRole = String(physicalRole || '').trim().toUpperCase();
         const logicalRole = String(hydrated.logical_role || '').trim().toUpperCase();
         const stateLabel = logicalRole && logicalRole !== normalizedPhysicalRole
-            ? `${escapeText(logicalRole)} · ${state}`
-            : state;
+            ? `${escapeText(logicalRole)} · ${effectiveState}`
+            : effectiveState;
         const fromRole = String(hydrated.from_role || '').trim();
         const doneFrom = String(hydrated.done_from || '').trim();
         const sentTo = String(hydrated.sent_to || '').trim();
-        const detail = state === 'RUNNING' && fromRole
+        const detail = stalled
+            ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#efbb62;margin-top:1px;">Runner unavailable · recover existing flow</div>`
+            : state === 'RUNNING' && fromRole
             ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">From: ${escapeText(fromRole)}</div>`
             : state === 'DONE' && doneFrom
                 ? `<div id="mauto-flow-detail" style="font-size:8px;line-height:1.05;color:#999;margin-top:1px;">Done From: ${escapeText(doneFrom)}</div>${sentTo ? `<div id="mauto-flow-sent" style="font-size:8px;line-height:1.05;color:#9adfbe;">Sent to: ${escapeText(sentTo)}</div>` : ''}`

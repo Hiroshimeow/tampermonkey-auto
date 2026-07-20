@@ -9,6 +9,7 @@ import re
 
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -68,6 +69,8 @@ TERMINAL_STATES = {
     "ROLE_SET",
     "ROLE_TAKEOVER_RELOADING",
     "ROLE_TAKEOVER_FAILED",
+    "COMPOSER_TEXT_CLEARED",
+    "COMPOSER_TEXT_CLEAR_FAILED",
     "UNKNOWN_COMMAND",
     "ERROR_COMMAND",
 }
@@ -75,6 +78,19 @@ TERMINAL_STATES = {
 
 PAGE_HANDOFF_SAFE_ACTIONS = {"PROBE", "SYNC_TRANSCRIPT", "WAIT_ASSISTANT_DONE"}
 COMMAND_CANCEL_STATES = {"CANCELLED", "EXPIRED"}
+NON_TERMINAL_FLOW_STATES = {"RUNNING", "WAITING"}
+SEMANTIC_ROLE_EVENTS = {
+    "ROLE_CLAIMED",
+    "ROLE_RELEASED",
+    "COMMAND_CREATED",
+    "COMMAND_DELIVERED",
+    "COMMAND_CANCELLED",
+    "COMMAND_EXPIRED",
+}
+
+
+def _iso_from_epoch(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class StatusRequest(BaseModel):
@@ -155,6 +171,12 @@ class FlowStatusRequest(BaseModel):
     updates: Dict[str, Optional[Dict[str, Any]]] = Field(default_factory=dict)
 
 
+class FlowHeartbeatRequest(BaseModel):
+    run_id: str = ""
+    request_id: str = ""
+    pid: Optional[int] = None
+
+
 class TaskCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str
@@ -169,6 +191,7 @@ class TaskCreateRequest(BaseModel):
     status: str = "BACKLOG"
     enabled: bool = True
     schedule: Dict[str, Any] = Field(default_factory=lambda: {"kind": "manual"})
+    execution_options: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskPatchRequest(BaseModel):
@@ -251,7 +274,11 @@ class DiagnosticState:
             "auto_open_url": "https://chatgpt.com/",
             "auto_open_wait_s": 45,
             "auto_close_after_s": 600,
+            "runner_heartbeat_interval_s": 5,
+            "runner_stale_after_s": 20,
+            "command_stale_after_s": 120,
         }
+        self.runner_heartbeats: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def role_owner_matches(owner: Dict[str, Any] | None, owner_id: str, claim_id: str, page_instance_id: str) -> bool:
@@ -326,13 +353,99 @@ class DiagnosticState:
             result = self.command_results.get(command_id)
             return dict(result) if result is not None else None
 
-    def role_inventory(self) -> list[Dict[str, Any]]:
+    def configured_role_for(self, physical_role: str) -> str:
+        normalized = normalize_role(physical_role)
+        last_user = str(self.last_user_message.get(normalized) or "")
+        for pattern in (
+            r"(?m)^PROMPT_ROLE:\s*([A-Za-z0-9_-]+)\s*$",
+            r'"prompt_role"\s*:\s*"([A-Za-z0-9_-]+)"',
+        ):
+            match = re.search(pattern, last_user)
+            if match:
+                return normalize_role(match.group(1))
+        flow = self.flow_statuses.get(normalized) or {}
+        return normalize_role(flow.get("logical_role") or normalized)
+
+    def response_projection(self, physical_role: str) -> list[Dict[str, Any]]:
+        normalized = normalize_role(physical_role)
+        projected: list[Dict[str, Any]] = []
+        turn = 0
+        for message in self.transcripts.get(normalized, []):
+            if not isinstance(message, dict) or str(message.get("role") or "").lower() != "assistant":
+                continue
+            turn += 1
+            images = message.get("images")
+            image_count = len(images) if isinstance(images, list) else int(message.get("image_count") or 0)
+            text = str(message.get("text") or "")
+            projected.append({
+                "turn": turn,
+                "text": text,
+                "text_len": len(text),
+                "image_count": image_count,
+            })
+        return projected
+
+    @staticmethod
+    def is_semantic_role_event(event: Dict[str, Any]) -> bool:
+        name = str(event.get("event") or "").strip().upper()
+        if not name or name in {"SYNC", "SYNC_IGNORED", "REPORT_IGNORED"}:
+            return False
+        return bool(
+            name in SEMANTIC_ROLE_EVENTS
+            or name in TERMINAL_STATES
+            or name.startswith(("FLOW_", "ERROR_"))
+            or any(marker in name for marker in ("FAILED", "TIMEOUT", "BLOCKED"))
+        )
+
+    def role_timeline(self, physical_role: str, *, limit: int = 100) -> Dict[str, Any]:
+        normalized = normalize_role(physical_role)
+        bounded_limit = max(1, min(int(limit), 500))
         with self.lock:
-            roles = set(self.status) | set(self.role_seen_at) | set(self.role_owners) | set(self.dom_info) | set(self.commands) | set(self.flow_statuses)
+            raw_events = [
+                dict(event)
+                for event in self.events
+                if str(event.get("role") or "").strip().upper() == normalized
+            ]
+        meaningful = [event for event in raw_events if self.is_semantic_role_event(event)]
+        return {
+            "role": normalized,
+            "events": meaningful[-bounded_limit:],
+            "raw_event_count": len(raw_events),
+            "omitted_event_count": len(raw_events) - len(meaningful),
+        }
+
+    def role_inventory(self) -> list[Dict[str, Any]]:
+        """Return roles that are live or still own active operational work.
+
+        Historical status, DOM, transcript, and owner caches remain available from
+        the explicit per-role diagnostic endpoint, but must not keep deleted or
+        long-offline roles in the dashboard's live inventory forever.
+        """
+        with self.lock:
             tasks = self.task_store.list_tasks(include_archived=True)
+            roles: set[str] = set()
+
+            for role in self.role_seen_at:
+                normalized = normalize_role(role)
+                online, _ = self.role_is_online(normalized)
+                if online:
+                    roles.add(normalized)
+
+            for role in self.commands:
+                normalized = normalize_role(role)
+                if self.active_command(normalized):
+                    roles.add(normalized)
+
+            for role, flow in self.flow_statuses.items():
+                if str((flow or {}).get("state") or "").upper() in NON_TERMINAL_FLOW_STATES:
+                    roles.add(normalize_role(role))
+
             for task in tasks:
-                roles.add(task["controller_role"])
-                roles.update(task["physical_role_map"].values())
+                if task.get("archived_at") or not task_reserves_controller(task):
+                    continue
+                roles.add(normalize_role(task["controller_role"]))
+                roles.update(normalize_role(role) for role in task["physical_role_map"].values())
+
             result = []
             for role in sorted(roles):
                 normalized = normalize_role(role)
@@ -341,21 +454,37 @@ class DiagnosticState:
                 flow = dict(self.flow_statuses.get(normalized) or {})
                 active = self.active_command(normalized)
                 reserved_task = next(
-                    (task for task in tasks if task["controller_role"] == normalized and task_reserves_controller(task) and not task.get("archived_at")),
+                    (
+                        task for task in tasks
+                        if task_reserves_controller(task)
+                        and not task.get("archived_at")
+                        and (
+                            task["controller_role"] == normalized
+                            or normalized in set(task["physical_role_map"].values())
+                        )
+                    ),
                     None,
                 )
+                responses = self.response_projection(normalized)
                 result.append({
                     "role": normalized,
+                    "configured_role": self.configured_role_for(normalized),
+                    "turn": len(responses),
                     "online": online,
                     "status": "ONLINE" if online else "OFFLINE",
                     "last_seen_age_s": age,
                     "current_logical_role": flow.get("logical_role") or None,
+                    "current_flow_state": flow.get("state") or None,
                     "current_task_id": reserved_task["task_id"] if reserved_task else None,
                     "reservation_state": (
                         reserved_task["wake"]["state"] if reserved_task and reserved_task["wake"]["state"] in RESERVING_WAKE_STATES
                         else reserved_task["status"] if reserved_task else None
                     ),
                     "page_path": dom.get("page_path") or dom.get("pathname") or "",
+                    "page_instance_id": str((self.observation_pages.get(normalized) or {}).get("page_instance_id") or ""),
+                    "observation_seq": int((self.observation_pages.get(normalized) or {}).get("observation_seq") or 0),
+                    "bridge_version": str(dom.get("bridge_version") or ""),
+                    "dom_summary": self.dom_summary(dom),
                     "active_command": {
                         "command_id": active.get("command_id"),
                         "action": active.get("action"),
@@ -382,6 +511,7 @@ class DiagnosticState:
         resolved_run_id = str(run_id or resolved_request_id or "").strip()
         with self.lock:
             existing_requests = self.flow_store.document["requests"]
+            prior_projection = {role: dict(status) for role, status in self.flow_statuses.items()}
             effective_activate = activate or (not explicit_request_id and resolved_request_id not in existing_requests)
             self.flow_store.patch(
                 request_id=resolved_request_id,
@@ -393,7 +523,184 @@ class DiagnosticState:
                 terminal_status=terminal_status,
             )
             self.flow_statuses = self.flow_store.active_projection()
+            for role, status in updates.items():
+                normalized_role = normalize_role(role)
+                prior = prior_projection.get(normalized_role)
+                if status is None:
+                    if prior is not None:
+                        self.log(
+                            normalized_role,
+                            "FLOW_CLEARED",
+                            run_id=resolved_run_id,
+                            request_id=resolved_request_id,
+                        )
+                    continue
+                projected = self.flow_statuses.get(normalized_role) or status
+                evidence = {
+                    key: projected.get(key)
+                    for key in ("state", "logical_role", "from_role", "done_from", "sent_to")
+                    if projected.get(key) not in (None, "")
+                }
+                prior_evidence = {
+                    key: prior.get(key)
+                    for key in ("state", "logical_role", "from_role", "done_from", "sent_to")
+                    if prior and prior.get(key) not in (None, "")
+                }
+                if evidence != prior_evidence:
+                    self.log(
+                        normalized_role,
+                        f"FLOW_{str(projected.get('state') or 'UPDATED').upper()}",
+                        run_id=resolved_run_id,
+                        request_id=resolved_request_id,
+                        **evidence,
+                    )
             return {role: dict(status) for role, status in self.flow_statuses.items()}
+
+    def record_runner_heartbeat(self, run_id: str, request_id: str = "", pid: Optional[int] = None) -> str:
+        resolved_request_id = str(request_id or run_id or "").strip()
+        if not resolved_request_id:
+            raise ValueError("run_id or request_id is required")
+        with self.lock:
+            self.runner_heartbeats[resolved_request_id] = {
+                "ts": time.time(),
+                "run_id": str(run_id or resolved_request_id).strip(),
+                "pid": int(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None,
+            }
+        return resolved_request_id
+
+    def _runner_liveness(self, request_id: str, *, now: float) -> Dict[str, Any]:
+        stale_after = max(1.0, float(self.config.get("runner_stale_after_s", 20) or 20))
+        beat = self.runner_heartbeats.get(str(request_id or "").strip())
+        if not beat:
+            return {"state": "UNKNOWN", "last_heartbeat_at": None, "last_heartbeat_age_s": None, "pid": None}
+        age = max(0.0, now - float(beat.get("ts") or 0.0))
+        return {
+            "state": "RUNNING" if age <= stale_after else "STOPPED",
+            "last_heartbeat_at": _iso_from_epoch(beat.get("ts") or 0.0),
+            "last_heartbeat_age_s": age,
+            "pid": beat.get("pid"),
+        }
+
+    def _active_command_snapshot(self, physical_role: str, *, now: float) -> Optional[Dict[str, Any]]:
+        active = self.active_command(physical_role)
+        if not active:
+            return None
+        cmd_state = self.command_status.get(active.get("command_id"), active.get("status", "PENDING"))
+        delivered_at = active.get("delivered_at")
+        age = max(0.0, now - float(delivered_at)) if delivered_at else None
+        return {
+            "role": physical_role,
+            "action": active.get("action"),
+            "state": cmd_state,
+            "age_s": age,
+        }
+
+    @staticmethod
+    def _command_overdue(command: Optional[Dict[str, Any]], *, threshold: float) -> bool:
+        if not command:
+            return False
+        age = command.get("age_s")
+        return bool(
+            str(command.get("state") or "").upper() == "DELIVERED"
+            and isinstance(age, (int, float))
+            and age > threshold
+        )
+
+    def derive_flow_liveness(self, request_id: Optional[str] = None, *, now: Optional[float] = None) -> Dict[str, Any]:
+        """Reconcile the stored flow projection against runner liveness and command age.
+
+        A flow that is still marked RUNNING/WAITING but whose runner liveness is
+        unavailable (UNKNOWN after restart or STOPPED after a stale heartbeat),
+        or whose active command is stuck DELIVERED past the overdue window (E08),
+        is reported STALLED with recovery evidence rather than trusted as live.
+        """
+        now = time.time() if now is None else now
+        command_stale_after = max(1.0, float(self.config.get("command_stale_after_s", 120) or 120))
+        with self.lock:
+            document = self.flow_store.read(request_id)
+            flow = document.get("flow")
+            active_request_id = str(document.get("active_request_id") or "").strip()
+            resolved_request_id = ""
+            if flow:
+                resolved_request_id = str(flow.get("request_id") or "").strip()
+            if not resolved_request_id:
+                resolved_request_id = str(request_id or "").strip() or active_request_id
+            runner = self._runner_liveness(resolved_request_id, now=now)
+            result: Dict[str, Any] = {
+                "runner": runner,
+                "stalled": False,
+                "reason": "",
+                "role": None,
+                "logical_role": None,
+                "last_command": None,
+                "next_action": "",
+            }
+            if not flow or flow.get("terminal_status"):
+                return result
+
+            roles = flow.get("roles") or {}
+            selected: Optional[tuple[str, Dict[str, Any]]] = None
+            for physical, status in roles.items():
+                if str(status.get("state") or "").upper() == "RUNNING":
+                    selected = (physical, status)
+                    break
+            if selected is None:
+                for physical, status in roles.items():
+                    if str(status.get("state") or "").upper() in NON_TERMINAL_FLOW_STATES:
+                        selected = (physical, status)
+                        break
+            if selected is None:
+                return result
+
+            physical, status = selected
+            last_command = (
+                self._active_command_snapshot(physical, now=now)
+                if resolved_request_id == active_request_id
+                else None
+            )
+            command_overdue = self._command_overdue(last_command, threshold=command_stale_after)
+            runner_state = str(runner.get("state") or "").upper()
+            runner_unavailable = runner_state in {"UNKNOWN", "STOPPED"}
+            if not (runner_unavailable or command_overdue):
+                result["last_command"] = last_command
+                return result
+
+            if command_overdue and last_command:
+                reason = f"{last_command['action']} command did not terminate"
+            elif runner_state == "STOPPED":
+                reason = "runner stopped before terminalizing flow"
+            elif runner_state == "UNKNOWN":
+                reason = "runner heartbeat unavailable for active flow"
+            else:
+                reason = "flow made no progress within the liveness window"
+            result.update({
+                "stalled": True,
+                "reason": reason,
+                "role": physical,
+                "logical_role": status.get("logical_role") or physical,
+                "last_command": last_command,
+                "next_action": "recover existing flow",
+            })
+            return result
+
+    def flow_status_stalled(self, physical_role: str, flow_status: Optional[Dict[str, Any]], *, now: Optional[float] = None) -> bool:
+        """Per-role stall verdict for the single-tab userscript overlay."""
+        if not flow_status:
+            return False
+        if str(flow_status.get("state") or "").upper() not in NON_TERMINAL_FLOW_STATES:
+            return False
+        now = time.time() if now is None else now
+        command_stale_after = max(1.0, float(self.config.get("command_stale_after_s", 120) or 120))
+        with self.lock:
+            active_flow = self.flow_store.read(None).get("flow")
+            if not active_flow or active_flow.get("terminal_status"):
+                return False
+            request_id = str(active_flow.get("request_id") or "").strip()
+            runner = self._runner_liveness(request_id, now=now)
+            if str(runner.get("state") or "").upper() in {"UNKNOWN", "STOPPED"}:
+                return True
+            command = self._active_command_snapshot(normalize_role(physical_role), now=now)
+            return self._command_overdue(command, threshold=command_stale_after)
 
     def queue_auto_open_role(self, role: str, url: str = "") -> None:
         normalized = str(role or "").strip().upper()
@@ -448,6 +755,7 @@ class DiagnosticState:
         return {
             "composer": bool(dom.get("composer")),
             "composer_text_len": dom.get("composer_text_len"),
+            "composer_attachment_count": len(dom.get("composer_attachments") or []) if isinstance(dom.get("composer_attachments"), list) else 0,
             "send_enabled": dom.get("send_enabled"),
             "stop_visible": dom.get("stop_visible"),
             "voice_visible": dom.get("voice_visible"),
@@ -993,6 +1301,8 @@ def api_status(req: StatusRequest):
             )
 
         flow_status = None if clear_role else (dict(state.flow_statuses.get(normalized_role) or {}) or None)
+        if flow_status is not None:
+            flow_status["stalled"] = state.flow_status_stalled(normalized_role, flow_status)
     return {
         "command": cmd,
         "config": state.config,
@@ -1023,6 +1333,12 @@ def api_release_role(req: RoleReleaseRequest):
         released = bool(owner and state.role_owner_matches(owner, req.role_owner_id, req.role_claim_id, req.page_instance_id))
         if released:
             state.role_owners.pop(role, None)
+            # A successful explicit release removes live presence immediately.
+            # Historical diagnostic caches remain readable through
+            # /api/admin/role/{role}, but no longer keep the role in Live roles.
+            state.status.pop(role, None)
+            state.role_seen_at.pop(role, None)
+            state.current_sessions.pop(role, None)
     return {"released": released}
 
 
@@ -1080,9 +1396,20 @@ def api_admin_flow_status(req: FlowStatusRequest):
     return {"status": "OK", "flow_statuses": flow_statuses, "flow": state.flow_store.read(req.request_id or req.run_id)}
 
 
+@app.post("/api/admin/flow-heartbeat")
+def api_admin_flow_heartbeat(req: FlowHeartbeatRequest):
+    try:
+        request_id = state.record_runner_heartbeat(req.run_id, req.request_id, req.pid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "OK", "request_id": request_id}
+
+
 @app.get("/api/admin/flow")
 def api_admin_flow(request_id: str = ""):
-    return state.flow_store.read(request_id or None)
+    document = state.flow_store.read(request_id or None)
+    document["liveness"] = state.derive_flow_liveness(request_id or None)
+    return document
 
 
 def _validated_task_body(model_type, body: Any):
@@ -1233,7 +1560,8 @@ def api_route_catalog(base_url: str = ""):
         item("admin", "POST", "/api/admin/command", "Create a command for a role."),
         item("admin", "POST", "/api/admin/command/{command_id}/cancel", "Terminalize a stranded command as CANCELLED or EXPIRED."),
         item("admin", "POST", "/api/admin/flow-status", "Atomically patch durable request-keyed semantic role flow state."),
-        item("admin", "GET", "/api/admin/flow", "Read durable active or request-specific semantic flow state.", "/api/admin/flow?request_id=demo-request-id"),
+        item("admin", "POST", "/api/admin/flow-heartbeat", "Record a runner liveness heartbeat for a flow request so stalls surface as STALLED."),
+        item("admin", "GET", "/api/admin/flow", "Read durable flow state with derived runner liveness and stall evidence.", "/api/admin/flow?request_id=demo-request-id"),
         item("tasks", "GET", "/api/admin/tasks", "Read durable Kanban tasks and scheduler health."),
         item("tasks", "GET", "/api/admin/tasks/{task_id}", "Read one durable task.", "/api/admin/tasks/task-demo"),
         item("tasks", "POST", "/api/admin/tasks", "Create a validated dashboard task."),
@@ -1245,7 +1573,8 @@ def api_route_catalog(base_url: str = ""):
         item("tasks", "GET", "/api/admin/roles", "Read generic userscript role inventory and task reservations."),
         item("admin", "GET", "/api/admin/command/{command_id}", "Read command status/result.", "/api/admin/command/demo-command-id"),
         item("admin", "GET", "/api/admin/role/{role}", "Read role snapshot/cache.", "/api/admin/role/A"),
-        item("admin", "GET", "/api/admin/events", "Read recent event log.", "/api/admin/events?role=A&limit=20"),
+        item("admin", "GET", "/api/admin/role/{role}/timeline", "Read semantic role lifecycle events without raw poll noise.", "/api/admin/role/A/timeline?limit=20"),
+        item("admin", "GET", "/api/admin/events", "Read the separate raw diagnostic event log.", "/api/admin/events?role=A&limit=20"),
         item("admin", "GET", "/api/admin/config", "Read runtime config."),
         item("admin", "POST", "/api/admin/config", "Update runtime config."),
         item("admin", "GET", "/api/admin/routes", "List available server endpoints."),
@@ -1285,6 +1614,20 @@ def api_admin_role(role: str):
         dom_info = state.dom_info.get(normalized_role, {})
         last_user = state.last_user_message.get(normalized_role, "")
         last_response = state.last_response.get(normalized_role, "")
+        responses = state.response_projection(normalized_role)
+        flow_status = dict(state.flow_statuses.get(normalized_role) or {})
+        tasks = state.task_store.list_tasks(include_archived=False)
+        current_task = next(
+            (
+                task for task in tasks
+                if task_reserves_controller(task)
+                and (
+                    task.get("controller_role") == normalized_role
+                    or normalized_role in set((task.get("physical_role_map") or {}).values())
+                )
+            ),
+            None,
+        )
         observation_state = dict(state.observation_pages.get(normalized_role) or {})
         active = state.active_command(normalized_role)
         active_command = None
@@ -1313,6 +1656,14 @@ def api_admin_role(role: str):
         }
         return {
             "role": normalized_role,
+            "configured_role": state.configured_role_for(normalized_role),
+            "current_logical_role": flow_status.get("logical_role") or None,
+            "turn": len(responses),
+            "responses": responses,
+            "message_counts": state.dom_summary(dom_info).get("message_counts") or {},
+            "current_task_id": current_task.get("task_id") if current_task else None,
+            "current_request_id": flow_status.get("run_id") or (current_task.get("active_request_id") if current_task else None),
+            "flow_status": flow_status or None,
             "presence": presence,
             "observation": observation,
             "active_command": active_command,
@@ -1326,6 +1677,14 @@ def api_admin_role(role: str):
             "last_user": last_user,
             "last_response": last_response,
         }
+
+
+@app.get("/api/admin/role/{role}/timeline")
+def api_admin_role_timeline(role: str, limit: int = 100):
+    try:
+        return state.role_timeline(role, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/admin/events")

@@ -2,6 +2,27 @@
 
 All notable changes to the Tampermonkey bridge and its role orchestration flow are documented here.
 
+## [1.0.7] - 2026-07-19
+
+Version 1.0.7 replaces the runtime-summary dashboard with an online physical-role board and makes persisted task execution options the single source of launch-command evidence.
+
+### Role-board control surface
+
+- Render only online physical browser roles as selectable cards with configured/current logical role, turn, conversation, composer, task, command, and liveness evidence.
+- Add role-scoped response and event views using `/api/admin/role/{role}` and `/api/admin/events?role=...`, with newest-response focus limited to initial load and role changes.
+- Add exact-role `Clear txt`, `F5`, and task-creation controls. `CLEAR_COMPOSER_TEXT` succeeds only when composer text is empty and the real attachment count is unchanged.
+
+### Task execution contract
+
+- Add validated, migrated `execution_options` persistence with exact defaults for timeout, request timeout, parallelism, max turns, reload delay, new-chat handoff, and handoff command policy.
+- Replace raw comma/JSON workflow fields with ordered logical-role chips, live physical-role mapping, bounded numeric inputs, approved behavior toggles, prompt samples, and an exact live `main.py` command preview.
+- Include persisted execution options and the generated command in scheduler wake evidence; create/edit/PATCH flows preserve optimistic revisions and restore the full editor state.
+
+### Verification
+
+- Advance dashboard contract version to 9 and userscript bridge version to 1.0.7.
+- Add role projection, execution-option migration/API, generated-command, clear-text terminal-state, attachment-preservation, and dashboard role-board contract coverage.
+
 ## [1.0.6] - 2026-07-19
 
 Version 1.0.6 turns the read-only flow page into a durable Kanban task control plane while preserving the accepted userscript transport and role-flow behavior.
@@ -27,10 +48,33 @@ Version 1.0.6 turns the read-only flow page into a durable Kanban task control p
 - Poll tasks, role inventory, and durable flow independently while retaining last-good data and exposing store, scheduler, connection, and revision conflicts.
 - Expose userscript transport and future target metadata as display-only seams; Phase 06 browser-target controls remain absent.
 
+### Runtime-first dashboard
+
+- Replace the empty-board-first layout with runtime roles, active flow, scheduler/task-store health, and recent server events.
+- Surface compact status-poll evidence for each live role: page, composer, generation, send state, message counts, bridge version, observation generation, logical role, command, and reservation.
+- Keep the Kanban implementation available, but hide all six columns when the task store is empty and show one actionable `No tasks configured` state instead.
+- Restrict `/api/admin/roles` to fresh presence or active operational ownership so deleted and long-offline historical roles no longer remain in Live roles forever.
+- Preserve offline roles only while they still own a nonterminal flow, active command, or controller-reserving task.
+
+### Operator-focused dashboard simplification
+
+- Keep search and state filtering visible while moving controller, repository, schedule, and archived filters behind one `More filters` disclosure.
+- Keep only `Run now` and `Pause/Resume` visible on task cards; group edit, uncertain-wake resolution, state move, and archive under `More actions`.
+- Reduce the create/edit form to the core task fields by default and group workflow mapping, scheduling, and execution-result fields into explicit advanced sections.
+- Add a compact runner health pill showing the effective runner state, PID, and heartbeat age; terminal flows render `IDLE` instead of a misleading missing-heartbeat warning.
+- Add dashboard contract coverage for the simplified interaction hierarchy and duplicate/malformed structural markers.
+
+### Stall detection (E09/E08)
+
+- Add a lightweight runner liveness heartbeat: `main.py` posts `/api/admin/flow-heartbeat` on a fixed interval while a flow is active and stops on finalize, so a crashed or killed runner is detectable without a run lease or workflow checkpoint.
+- Reconcile the stored flow projection against runner liveness and command age in `/api/admin/flow`: a flow still marked `RUNNING`/`WAITING` whose runner stopped heartbeating (E09) or whose active command is stuck `DELIVERED` past the overdue window (E08) is reported `STALLED` with the reason, last command, runner state, heartbeat age, and recovery next action instead of a stale `RUNNING`.
+- Surface the per-role stall verdict on the single-tab poll response so the userscript overlay renders `STALLED` instead of a live `RUNNING`, and render the full stall evidence block on the dashboard.
+
 ### Documentation and verification
 
 - Update `skills/ORCHESTRATOR.md` with exact task claim, mutation, conflict, duplicate-flow, and wake-resolution rules.
 - Add focused task store, scheduler, server API, and dashboard contract coverage.
+- Add E09/E08 regression coverage: stopped-runner and stuck-`DELIVERED` flows must surface `STALLED`, terminal and fresh flows must not, and the runner heartbeat must start with the flow and stop on finalize.
 
 ## [1.0.5] - 2026-07-18
 

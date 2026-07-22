@@ -1,7 +1,8 @@
 # Tampermonkey Auto Role Runner
 
 This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript.
-![Uploading {30DC0FBB-26F3-4275-92D7-DF8A31F73D24}.png…]()
+<img width="1182" height="1124" alt="image" src="https://github.com/user-attachments/assets/a090332b-dc24-4c35-a419-5510da761a57" />
+
 
 It has two common entrypoints:
 

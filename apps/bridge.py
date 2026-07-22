@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import urllib.error
@@ -14,7 +15,21 @@ from apps.constants import (
     DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
     DEFAULT_RESPONSE_RECOVERY_POLL_S,
     DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
+    DEFAULT_RESPONSE_STABLE_CONFIRM_S,
 )
+
+
+EXPIRABLE_COMMANDS = {
+    "PROBE",
+    "SYNC_TRANSCRIPT",
+    "CLICK_CHOICE_PROMPT",
+    "NEW_CHAT",
+    "NAVIGATE_NEW",
+    "RESET_PAGE",
+    "RELOAD_PAGE",
+    "RELOAD",
+    "HARD_RELOAD",
+}
 
 
 class ManualInputPendingError(Exception):
@@ -38,6 +53,8 @@ class ResponseActivity:
     assistant_count: int
     image_count: int
     last_user_text: str
+    page_instance_id: str
+    observation_seq: int
 
     @property
     def response_len(self) -> int:
@@ -74,6 +91,34 @@ class BridgeClient:
         self.request_timeout_s = request_timeout_s
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    @staticmethod
+    def _operation_deadline(timeout_s: float, deadline: float | None = None) -> float:
+        if deadline is not None:
+            return float(deadline)
+        return time.monotonic() + max(0.1, float(timeout_s))
+
+    @staticmethod
+    def _remaining_time(deadline: float, *, context: str = "operation") -> float:
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"{context} exhausted remaining deadline budget")
+        return remaining
+
+    @classmethod
+    def _bounded_timeout(
+        cls,
+        deadline: float,
+        limit_s: float | None = None,
+        *,
+        context: str = "operation",
+    ) -> float:
+        remaining = cls._remaining_time(deadline, context=context)
+        return remaining if limit_s is None else min(max(0.0, float(limit_s)), remaining)
+
+    def _sleep_bounded(self, seconds: float, deadline: float, *, context: str = "operation") -> None:
+        remaining = self._remaining_time(deadline, context=context)
+        self.sleep(min(max(0.0, float(seconds)), remaining))
+
     def json_request(
         self,
         method: str,
@@ -99,14 +144,25 @@ class BridgeClient:
             raise RuntimeError(f"Cannot connect to {url}: {exc.reason}") from exc
 
     def call_browser_role(self, browser_role: str, prompt: str, timeout_s: float) -> str:
-        snapshot = self.role_snapshot(browser_role)
+        deadline = self._operation_deadline(timeout_s)
+        snapshot = self.role_snapshot(
+            browser_role,
+            timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} preflight snapshot"),
+        )
         self.ensure_role_online(browser_role, snapshot)
         baseline = self.response_activity(snapshot)
-        self.set_prompt(browser_role, prompt, timeout_s)
-        return self.send_current_prompt_and_wait(browser_role, timeout_s, prompt=prompt, baseline=baseline)
+        self.set_prompt(browser_role, prompt, timeout_s, _deadline=deadline)
+        return self.send_current_prompt_and_wait(
+            browser_role,
+            timeout_s,
+            prompt=prompt,
+            baseline=baseline,
+            _deadline=deadline,
+        )
 
-    @staticmethod
-    def ensure_role_online(browser_role: str, snapshot: dict[str, Any]) -> None:
+    @classmethod
+    def ensure_role_online(cls, browser_role: str, snapshot: dict[str, Any]) -> None:
+        snapshot = cls._mapping(snapshot, "snapshot")
         status = str(snapshot.get("status") or "").upper()
         if snapshot.get("online") is False or status == "OFFLINE":
             age = snapshot.get("last_seen_age_s")
@@ -125,13 +181,35 @@ class BridgeClient:
     def composer_matches_prompt(cls, activity: ResponseActivity, prompt: str) -> bool:
         return cls.normalize_composer_text(activity.composer_text) == cls.normalize_composer_text(prompt)
 
-    def set_prompt(self, browser_role: str, prompt: str, timeout_s: float, *, force_replace: bool = False) -> dict[str, Any]:
+    def set_prompt(
+        self,
+        browser_role: str,
+        prompt: str,
+        timeout_s: float,
+        *,
+        force_replace: bool = False,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
         del force_replace
-        deadline = time.time() + max(1.0, timeout_s)
-        activity = self.response_activity(self.role_snapshot(browser_role))
-        while activity.active and time.time() < deadline:
-            self.wait_for_current_response(browser_role, max(1.0, deadline - time.time()))
-            activity = self.response_activity(self.role_snapshot(browser_role))
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        activity = self.response_activity(
+            self.role_snapshot(
+                browser_role,
+                timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} prompt snapshot"),
+            )
+        )
+        while activity.active:
+            self.wait_for_current_response(
+                browser_role,
+                timeout_s,
+                _deadline=deadline,
+            )
+            activity = self.response_activity(
+                self.role_snapshot(
+                    browser_role,
+                    timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} prompt snapshot"),
+                )
+            )
 
         if activity.composer_attachment_count > 0:
             raise ManualInputPendingError(
@@ -148,14 +226,16 @@ class BridgeClient:
                 browser_role,
                 "SET_PROMPT",
                 {"text": prompt, "method": "auto", "expected_text": prompt},
-                max(1.0, deadline - time.time()),
+                self._bounded_timeout(deadline, context=f"{browser_role} SET_PROMPT"),
                 "PASTE_CONFIRMED",
+                _deadline=deadline,
             )
 
         self.wait_for_stable_expected_prompt(
             browser_role,
             prompt,
-            max(1.0, deadline - time.time()),
+            timeout_s,
+            _deadline=deadline,
         )
         return result
 
@@ -166,13 +246,20 @@ class BridgeClient:
         timeout_s: float,
         poll_s: float = 0.1,
         stable_samples: int = 2,
+        *,
+        _deadline: float | None = None,
     ) -> ResponseActivity:
-        deadline = time.time() + max(1.0, timeout_s)
+        deadline = self._operation_deadline(timeout_s, _deadline)
         stable = 0
         last_normalized: str | None = None
         last_activity: ResponseActivity | None = None
-        while time.time() < deadline:
-            activity = self.response_activity(self.role_snapshot(browser_role))
+        while time.monotonic() < deadline:
+            activity = self.response_activity(
+                self.role_snapshot(
+                    browser_role,
+                    timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} prompt readiness"),
+                )
+            )
             last_activity = activity
             normalized = self.normalize_composer_text(activity.composer_text)
             expected = self.normalize_composer_text(prompt)
@@ -183,9 +270,6 @@ class BridgeClient:
                     )
                 stable = 0
             elif activity.composer_attachment_count > 0:
-                # ChatGPT can briefly expose an "uploading" attachment while it
-                # processes an automation-owned prompt. Preserve ownership and
-                # wait for the same prompt to become send-ready.
                 stable = 0
             elif activity.composer_exists and activity.send_enabled is True:
                 stable = stable + 1 if normalized == last_normalized else 1
@@ -194,7 +278,7 @@ class BridgeClient:
             else:
                 stable = 0
             last_normalized = normalized
-            self.sleep(max(0.01, poll_s))
+            self._sleep_bounded(max(0.01, poll_s), deadline, context=f"{browser_role} prompt readiness")
         if last_activity and not self.composer_matches_prompt(last_activity, prompt):
             raise ManualInputPendingError(
                 f"{browser_role} composer no longer contains the expected automation prompt",
@@ -204,8 +288,16 @@ class BridgeClient:
         raise RuntimeError(f"{browser_role} composer did not become stable and send-ready before timeout")
 
     def upload_files(self, browser_role: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        self.wait_until_clean_ready(browser_role, timeout_s)
-        return self._run_command(browser_role, "UPLOAD_FILES", payload, timeout_s, "UPLOAD_FILES_DONE")
+        deadline = self._operation_deadline(timeout_s)
+        self.wait_until_clean_ready(browser_role, timeout_s, _deadline=deadline)
+        return self._run_command(
+            browser_role,
+            "UPLOAD_FILES",
+            payload,
+            self._bounded_timeout(deadline, context=f"{browser_role} UPLOAD_FILES"),
+            "UPLOAD_FILES_DONE",
+            _deadline=deadline,
+        )
 
     @classmethod
     def has_send_evidence(cls, activity: ResponseActivity, baseline: ResponseActivity) -> bool:
@@ -232,20 +324,45 @@ class BridgeClient:
         *,
         prompt: str | None = None,
         baseline: ResponseActivity | None = None,
+        _deadline: float | None = None,
     ) -> str:
-        before_send = self.response_activity(self.role_snapshot(browser_role))
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        before_send = self.response_activity(
+            self.role_snapshot(
+                browser_role,
+                timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} pre-send snapshot"),
+            )
+        )
         response_baseline = baseline or before_send
         payload = {"expected_text": prompt or ""}
         try:
-            self._run_command(browser_role, "CLICK_SEND", payload, timeout_s, "SEND_ACCEPTED")
+            self._run_command(
+                browser_role,
+                "CLICK_SEND",
+                payload,
+                self._bounded_timeout(deadline, context=f"{browser_role} CLICK_SEND"),
+                "SEND_ACCEPTED",
+                _deadline=deadline,
+            )
         except RuntimeError as exc:
-            activity = self.response_activity(self.role_snapshot(browser_role), previous_response=response_baseline.response)
+            activity = self.response_activity(
+                self.role_snapshot(
+                    browser_role,
+                    timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} send recovery snapshot"),
+                ),
+                previous_response=response_baseline.response,
+            )
             if prompt and self.has_send_evidence(activity, response_baseline):
                 print(
                     f"[send-recover] role={browser_role} {exc}; send evidence detected, waiting for fresh response",
                     flush=True,
                 )
-                return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
+                return self.wait_assistant_done(
+                    browser_role,
+                    timeout_s,
+                    baseline=response_baseline,
+                    _deadline=deadline,
+                )
             if prompt and self.composer_matches_prompt(activity, prompt):
                 print(
                     f"[send-recover] role={browser_role} {exc}; expected prompt still present, retrying click once in place",
@@ -256,12 +373,23 @@ class BridgeClient:
                     prompt,
                     timeout_s,
                     stable_samples=1,
+                    _deadline=deadline,
                 )
                 try:
-                    self._run_command(browser_role, "CLICK_SEND", payload, timeout_s, "SEND_ACCEPTED")
+                    self._run_command(
+                        browser_role,
+                        "CLICK_SEND",
+                        payload,
+                        self._bounded_timeout(deadline, context=f"{browser_role} CLICK_SEND retry"),
+                        "SEND_ACCEPTED",
+                        _deadline=deadline,
+                    )
                 except RuntimeError as retry_exc:
                     final_activity = self.response_activity(
-                        self.role_snapshot(browser_role),
+                        self.role_snapshot(
+                            browser_role,
+                            timeout_s=self._bounded_timeout(deadline, context=f"{browser_role} final send snapshot"),
+                        ),
                         previous_response=response_baseline.response,
                     )
                     if self.has_send_evidence(final_activity, response_baseline):
@@ -269,7 +397,12 @@ class BridgeClient:
                             f"[send-recover] role={browser_role} {retry_exc}; final send evidence detected after retry, waiting for fresh response",
                             flush=True,
                         )
-                        return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
+                        return self.wait_assistant_done(
+                            browser_role,
+                            timeout_s,
+                            baseline=response_baseline,
+                            _deadline=deadline,
+                        )
                     raise
             elif prompt:
                 raise ManualInputPendingError(
@@ -277,7 +410,12 @@ class BridgeClient:
                 ) from exc
             else:
                 raise
-        return self.wait_assistant_done(browser_role, timeout_s, baseline=response_baseline)
+        return self.wait_assistant_done(
+            browser_role,
+            timeout_s,
+            baseline=response_baseline,
+            _deadline=deadline,
+        )
 
     def wait_assistant_done(
         self,
@@ -285,53 +423,75 @@ class BridgeClient:
         timeout_s: float,
         *,
         baseline: ResponseActivity | None = None,
+        _deadline: float | None = None,
     ) -> str:
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        remaining = self._remaining_time(deadline, context=f"{browser_role} WAIT_ASSISTANT_DONE")
+        if remaining < 2.0:
+            raise RuntimeError(
+                f"{browser_role} WAIT_ASSISTANT_DONE cannot fit the minimum browser timeout and outer grace "
+                "in the remaining deadline budget"
+            )
+        browser_timeout_ms = max(1_000, math.ceil((remaining - 1.0) * 1_000))
         final = self.run_command(
             browser_role,
             "WAIT_ASSISTANT_DONE",
-            {"timeout_ms": max(1_000, int(timeout_s * 1_000) - 1_000)},
-            timeout_s,
+            {"timeout_ms": browser_timeout_ms},
+            self._bounded_timeout(deadline, context=f"{browser_role} WAIT_ASSISTANT_DONE result"),
+            _deadline=deadline,
         )
         status = str(final.get("status") or "")
         result = final.get("result") or {}
-        if status != "ASSISTANT_DONE":
-            if status == "ASSISTANT_TIMEOUT" or not final.get("done"):
-                return self.recover_response_after_reload(
-                    browser_role,
-                    timeout_s,
-                    require_response=True,
-                    baseline=baseline,
-                    require_fresh=baseline is not None,
-                )
-            if status == "ERROR_COMMAND":
-                reason = str(result.get("reason") or "unknown")
-                print(
-                    f"[response-watch] role={browser_role} WAIT_ASSISTANT_DONE returned ERROR_COMMAND "
-                    f"reason={reason}; recovering current response",
-                    flush=True,
-                )
-                return self.wait_for_current_response(
-                    browser_role,
-                    timeout_s,
-                    require_response=True,
-                    baseline=baseline,
-                    require_fresh=baseline is not None,
-                )
-            raise RuntimeError(f"{browser_role} WAIT_ASSISTANT_DONE failed: expected ASSISTANT_DONE, got {status or 'timeout'}")
-        response = str(result.get("text") or "").strip()
-        if self.looks_incomplete_response(response) or (baseline is not None and response == baseline.response):
-            print(
-                f"[response-watch] role={browser_role} assistant_done text is incomplete or stale; syncing transcript again",
-                flush=True,
+        command_reason = str((result.get("result") or {}).get("reason") or result.get("reason") or "")
+        response = str(result.get("text") or "")
+        result_dom_info = result.get("dom_info") if isinstance(result.get("dom_info"), dict) else {}
+        result_meta = result.get("result") if isinstance(result.get("result"), dict) else {}
+        result_snapshot = {
+            "last_response": response,
+            "dom_info": result_dom_info,
+            "observation": {
+                "page_instance_id": str(result_dom_info.get("page_instance_id") or ""),
+                "observation_seq": result_dom_info.get("observation_seq") or 0,
+            },
+        }
+        result_activity = self.response_activity(result_snapshot)
+        browser_proof_complete = bool(
+            status == "ASSISTANT_DONE"
+            and not self.looks_incomplete_response(response)
+            and self._int_value(result_meta.get("stable_samples")) >= 2
+            and result_activity.composer_exists
+            and not result_activity.stop_visible
+            and not result_activity.manual_input_pending
+        )
+        if browser_proof_complete and (baseline is None or response != baseline.response):
+            return response
+
+        recoverable = bool(
+            status in {"ASSISTANT_DONE", "ASSISTANT_TIMEOUT", "EXPIRED"}
+            or not final.get("done")
+            or (status == "CANCELLED" and command_reason == "owner_page_replaced")
+            or status == "ERROR_COMMAND"
+        )
+        if not recoverable:
+            raise RuntimeError(
+                f"{browser_role} WAIT_ASSISTANT_DONE failed: expected recoverable terminal state, "
+                f"got {status or 'timeout'} reason={command_reason or 'none'}"
             )
-            return self.wait_for_current_response(
-                browser_role,
-                timeout_s,
-                require_response=True,
-                baseline=baseline,
-                require_fresh=baseline is not None,
-            )
-        return response
+
+        print(
+            f"[response-watch] role={browser_role} terminal={status or 'timeout'} "
+            f"reason={command_reason or 'none'}; verifying stable current response",
+            flush=True,
+        )
+        return self.wait_for_current_response(
+            browser_role,
+            timeout_s,
+            require_response=True,
+            baseline=baseline,
+            require_fresh=baseline is not None,
+            allow_reload=not (status == "CANCELLED" and command_reason == "owner_page_replaced"),
+            _deadline=deadline,
+        )
 
     def _run_command(
         self,
@@ -340,46 +500,197 @@ class BridgeClient:
         payload: dict[str, Any],
         timeout_s: float,
         expected_status: str,
+        *,
+        _deadline: float | None = None,
     ) -> dict[str, Any]:
-        result = self.run_command(role, action, payload, timeout_s)
+        result = self.run_command(role, action, payload, timeout_s, _deadline=_deadline)
         status = str(result.get("status") or "")
         if status != expected_status:
             raise RuntimeError(f"{role} {action} failed: expected {expected_status}, got {status or 'timeout'}")
         return result
 
-    def run_command(self, role: str, action: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        command_id = self.create_command(role, action, payload)
+    def run_command(
+        self,
+        role: str,
+        action: str,
+        payload: dict[str, Any],
+        timeout_s: float,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        command_id = self.create_command(
+            role,
+            action,
+            payload,
+            timeout_s=self._bounded_timeout(deadline, context=f"{role} {action} create"),
+        )
         if not command_id:
             raise RuntimeError(f"{role} {action} returned no command id")
-        return self.wait_command(command_id, timeout_s)
+        return self.wait_command(command_id, timeout_s, _deadline=deadline)
 
-    def create_command(self, role: str, action: str, payload: dict[str, Any] | None = None) -> str:
-        data = self.json_request("POST", "/api/admin/command", {"role": role, "action": action, "payload": payload or {}})
+    def create_command(
+        self,
+        role: str,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> str:
+        data = self.json_request(
+            "POST",
+            "/api/admin/command",
+            {"role": role, "action": action, "payload": payload or {}},
+            timeout_s=timeout_s,
+        )
         return str((data.get("command") or {}).get("command_id") or "")
 
-    def wait_command(self, command_id: str, timeout_s: float) -> dict[str, Any]:
-        deadline = time.time() + timeout_s
-        last = {}
-        while time.time() < deadline:
-            last = self.json_request("GET", f"/api/admin/command/{urllib.parse.quote(command_id)}")
+    def update_flow_statuses(
+        self,
+        run_id: str,
+        updates: dict[str, dict[str, Any] | None],
+        *,
+        request_id: str = "",
+        parent_request_id: str | None = None,
+        goal_hash: str | None = None,
+        terminal_status: str | None = None,
+        activate: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"run_id": run_id, "updates": updates}
+        if request_id:
+            payload["request_id"] = request_id
+        if parent_request_id is not None:
+            payload["parent_request_id"] = parent_request_id
+        if goal_hash is not None:
+            payload["goal_hash"] = goal_hash
+        if terminal_status is not None:
+            payload["terminal_status"] = terminal_status
+        if activate:
+            payload["activate"] = True
+        return self.json_request("POST", "/api/admin/flow-status", payload)
+
+    def send_flow_heartbeat(
+        self,
+        run_id: str,
+        *,
+        request_id: str = "",
+        pid: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"run_id": run_id}
+        if request_id:
+            payload["request_id"] = request_id
+        if pid is not None:
+            payload["pid"] = pid
+        return self.json_request("POST", "/api/admin/flow-heartbeat", payload, timeout_s=timeout_s)
+
+    def cancel_command(
+        self,
+        command_id: str,
+        state: str,
+        reason: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        return self.json_request(
+            "POST",
+            f"/api/admin/command/{urllib.parse.quote(command_id)}/cancel",
+            {"state": state, "reason": reason},
+            timeout_s=timeout_s,
+        )
+
+    def wait_command(
+        self,
+        command_id: str,
+        timeout_s: float,
+        *,
+        expire_on_timeout: bool = False,
+        expire_reason: str = "command_timeout",
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        last: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            last = self.json_request(
+                "GET",
+                f"/api/admin/command/{urllib.parse.quote(command_id)}",
+                timeout_s=self._bounded_timeout(deadline, context=f"command {command_id} poll"),
+            )
             status = str(last.get("status") or "")
-            if last.get("done") or re.search(r"DONE|FAILED|ERROR|UNKNOWN|RELOADING|NAVIGATING|SAVED", status):
+            if last.get("done") or re.search(
+                r"DONE|FAILED|ERROR|UNKNOWN|RELOADING|NAVIGATING|SAVED|CANCELLED|EXPIRED",
+                status,
+            ):
                 return last
-            time.sleep(0.5)
+            remaining = deadline - time.monotonic()
+            if expire_on_timeout and remaining <= 0.5:
+                return self.cancel_command(
+                    command_id,
+                    "EXPIRED",
+                    expire_reason,
+                    timeout_s=max(0.001, remaining),
+                )
+            self._sleep_bounded(0.5, deadline, context=f"command {command_id} poll")
         return last
 
-    def command_roundtrip(self, role: str, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
-        command_id = self.create_command(role, action, {"source": "main_preflight"})
+    def command_roundtrip(
+        self,
+        role: str,
+        action: str,
+        timeout_s: float = 20.0,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        command_id = self.create_command(
+            role,
+            action,
+            {"source": "main_preflight"},
+            timeout_s=self._bounded_timeout(deadline, context=f"{role} {action} create"),
+        )
         if not command_id:
             return {"ok": False, "status": "NO_COMMAND_ID", "done": False}
-        result = self.wait_command(command_id, timeout_s)
-        return {"ok": bool(result.get("done")), "command_id": command_id, **result}
+        normalized_action = str(action or "").upper()
+        result = self.wait_command(
+            command_id,
+            timeout_s,
+            expire_on_timeout=normalized_action in EXPIRABLE_COMMANDS,
+            expire_reason=f"{normalized_action.lower()}_timeout",
+            _deadline=deadline,
+        )
+        ok = bool(result.get("done")) and str(result.get("status") or "") not in {"CANCELLED", "EXPIRED"}
+        return {"ok": ok, "command_id": command_id, **result}
 
-    def role_snapshot(self, role: str) -> dict[str, Any]:
-        return self.json_request("GET", f"/api/admin/role/{urllib.parse.quote(role)}")
+    def role_snapshot(self, role: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        return self.json_request(
+            "GET",
+            f"/api/admin/role/{urllib.parse.quote(role)}",
+            timeout_s=timeout_s,
+        )
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+
+    @staticmethod
+    def _mapping(value: Any, field: str) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        return value
+
+    @classmethod
+    def _mapping_field(cls, parent: dict[str, Any], field: str, parent_name: str) -> dict[str, Any]:
+        if field not in parent:
+            return {}
+        return cls._mapping(parent[field], f"{parent_name}.{field}")
+
+    @staticmethod
+    def _list_field(parent: dict[str, Any], field: str, parent_name: str) -> list[Any]:
+        if field not in parent:
+            return []
+        value = parent[field]
+        if not isinstance(value, list):
+            raise ValueError(f"{parent_name}.{field} must be a list")
+        return value
 
     @staticmethod
     def _int_value(value: Any, default: int = 0) -> int:
@@ -420,16 +731,18 @@ class BridgeClient:
 
     @classmethod
     def response_activity(cls, snapshot: dict[str, Any], previous_response: str = "") -> ResponseActivity:
-        dom_info = snapshot.get("dom_info") or {}
-        messages = dom_info.get("messages") or {}
-        counts = messages.get("counts") or {}
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
+        messages = cls._mapping_field(dom_info, "messages", "snapshot.dom_info")
+        counts = cls._mapping_field(messages, "counts", "snapshot.dom_info.messages")
         last_user = messages.get("last_user") or {}
         last_user_text = str(last_user.get("text") or "") if isinstance(last_user, dict) else ""
-        response = str(snapshot.get("last_response") or "").strip()
+        observation = cls._mapping_field(snapshot, "observation", "snapshot")
+        response = str(snapshot.get("last_response") or "")
         composer_text = str(dom_info.get("composer_text") or "")
         composer_text_len = cls._int_value(dom_info.get("composer_text_len"), len(composer_text))
-        attachments = dom_info.get("composer_attachments") or []
-        choice_candidates = dom_info.get("choice_prompt_candidates") or []
+        attachments = cls._list_field(dom_info, "composer_attachments", "snapshot.dom_info")
+        choice_candidates = cls._list_field(dom_info, "choice_prompt_candidates", "snapshot.dom_info")
         choice_labels = tuple(
             label
             for label in (
@@ -459,6 +772,12 @@ class BridgeClient:
             assistant_count=cls._int_value(counts.get("assistant")),
             image_count=cls._int_value(counts.get("images")),
             last_user_text=last_user_text,
+            page_instance_id=str(
+                dom_info.get("page_instance_id")
+                or observation.get("page_instance_id")
+                or ""
+            ),
+            observation_seq=cls._int_value(observation.get("observation_seq")),
         )
 
     @staticmethod
@@ -490,12 +809,16 @@ class BridgeClient:
         value = str(text or "").strip()
         if not value:
             return True
-        if value.count("```") % 2 == 1:
+        without_language_label = re.sub(r"(?is)^json\b\s*", "", value, count=1).strip()
+        if not without_language_label:
             return True
-        without_language_label = re.sub(r"(?is)^json\s*", "", value).strip()
-        if re.match(r"(?is)^(?:json\s*)?\{\s*$", value):
+        if without_language_label.count("```") % 2 == 1:
             return True
-        if without_language_label.startswith("{") or re.search(r"(?is)```json", value):
+        if re.fullmatch(r"(?is)```\s*(?:json)?\s*```", without_language_label):
+            return True
+        if re.match(r"(?is)^\{\s*$", without_language_label):
+            return True
+        if without_language_label.startswith("{") or re.search(r"(?is)```\s*json", without_language_label):
             depth = 0
             in_string = False
             escape = False
@@ -528,84 +851,147 @@ class BridgeClient:
         require_response: bool = False,
         baseline: ResponseActivity | None = None,
         require_fresh: bool = False,
+        allow_reload: bool = True,
+        stable_confirm_s: float = DEFAULT_RESPONSE_STABLE_CONFIRM_S,
+        *,
+        _deadline: float | None = None,
     ) -> str:
-        deadline = time.time() + max(1.0, timeout_s)
-        cycle_started = time.time()
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        cycle_started = time.monotonic()
         last_response = ""
         last_logged_bucket = -1
         last_activity: ResponseActivity | None = None
         active_reload_used = False
+        stable_key: tuple[str, int, str] | None = None
+        stable_samples = 0
+        stable_since = 0.0
+        stable_last_seq = 0
+        strongest_key: tuple[str, int, str] | None = None
+        strongest_response = ""
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                self.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=20.0)
-                activity = self.response_activity(self.role_snapshot(role), previous_response=last_response)
+                self.command_roundtrip(
+                    role,
+                    "SYNC_TRANSCRIPT",
+                    timeout_s=self._bounded_timeout(deadline, 20.0, context=f"{role} transcript sync"),
+                    _deadline=deadline,
+                )
+                activity = self.response_activity(
+                    self.role_snapshot(
+                        role,
+                        timeout_s=self._bounded_timeout(deadline, context=f"{role} response snapshot"),
+                    ),
+                    previous_response=last_response,
+                )
             except Exception as exc:
                 print(f"[response-watch] role={role} transient snapshot/sync failure: {exc}; waiting", flush=True)
-                self.sleep(max(0.1, poll_s))
+                self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} response recovery")
                 continue
+
             last_activity = activity
-            last_response = activity.response or last_response
+            last_response = activity.response
 
             if self.is_manual_input_pending(activity):
+                stable_key = None
+                stable_samples = 0
                 print(
                     f"[response-watch] role={role} manual_input_pending=true "
                     f"composer_len={activity.composer_text_len} attachments={activity.composer_attachment_count}; "
                     "waiting without send/reload",
                     flush=True,
                 )
-                self.sleep(max(0.1, poll_s))
+                self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} manual input wait")
                 continue
 
             if activity.blocked_by_choice_prompt:
+                stable_key = None
+                stable_samples = 0
                 labels = ", ".join(activity.choice_prompt_labels[:5]) or "unknown"
                 print(
                     f"[response-watch] role={role} choice prompt pending labels={labels}; clicking safe choice",
                     flush=True,
                 )
-                result = self.command_roundtrip(role, "CLICK_CHOICE_PROMPT", timeout_s=20.0)
+                result = self.command_roundtrip(
+                    role,
+                    "CLICK_CHOICE_PROMPT",
+                    timeout_s=self._bounded_timeout(deadline, 20.0, context=f"{role} choice prompt"),
+                    _deadline=deadline,
+                )
                 status = str(result.get("status") or "")
                 if status != "CHOICE_PROMPT_CLICKED":
                     raise RuntimeError(
                         f"{role} choice prompt blocked response recovery and could not be resolved: "
                         f"status={status or 'timeout'} labels={labels}",
                     )
-                self.sleep(max(0.5, poll_s))
+                self._sleep_bounded(max(0.5, poll_s), deadline, context=f"{role} choice prompt settle")
                 last_logged_bucket = -1
                 continue
+
+            fresh = not require_fresh or self.is_fresh_response(activity, baseline)
+            complete = bool(
+                activity.has_response
+                and fresh
+                and activity.composer_exists
+                and not activity.stop_visible
+                and not self.looks_incomplete_response(activity.response)
+            )
+            candidate_key = (activity.response, activity.assistant_count, activity.page_instance_id)
+            shorter_prefix = bool(
+                strongest_key
+                and strongest_key[1:] == candidate_key[1:]
+                and strongest_response.startswith(activity.response)
+                and len(activity.response) < len(strongest_response)
+            )
+
+            if complete and not shorter_prefix:
+                if (
+                    strongest_key is None
+                    or candidate_key == strongest_key
+                    or len(activity.response) >= len(strongest_response)
+                    or not activity.response.startswith(strongest_response)
+                ):
+                    strongest_key = candidate_key
+                    strongest_response = activity.response
+
+                seq_is_new = bool(
+                    activity.observation_seq <= 0
+                    or stable_last_seq <= 0
+                    or activity.observation_seq > stable_last_seq
+                )
+                if candidate_key == stable_key and seq_is_new:
+                    stable_samples += 1
+                else:
+                    stable_key = candidate_key
+                    stable_samples = 1
+                    stable_since = time.monotonic()
+                stable_last_seq = activity.observation_seq
+                # A different observation_seq only proves another poll ran, not
+                # that the response has genuinely settled -- require real
+                # elapsed time since this candidate first looked complete
+                # before trusting it, so a mid-generation pause on a
+                # plausible-looking prefix can't be mistaken for "done".
+                if stable_samples >= 2 and (time.monotonic() - stable_since) >= max(0.0, stable_confirm_s):
+                    return activity.response
+            else:
+                stable_key = None
+                stable_samples = 0
+                stable_since = 0.0
+                stable_last_seq = 0
 
             if activity.has_response and self.looks_incomplete_response(activity.response):
                 print(
                     f"[response-watch] role={role} response looks incomplete len={activity.response_len}; waiting",
                     flush=True,
                 )
-                self.sleep(max(0.1, poll_s))
-                continue
 
-            if self.is_response_done(activity):
-                if not require_fresh or self.is_fresh_response(activity, baseline):
-                    return activity.response
-                self.sleep(max(0.1, poll_s))
-                continue
             if not self.is_response_active(activity):
-                if activity.has_response and not activity.composer_exists:
-                    print(
-                        f"[response-watch] role={role} response present but composer not ready after reload; waiting",
-                        flush=True,
-                    )
-                    self.sleep(max(0.1, poll_s))
-                    continue
-                if activity.has_response:
-                    if not require_fresh or self.is_fresh_response(activity, baseline):
-                        return activity.response
-                    self.sleep(max(0.1, poll_s))
-                    continue
-                if require_response:
-                    self.sleep(max(0.1, poll_s))
-                    continue
-                return ""
+                if not activity.has_response and not require_response:
+                    return ""
+                self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} stable response wait")
+                continue
 
-            elapsed_in_cycle = time.time() - cycle_started
+            elapsed_in_cycle = time.monotonic() - cycle_started
             bucket = int(elapsed_in_cycle // max(1.0, poll_s * 5))
             if bucket != last_logged_bucket:
                 state = "streaming" if self.is_response_streaming(activity) else "active"
@@ -616,19 +1002,31 @@ class BridgeClient:
                 )
                 last_logged_bucket = bucket
 
-            if self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s) and not active_reload_used:
+            if (
+                allow_reload
+                and self.is_response_stuck(activity, elapsed_in_cycle, active_wait_s)
+                and not active_reload_used
+            ):
                 print(
                     f"[response-watch] role={role} still active after {active_wait_s:.1f}s; reloading page once",
                     flush=True,
                 )
                 active_reload_used = True
-                self.command_roundtrip(role, "RELOAD_PAGE", timeout_s=20.0)
-                self.sleep(max(0.0, page_wait_s))
-                cycle_started = time.time()
+                self.command_roundtrip(
+                    role,
+                    "RELOAD_PAGE",
+                    timeout_s=self._bounded_timeout(deadline, 20.0, context=f"{role} response reload"),
+                    _deadline=deadline,
+                )
+                self._sleep_bounded(max(0.0, page_wait_s), deadline, context=f"{role} response reload settle")
+                cycle_started = time.monotonic()
+                stable_key = None
+                stable_samples = 0
+                stable_last_seq = 0
                 last_logged_bucket = -1
                 continue
 
-            self.sleep(max(0.1, poll_s))
+            self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} response poll")
 
         if last_activity and self.is_manual_input_pending(last_activity):
             raise ManualInputPendingError(
@@ -636,12 +1034,14 @@ class BridgeClient:
             )
         if last_activity and self.is_response_active(last_activity):
             raise RuntimeError(f"{role} response still active after timeout; last_response_len={len(last_response)}")
-        if last_response and not self.looks_incomplete_response(last_response):
-            if not require_fresh or (last_activity is not None and self.is_fresh_response(last_activity, baseline)):
-                return last_response
-            raise RuntimeError(f"{role} response wait timed out without a fresh assistant response")
+        if strongest_response:
+            raise RuntimeError(
+                f"{role} response wait timed out before two stable complete observations; "
+                f"strongest_response_len={len(strongest_response)}"
+            )
         if last_response:
-            raise RuntimeError(f"{role} response wait timed out with incomplete response; last_response_len={len(last_response)}")
+            state = "incomplete" if self.looks_incomplete_response(last_response) else "unstable"
+            raise RuntimeError(f"{role} response wait timed out with {state} response; last_response_len={len(last_response)}")
         if require_response:
             raise RuntimeError(f"{role} response wait timed out while waiting for recovered response")
         raise RuntimeError(f"{role} response wait timed out; last_response_len={len(last_response)}")
@@ -651,16 +1051,23 @@ class BridgeClient:
         role: str,
         timeout_s: float,
         poll_s: float = DEFAULT_RESPONSE_RECOVERY_POLL_S,
+        *,
+        _deadline: float | None = None,
     ) -> ResponseActivity:
-        deadline = time.time() + max(1.0, timeout_s)
+        deadline = self._operation_deadline(timeout_s, _deadline)
         last_activity: ResponseActivity | None = None
         last_logged_bucket = -1
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                activity = self.response_activity(self.role_snapshot(role))
+                activity = self.response_activity(
+                    self.role_snapshot(
+                        role,
+                        timeout_s=self._bounded_timeout(deadline, context=f"{role} clean-ready snapshot"),
+                    )
+                )
             except Exception as exc:
                 print(f"[ready-check] role={role} transient snapshot failure: {exc}; waiting", flush=True)
-                self.sleep(max(0.1, poll_s))
+                self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} clean-ready wait")
                 continue
             last_activity = activity
             if self.is_clean_ready(activity):
@@ -671,17 +1078,22 @@ class BridgeClient:
                     f"[ready-check] role={role} choice prompt pending labels={labels}; clicking safe choice",
                     flush=True,
                 )
-                result = self.command_roundtrip(role, "CLICK_CHOICE_PROMPT", timeout_s=20.0)
+                result = self.command_roundtrip(
+                    role,
+                    "CLICK_CHOICE_PROMPT",
+                    timeout_s=self._bounded_timeout(deadline, 20.0, context=f"{role} clean-ready choice"),
+                    _deadline=deadline,
+                )
                 status = str(result.get("status") or "")
                 if status != "CHOICE_PROMPT_CLICKED":
                     raise RuntimeError(
                         f"{role} choice prompt blocked composer and could not be resolved: "
                         f"status={status or 'timeout'} labels={labels}",
                     )
-                self.sleep(max(0.5, poll_s))
+                self._sleep_bounded(max(0.5, poll_s), deadline, context=f"{role} clean-ready choice settle")
                 last_logged_bucket = -1
                 continue
-            remaining_s = max(0.0, deadline - time.time())
+            remaining_s = max(0.0, deadline - time.monotonic())
             bucket = int(remaining_s // max(1.0, poll_s * 5))
             if bucket != last_logged_bucket:
                 if self.is_manual_input_pending(activity):
@@ -701,9 +1113,9 @@ class BridgeClient:
                     print(f"[ready-check] role={role} not clean-ready; waiting", flush=True)
                 last_logged_bucket = bucket
             if self.is_response_active(activity):
-                self.wait_for_current_response(role, timeout_s=max(1.0, deadline - time.time()))
+                self.wait_for_current_response(role, timeout_s, _deadline=deadline)
                 continue
-            self.sleep(max(0.1, poll_s))
+            self._sleep_bounded(max(0.1, poll_s), deadline, context=f"{role} clean-ready poll")
         if last_activity and self.is_manual_input_pending(last_activity):
             raise ManualInputPendingError(
                 f"{role} composer still has manual input after waiting; not replacing it with an automated prompt",
@@ -720,6 +1132,8 @@ class BridgeClient:
         require_response: bool = False,
         baseline: ResponseActivity | None = None,
         require_fresh: bool = False,
+        *,
+        _deadline: float | None = None,
     ) -> str:
         return self.wait_for_current_response(
             role,
@@ -730,38 +1144,56 @@ class BridgeClient:
             require_response=require_response,
             baseline=baseline,
             require_fresh=require_fresh,
+            _deadline=_deadline,
         )
 
-    @staticmethod
-    def _snapshot_page_generation(snapshot: dict[str, Any]) -> str:
-        dom_info = snapshot.get("dom_info") or {}
+    @classmethod
+    def _snapshot_page_generation(cls, snapshot: dict[str, Any]) -> str:
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
         return str(dom_info.get("page_instance_id") or "")
 
-    @staticmethod
-    def _snapshot_page_path(snapshot: dict[str, Any]) -> str:
-        dom_info = snapshot.get("dom_info") or {}
+    @classmethod
+    def _snapshot_page_path(cls, snapshot: dict[str, Any]) -> str:
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
         return str(dom_info.get("page_path") or "")
 
     @classmethod
-    def is_clean_new_chat_snapshot(cls, snapshot: dict[str, Any], previous_generation: str) -> bool:
-        dom_info = snapshot.get("dom_info") or {}
-        messages = dom_info.get("messages") or {}
-        counts = messages.get("counts") or {}
+    def is_clean_root_snapshot(cls, snapshot: dict[str, Any]) -> bool:
+        snapshot = cls._mapping(snapshot, "snapshot")
+        dom_info = cls._mapping_field(snapshot, "dom_info", "snapshot")
+        messages = cls._mapping_field(dom_info, "messages", "snapshot.dom_info")
+        counts = cls._mapping_field(messages, "counts", "snapshot.dom_info.messages")
+        observation = cls._mapping_field(snapshot, "observation", "snapshot")
         generation = cls._snapshot_page_generation(snapshot)
+        observed_generation = str(observation.get("page_instance_id") or "")
         path = cls._snapshot_page_path(snapshot)
         activity = cls.response_activity(snapshot)
         return bool(
-            generation
-            and previous_generation
-            and generation != previous_generation
+            snapshot.get("online") is not False
+            and not snapshot.get("active_command")
+            and generation
+            and (not observed_generation or observed_generation == generation)
             and path == "/"
             and activity.composer_exists
             and not activity.composer_text
             and activity.composer_attachment_count == 0
             and not activity.stop_visible
             and not activity.choice_prompt_pending
+            and not activity.response
+            and not activity.last_user_text
             and cls._int_value(counts.get("user")) == 0
             and cls._int_value(counts.get("assistant")) == 0
+        )
+
+    @classmethod
+    def is_clean_new_chat_snapshot(cls, snapshot: dict[str, Any], previous_generation: str) -> bool:
+        generation = cls._snapshot_page_generation(snapshot)
+        return bool(
+            previous_generation
+            and generation != previous_generation
+            and cls.is_clean_root_snapshot(snapshot)
         )
 
     def wait_new_chat_ready(
@@ -770,30 +1202,53 @@ class BridgeClient:
         before_snapshot: dict[str, Any],
         timeout_s: float,
         poll_s: float = 0.5,
+        *,
+        _deadline: float | None = None,
     ) -> dict[str, Any]:
         previous_generation = self._snapshot_page_generation(before_snapshot)
         if not previous_generation:
             raise RuntimeError(f"{role} reset readiness cannot be verified: missing pre-reset page_instance_id")
-        deadline = time.time() + max(1.0, timeout_s)
+        deadline = self._operation_deadline(timeout_s, _deadline)
         last_probe: dict[str, Any] = {}
         last_snapshot: dict[str, Any] = {}
-        while time.time() < deadline:
-            remaining = max(1.0, deadline - time.time())
+        while time.monotonic() < deadline:
             try:
-                last_probe = self.command_roundtrip(role, "PROBE", timeout_s=min(20.0, remaining))
-                if last_probe.get("done") and str(last_probe.get("status") or "") == "PROBE_DONE":
-                    last_snapshot = self.role_snapshot(role)
-                    if self.is_clean_new_chat_snapshot(last_snapshot, previous_generation):
-                        return {
-                            "done": True,
-                            "status": "NEW_CHAT_READY",
-                            "probe": last_probe,
-                            "page_instance_id": self._snapshot_page_generation(last_snapshot),
-                            "page_path": self._snapshot_page_path(last_snapshot),
-                        }
+                candidate = self.role_snapshot(
+                    role,
+                    timeout_s=self._bounded_timeout(deadline, context=f"{role} NEW_CHAT readiness snapshot"),
+                )
+                last_snapshot = candidate
+                if not self.is_clean_new_chat_snapshot(candidate, previous_generation):
+                    self._sleep_bounded(max(0.05, poll_s), deadline, context=f"{role} NEW_CHAT readiness")
+                    continue
+                candidate_generation = self._snapshot_page_generation(candidate)
+                last_probe = self.command_roundtrip(
+                    role,
+                    "PROBE",
+                    timeout_s=self._bounded_timeout(deadline, 20.0, context=f"{role} NEW_CHAT probe"),
+                    _deadline=deadline,
+                )
+                if not (last_probe.get("done") and str(last_probe.get("status") or "") == "PROBE_DONE"):
+                    self._sleep_bounded(max(0.05, poll_s), deadline, context=f"{role} NEW_CHAT probe settle")
+                    continue
+                last_snapshot = self.role_snapshot(
+                    role,
+                    timeout_s=self._bounded_timeout(deadline, context=f"{role} NEW_CHAT final snapshot"),
+                )
+                if (
+                    self._snapshot_page_generation(last_snapshot) == candidate_generation
+                    and self.is_clean_new_chat_snapshot(last_snapshot, previous_generation)
+                ):
+                    return {
+                        "done": True,
+                        "status": "NEW_CHAT_READY",
+                        "probe": last_probe,
+                        "page_instance_id": candidate_generation,
+                        "page_path": self._snapshot_page_path(last_snapshot),
+                    }
             except RuntimeError:
                 pass
-            self.sleep(max(0.05, poll_s))
+            self._sleep_bounded(max(0.05, poll_s), deadline, context=f"{role} NEW_CHAT readiness")
         raise RuntimeError(
             f"{role} new chat did not reach terminal clean readiness before timeout; "
             f"last_probe_status={last_probe.get('status') or 'none'} "
@@ -801,5 +1256,17 @@ class BridgeClient:
             f"last_path={self._snapshot_page_path(last_snapshot) or 'none'}"
         )
 
-    def new_chat(self, role: str, timeout_s: float = 25.0) -> dict[str, Any]:
-        return self.command_roundtrip(role, "NEW_CHAT", timeout_s)
+    def new_chat(
+        self,
+        role: str,
+        timeout_s: float = 25.0,
+        *,
+        _deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = self._operation_deadline(timeout_s, _deadline)
+        return self.command_roundtrip(
+            role,
+            "NEW_CHAT",
+            timeout_s=self._bounded_timeout(deadline, context=f"{role} NEW_CHAT"),
+            _deadline=deadline,
+        )

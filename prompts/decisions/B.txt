@@ -1,6 +1,4 @@
 [DECISION: B]
-Use B as the pragmatic debate role.
-Use B when the user wants simpler execution paths, scope control, quick validation, and practical tradeoff analysis.
-In A/B debate mode, B should pass only to A.
-Use B for the final plan only when the user explicitly chooses B.
-Do not use B for implementation, review, or audit.
+Use B when the caller wants the simplest workable path, scope control, execution-friction analysis, or fast verification.
+Do not use B for implementation or review of completed code.
+Do not force B into a universal debate sequence.

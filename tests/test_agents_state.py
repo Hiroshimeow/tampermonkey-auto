@@ -476,6 +476,91 @@ def test_role_prompts_do_not_duplicate_routing_contract():
     assert offenders == []
 
 
+def test_role_prompts_and_skills_do_not_redefine_caller_modes() -> None:
+    root = Path(__file__).resolve().parents[1]
+    role_prompts = [
+        root / "prompts" / f"{role}.txt"
+        for role in ("PLAN", "DEV", "REVIEW", "AUDIT", "MANAGER", "A", "B")
+    ]
+    role_skills = [
+        root / "skills" / f"{role}.md"
+        for role in ("PLAN", "DEV", "REVIEW", "AUDIT", "MANAGER", "A", "B")
+    ]
+    forbidden = ("MODE SELECTION", "MODE 1", "MODE 2", "MODE-SENSITIVE")
+
+    offenders = []
+    for path in role_prompts + role_skills:
+        text = path.read_text(encoding="utf-8").upper()
+        if any(token in text for token in forbidden):
+            offenders.append(path.relative_to(root).as_posix())
+
+    assert offenders == []
+
+
+def test_coder_guide_requires_plan_local_implementation_and_named_validators() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "coder.md").read_text(encoding="utf-8").upper()
+
+    assert "MANDATORY PLANNING ROLE" in text
+    assert "CALL PLAN" in text
+    assert "CURRENT AGENT IMPLEMENTS" in text
+    assert "MANDATORY VALIDATION ROLES" in text
+    assert "USER-SPECIFIED ORDER" in text
+    assert "DO NOT DISPATCH BROWSER DEV" in text
+    assert "ALL REQUIRED VALIDATORS PASS" in text
+    assert "RUN `UV RUN ROLE.PY --HELP` ONCE" in text
+    assert "DEFAULT ROLE TIMEOUT: 2700 SECONDS" in text
+
+
+def test_orchestrator_guide_requires_stable_full_role_loop() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "orches.md").read_text(encoding="utf-8").upper()
+
+    assert "TRANSPORT-ONLY" in text
+    assert "PLAN -> DEV -> REVIEW" in text
+    assert "ADDITIONAL USER-NAMED VALIDATORS" in text
+    assert "RESTART THE CYCLE AT PLAN" in text
+    assert "ALL REQUIRED ROLES PASS" in text
+    assert "DEFAULT ROLE TIMEOUT: 2700 SECONDS" in text
+
+
+def test_specialist_prompts_define_contextual_output_and_inline_delegation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    required = (
+        "ROUTE_JSON_CONTRACT",
+        "ANSWER THE DIRECT CALLER NORMALLY",
+        "UV RUN ROLE.PY --HELP",
+        "RESPONSE_PATH",
+        "DO NOT CALL YOURSELF",
+    )
+    offenders = []
+    for role in ("PLAN", "DEV", "REVIEW", "AUDIT", "MANAGER", "A", "B"):
+        path = root / "prompts" / f"{role}.txt"
+        text = path.read_text(encoding="utf-8").upper()
+        missing = [token for token in required if token not in text]
+        if missing:
+            offenders.append((path.relative_to(root).as_posix(), missing))
+
+    assert offenders == []
+
+
+def test_decision_guides_do_not_force_a_universal_workflow() -> None:
+    root = Path(__file__).resolve().parents[1]
+    decisions = root / "prompts" / "decisions"
+    plan = (decisions / "PLAN.txt").read_text(encoding="utf-8").upper()
+    dev = (decisions / "DEV.txt").read_text(encoding="utf-8").upper()
+    review = (decisions / "REVIEW.txt").read_text(encoding="utf-8").upper()
+    finish = (decisions / "FINISH.txt").read_text(encoding="utf-8").upper()
+    manager = (decisions / "MANAGER.txt").read_text(encoding="utf-8").upper()
+
+    assert "DO NOT USE PLAN FOR STRAIGHTFORWARD FIXES" not in plan
+    assert "ACTIVE CALLER FLOW" in plan
+    assert "ACTIVE CALLER FLOW" in dev
+    assert "ACTIVE CALLER FLOW" in review
+    assert "ALL ROLES REQUIRED BY THE ACTIVE CALLER FLOW" in finish
+    assert "DO NOT INVENT A DEFAULT CHAIN" in manager
+
+
 def test_discover_prompt_roles_excludes_runtime_templates(tmp_path):
     agents = load_agents_module()
     prompts = tmp_path / "prompts"

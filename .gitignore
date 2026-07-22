@@ -14,3 +14,4 @@ temps/*
 !temps/skills/**
 .role_state/
 .plan/
+.*

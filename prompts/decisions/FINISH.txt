@@ -1,4 +1,3 @@
 [DECISION: FINISH]
-Use FINISH only when the user's full goal is complete and verified.
-Completion needs evidence that fits the task.
-Do not use FINISH for partial progress, unresolved blockers, or claims that nobody checked.
+Use FINISH only when the user's full goal is complete, verified, and all roles required by the active caller flow have passed the same final state.
+Do not use FINISH for partial progress, unresolved blockers, or unchecked claims.

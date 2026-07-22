@@ -1,4 +1,4 @@
 [DECISION: DEV]
-Use DEV for code, config, files, generated artifacts, fixes, or any concrete change.
-Use DEV when REVIEW or AUDIT found defects that require edits.
-Do not use DEV for pure review, final verification, or user-facing product choices.
+Use DEV only when the active caller flow assigns concrete implementation, file, configuration, or artifact changes to browser DEV.
+Use DEV for verified defects that require edits when DEV is authorized in that flow.
+Do not use DEV for planning, review, audit, or final approval.

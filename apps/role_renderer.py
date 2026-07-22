@@ -58,17 +58,19 @@ def render_direct_role_prompt(
     request_id: str,
     request_marker: str = "ROLE_REQUEST_ID",
     include_skill: bool = True,
+    include_role_context: bool = True,
 ) -> RenderedPrompt:
     normalized_role = str(role or "").upper().strip()
     parts: list[str] = []
     files: list[str] = []
 
-    prompt_path = role_prompt_path(normalized_role)
-    files.extend(_append_optional_file_section(parts, "ROLE PROMPT", prompt_path, display_role=normalized_role))
+    if include_role_context:
+        prompt_path = role_prompt_path(normalized_role)
+        files.extend(_append_optional_file_section(parts, "ROLE PROMPT", prompt_path, display_role=normalized_role))
 
-    if include_skill:
-        skill_path = role_skill_path(normalized_role)
-        files.extend(_append_optional_file_section(parts, "ROLE SKILL", skill_path, display_role=normalized_role))
+        if include_skill:
+            skill_path = role_skill_path(normalized_role)
+            files.extend(_append_optional_file_section(parts, "ROLE SKILL", skill_path, display_role=normalized_role))
 
     parts.append(f"{request_marker}: {request_id}")
     parts.append("USER_PROMPT:")
@@ -92,13 +94,13 @@ def render_route_prompt(
     loader_manifest: LoaderManifest | None = None,
     goal_only: bool = False,
 ) -> RenderedPrompt:
-    if goal_only:
+    if goal_only and caller_role == "USER":
         text = goal_only_prompt(goal)
         return RenderedPrompt(text=text, content_hash_source=text)
     parts: list[str] = []
     files: list[str] = []
 
-    if include_system:
+    if include_system and not goal_only:
         if loader_manifest is None:
             raise FileNotFoundError(f"Missing loader manifest for role {prompt_role}")
         files.extend(_append_required_file_section(parts, "AGENTS", loader_manifest.agents_path))

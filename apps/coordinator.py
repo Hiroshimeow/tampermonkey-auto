@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
+import uuid
 from typing import Any
 
 from apps.bridge import BridgeClient, ManualInputPendingError
@@ -55,6 +57,10 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         self.background_tasks: list[threading.Thread] = []
         self.reload_generation: dict[str, int] = {}
         self.current_goal = ""
+        self.flow_run_id = f"main-{uuid.uuid4()}"
+        self.flow_status_active = False
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def has_turn_budget(self) -> bool:
         return self.max_turns <= 0 or self.turn_count < self.max_turns
@@ -63,6 +69,8 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         state = FlowState(goal=goal)
         self.current_goal = goal
         try:
+            self.begin_flow_status()
+            self._start_runner_heartbeat()
             loader_errors = self.runtime_config.loader_errors()
             if loader_errors:
                 raise FlowStopError(
@@ -80,9 +88,171 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
         except RuntimeError as exc:
             self.finished = self.flow_stop_result(state, "runtime_error", str(exc))
 
-        if self.finished:
-            return self.finished
-        return self.unfinished_result(state)
+        result = self.finished or self.unfinished_result(state)
+        self.finalize_flow_status(
+            str(result.get("status") or "runtime_error"),
+            finishing_role=str(result.get("approved_by") or ""),
+        )
+        return result
+
+    def publish_flow_statuses(
+        self,
+        updates: dict[str, dict[str, Any] | None],
+        *,
+        request_id: str = "",
+        parent_request_id: str | None = None,
+        goal_hash: str | None = None,
+        terminal_status: str | None = None,
+        activate: bool = False,
+    ) -> None:
+        if self.dry_run:
+            return
+        if not updates and terminal_status is None and not activate:
+            return
+        update = getattr(self.client, "update_flow_statuses", None)
+        if not callable(update):
+            return
+        try:
+            update(
+                self.flow_run_id,
+                updates,
+                request_id=request_id or self.flow_run_id,
+                parent_request_id=parent_request_id,
+                goal_hash=goal_hash,
+                terminal_status=terminal_status,
+                activate=activate,
+            )
+        except Exception as exc:
+            print(f"[flow-ui] status update failed: {exc}", flush=True)
+
+    def _runner_heartbeat_interval_s(self) -> float:
+        return max(1.0, float(getattr(self.args, "heartbeat_interval", 5.0) or 5.0))
+
+    def _emit_runner_heartbeat(self) -> None:
+        send = getattr(self.client, "send_flow_heartbeat", None)
+        if not callable(send):
+            return
+        try:
+            send(
+                self.flow_run_id,
+                request_id=self.flow_run_id,
+                pid=os.getpid(),
+                timeout_s=min(10.0, self._runner_heartbeat_interval_s()),
+            )
+        except Exception as exc:
+            print(f"[flow-ui] heartbeat failed: {exc}", flush=True)
+
+    def _start_runner_heartbeat(self) -> None:
+        if self.dry_run or self._heartbeat_thread is not None:
+            return
+        self._heartbeat_stop.clear()
+        self._emit_runner_heartbeat()
+        thread = threading.Thread(target=self._runner_heartbeat_loop, name="flow-heartbeat", daemon=True)
+        self._heartbeat_thread = thread
+        thread.start()
+
+    def _runner_heartbeat_loop(self) -> None:
+        interval = self._runner_heartbeat_interval_s()
+        while not self._heartbeat_stop.wait(interval):
+            self._emit_runner_heartbeat()
+
+    def _stop_runner_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        self._heartbeat_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def begin_flow_status(self) -> None:
+        self.flow_status_active = True
+        updates: dict[str, dict[str, Any] | None] = {}
+        for physical in self.runtime_config.physical_roles:
+            logical_roles = self.runtime_config.logical_roles_for(physical)
+            updates[physical] = {
+                "state": "WAITING",
+                "logical_role": logical_roles[0] if logical_roles else physical,
+            }
+        start_physical = self.pick_browser_role(self.start_role)
+        updates[start_physical] = {
+            "state": "RUNNING",
+            "logical_role": self.start_role,
+            "from_role": "User",
+        }
+        goal_hash = self.runtime_config.provenance_for(self.start_role, self.current_goal).goal_hash
+        self.publish_flow_statuses(
+            updates,
+            request_id=self.flow_run_id,
+            parent_request_id="",
+            goal_hash=goal_hash,
+            activate=True,
+        )
+
+    def publish_flow_route(self, source_role: str, target_roles: list[str], *, caller_role: str) -> None:
+        if not self.flow_status_active or not target_roles:
+            return
+        source = normalize_role(source_role)
+        targets = [normalize_role(role) for role in target_roles if normalize_role(role)]
+        if not source or not targets:
+            return
+        caller = "User" if str(caller_role).strip().upper() == "USER" else normalize_role(caller_role)
+        updates: dict[str, dict[str, Any] | None] = {
+            self.pick_browser_role(source): {
+                "state": "DONE",
+                "logical_role": source,
+                "done_from": caller or "User",
+                "sent_to": ", ".join(targets),
+            }
+        }
+        for target in targets:
+            updates[self.pick_browser_role(target)] = {
+                "state": "RUNNING",
+                "logical_role": target,
+                "from_role": source,
+            }
+        self.publish_flow_statuses(updates)
+
+    def publish_flow_fan_in(self, target_role: str, source_roles: list[str]) -> None:
+        if not self.flow_status_active:
+            return
+        target = normalize_role(target_role)
+        sources = [normalize_role(role) for role in source_roles if normalize_role(role)]
+        if not target or not sources:
+            return
+        updates: dict[str, dict[str, Any] | None] = {
+            self.pick_browser_role(source): {
+                "state": "DONE",
+                "logical_role": source,
+                "done_from": target,
+                "sent_to": target,
+            }
+            for source in sources
+        }
+        updates[self.pick_browser_role(target)] = {
+            "state": "RUNNING",
+            "logical_role": target,
+            "from_role": ", ".join(sources),
+        }
+        self.publish_flow_statuses(updates)
+
+    def finalize_flow_status(self, terminal_status: str, *, finishing_role: str = "") -> None:
+        self._stop_runner_heartbeat()
+        if not self.flow_status_active:
+            return
+        self.flow_status_active = False
+        normalized_terminal = str(terminal_status or "runtime_error")
+        normalized_finisher = normalize_role(finishing_role)
+        updates: dict[str, dict[str, Any] | None] = {}
+        if normalized_terminal == "complete" and normalized_finisher in self.finish_roles:
+            updates[self.pick_browser_role(normalized_finisher)] = {
+                "state": "DONE",
+                "logical_role": normalized_finisher,
+                "done_from": normalized_finisher,
+            }
+        self.publish_flow_statuses(
+            updates,
+            request_id=self.flow_run_id,
+            terminal_status=normalized_terminal,
+        )
 
     def flow_stop_result(self, state: FlowState, status: str, message: str, **details: Any) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -191,10 +361,11 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
                 self.system_sent.add(prompt_role)
 
             route = parse_route(response)
-            if self.uses_goal_only_prompt(prompt_role) and not route.ok and response.strip():
-                route = Route(targets={"FINISH": response.strip()}, raw=response)
             route = self.validate_route(prompt_role, route)
-            if not route.ok and not self.uses_goal_only_prompt(prompt_role):
+            if not route.ok:
+                response = self.resync_invalid_route(browser_role, response)
+                route = self.validate_route(prompt_role, parse_route(response))
+            if not route.ok:
                 print(f"[format] invalid route from {prompt_role}: {route.error or 'missing route'}", flush=True)
                 repaired = True
                 repair_prompt = self.build_format_repair_prompt(
@@ -262,6 +433,28 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             return synthetic_response(prompt_role, instruction, repair, self.prompt_roles)
         return self.client.call_browser_role(browser_role, prompt, timeout_s=self.args.timeout)
 
+    def resync_invalid_route(self, browser_role: str, current_response: str) -> str:
+        if self.dry_run:
+            return current_response
+        try:
+            self.client.command_roundtrip(
+                browser_role,
+                "SYNC_TRANSCRIPT",
+                timeout_s=min(10.0, max(1.0, float(self.args.timeout))),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[format-resync] role={browser_role} sync failed: {exc}", flush=True)
+        try:
+            snapshot = self.client.role_snapshot(browser_role)
+            refreshed = self.client.response_activity(snapshot).response.strip()
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[format-resync] role={browser_role} snapshot failed: {exc}", flush=True)
+            return current_response
+        if refreshed and refreshed != current_response.strip():
+            print(f"[format-resync] role={browser_role} using refreshed response", flush=True)
+            return refreshed
+        return current_response
+
     def resume_existing_response(self, prompt_role: str, browser_role: str, turn: int, state: FlowState | None = None) -> str:
         if not self.args.resume or self.dry_run or turn != 1:
             return ""
@@ -306,7 +499,7 @@ class Coordinator(RouteExecutorMixin, BrowserLifecycleMixin):
             prompt_roles=self.prompt_roles,
             finish_roles=self.finish_roles,
             manager_role=self.manager_role,
-            state_text=state.compact(self.args.max_state_chars),
+            state_text=state.route_context(self.args.max_state_chars),
             provenance=self.runtime_config.provenance_for(prompt_role, state.goal),
             loader_manifest=self.runtime_config.loader_manifest(prompt_role),
             goal_only=self.uses_goal_only_prompt(prompt_role),

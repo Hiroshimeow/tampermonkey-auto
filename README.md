@@ -1,11 +1,28 @@
 # Tampermonkey Auto Role Runner
 
-This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript.
+This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript. It reads DOM, clicks buttons, and pretends to be several coworkers at once so you don't have to keep ten browser tabs straight in your own head.
 
 It has two common entrypoints:
 
 - `main.py`: multi-role coordination with route JSON.
 - `role.py`: send exactly one prompt to exactly one browser role and return one machine-readable JSON object.
+
+## How a response actually gets captured (read this before debugging "why is the answer cut off")
+
+The userscript owns exactly one job here: turn the live chat DOM into text. `tampermonkey.js` runs a **hybrid observer**:
+
+- A `MutationObserver` bound to the chat root (`<main>`, never `document.body`) is the primary signal — it notices when the DOM settles and debounces bursts into one clean capture (`observer_quiet_ms`, 400ms).
+- The status poll (`poll_ms`, 800ms) only keeps the tab's presence/commands alive and falls back to a forced recapture if the cache goes stale (`observer_fallback_ms`, 5s) — it does not read content on every tick.
+- "Is the turn actually done" requires the composer to exist, the Stop button to be gone, no streaming marker, and the same answer observed twice across a real elapsed quiet window (`completion_confirm_ms`, 2.5s) — not just "a different observation happened."
+
+If you ever see a suspiciously short captured response (a bare `"json"`, a lone word, a truncated sentence), it is almost always one of these two failure modes, not a new mystery:
+
+1. Extraction read the wrong DOM node (fixed once already: never read `innerText` of the whole message bubble — read `textContent` from the specific content node, or you'll eventually capture a code-fence language label instead of the code).
+2. The completion detector confirmed too early (fixed once already: two "different" observations are not proof of settling — require real elapsed time since the candidate first looked complete, or a bored assistant pausing mid-thought becomes a permanently truncated cached answer).
+
+**Do not add `attributes: true` to the chat-root `MutationObserver`.** We tried it once, for a good reason (catching an attribute-only Stop-button toggle), and it froze the tab solid: a live streaming ChatGPT page mutates style/class/data-* attributes constantly, MutationObserver callbacks run as microtasks (higher priority than `setTimeout`), and enough attribute churn will starve the JS event loop entirely — the tab stays open, still renders, and never talks to the server again. The tab looks fine. It is not fine. `childList`/`subtree`/`characterData` alone is the correct, tested scope.
+
+For debugging a role's actual current response without going through the completion heuristic at all, `GET /api/admin/role/{role}` returns the server's continuously-updated `last_response` — it reflects whatever the DOM currently shows, independent of whether any wait loop has decided the turn is "done." This is the ground truth when a captured `.role_state/responses/*.md` file looks wrong.
 
 ## Prerequisites
 
@@ -21,6 +38,15 @@ http://127.0.0.1:8500
 ```
 
 Override it with `--base-url` or `MAUTO_BASE_URL`.
+
+## Two ways an agent uses this repo (pick one, don't blend them)
+
+An agent calling into this repo through `role.py` operates in one of two modes, defined by `orches.md` and `coder.md`. They are not interchangeable, and mixing them is how you end up with an agent that both edits your code and pretends it's "just the transport."
+
+- **Transport-only (`orches.md`)**: the agent calls authorized browser roles, reads `response_path`, and moves the declared workflow (`PLAN -> DEV -> REVIEW -> ...`) forward. It never inspects source, never implements, never issues a technical verdict. A route key inside a response is a handoff hint, not permission to invent a new role.
+- **Coder (`coder.md`)**: the agent *is* the implementation worker. `PLAN` still plans and every user-named validator (`REVIEW`, `AUDIT`, ...) still validates, but a `DEV` route key returned by `PLAN` is work for the calling agent, not an instruction to dispatch a browser `DEV`. The agent implements, then runs every named validator in order, and loops back on any non-pass until all of them pass in the same final cycle.
+
+If an agent is quietly editing files while claiming to be "just relaying messages," it drifted from `orches.md` into `coder.md` without telling anyone. That's a process bug, not a feature.
 
 ## Main Multi-Role Flow
 
@@ -83,9 +109,9 @@ Use `--resume` only when the current browser tab already has a response you want
 uv run python main.py --role DEV,REVIEW,PLAN --resume --goal "your task here"
 ```
 
-`--resume` reads the existing browser response only on the first dispatched turn. Later turns do not reuse old responses.
+`--resume` considers the existing browser response only on the first dispatched turn. The last user prompt must contain exactly one provenance marker with the exact key set and types for the current logical role, allowed-role configuration, finish authority, route-mode version, and goal hash. Duplicate, extra-field, malformed, missing, or mismatched provenance causes the old response to be ignored and a current full loader prompt to be sent instead.
 
-If manager mode is active and the resumed route JSON does not route to `MANAGER`, the runner sends a repair prompt asking the role to route to `MANAGER`.
+A compatible but invalid resumed route gets exactly one thin repair prompt on the same role. A second invalid route stops with `stopped_invalid_route`; it is not redirected to `MANAGER` or another fallback role. `--resume --preflight` uses non-destructive `PROBE` checks only.
 
 ## Route JSON Contract
 
@@ -257,9 +283,9 @@ prompts/DEV.txt
 prompts/REVIEW.txt
 ```
 
-Custom roles may use exact prompt files such as `prompts/DEV2.txt`. If no exact prompt exists, the runner may fall back to a known role type such as `DEV`, depending on the role name.
+Custom roles may use exact prompt and skill files such as `prompts/DEV2.txt` and `skills/DEV2.md`. If no exact files exist, the runtime may resolve both from a known role type such as `DEV`, depending on the role name.
 
-If no prompt is available for a role, the runner still works in goal-only mode, but the role must be given self-contained instructions.
+Route mode is fail-closed. Every configured logical role must resolve all required loader inputs: `AGENTS.md`, `prompts/HANDOFF.md`, a role prompt, and a role skill. Missing or empty loader files return a structured `loader_error` before browser dispatch; there is no goal-only downgrade.
 
 ## Advanced Overrides
 
@@ -284,6 +310,75 @@ uv run python main.py `
   --role-map PLAN=REVIEW DEV=DEV REVIEW=REVIEW `
   --finish-roles REVIEW `
   --goal "your task here"
+```
+
+The logical-to-physical binding is resolved once at startup. Logical roles sharing one physical tab are serialized, including prompt/send/response transactions and reset/reload operations. This prevents concurrent mutation of the tab, but it does not create separate browser chat histories for those logical roles. A NEW_CHAT reset holds the physical lock until navigation is acknowledged, the page-instance generation changes, the role re-registers, and a clean empty composer is confirmed at `/`; only then are bootstrap state and phase advanced. Preflight targets every resolved physical role, including values that appear only in `--role-map`, and stops on command failure or `done=false`.
+
+### Run REVIEW, DEV, and PLAN on one physical tab
+
+Use this mode when one browser tab is reliable and you want that tab to execute several logical roles in sequence. The logical role still controls the injected prompt and skill; `--role-map` only selects the physical browser tab used for transport.
+
+Prepare one clean browser tab registered as physical role `DEV`, then run:
+
+```powershell
+uv run main.py `
+  --role REVIEW,DEV,PLAN `
+  --browser-roles DEV `
+  --role-map "REVIEW=DEV DEV=DEV PLAN=DEV" `
+  --finish-roles PLAN `
+  --goal "Read the exact .plan file, continue REVIEW -> PLAN -> DEV -> REVIEW until PLAN verifies everything and FINISHes." `
+  --timeout 1800 `
+  --request-timeout 1800 `
+  --parallelism 1 `
+  --new-chat-on-handoff `
+  --handoff-command-policy always `
+  --reload-after 0
+```
+
+There is intentionally no `--max-turns` flag. The default value is `0`, so the workflow continues until an authorized `FINISH` or an unrecoverable runtime error.
+
+With the command above:
+
+- `REVIEW`, `DEV`, and `PLAN` are logical roles with their own prompts and skills.
+- All three use the same physical browser tab registered as `DEV`.
+- `--parallelism 1` serializes all work on that tab.
+- `PLAN` is the only role allowed to `FINISH`.
+- `--new-chat-on-handoff` starts a clean chat between logical roles.
+- The first logical role is the first name in `--role`, here `REVIEW`.
+
+Every non-final role response must include a `HANDOFF:` section and request a handoff in the final route JSON:
+
+````text
+HANDOFF:
+Read exactly .plan/turn_34_review_for_plan.md and continue as PLAN.
+
+```json
+{
+  "PLAN": "Read exactly .plan/turn_34_review_for_plan.md and continue.",
+  "command": "handoff"
+}
+```
+````
+
+The runtime then resets the shared physical tab to a new chat, injects the next logical role context, and continues automatically. Do not use this mode for roles that must run concurrently; logical roles mapped to the same physical tab are necessarily sequential.
+
+Composer sending requires exact normalized prompt ownership, zero real attachments, composer presence, and `send_enabled=true` immediately before the click. The userscript performs one click per `CLICK_SEND` command and has no hidden `requestSubmit` fallback; Python may retry the command once only when the exact owned prompt remains, so the total submit budget is two attempts.
+
+## Stable Flow Kanban control plane
+
+Open `/dashboard` on the bridge server to manage durable tasks across `BACKLOG`, `READY`, `RUNNING`, `REVIEW`, `BLOCKED`, and `DONE`.
+
+Task records are stored atomically in `.role_state/tasks.json`. The dashboard supports create/edit, native drag/drop plus keyboard move controls, archive, pause/resume, manual wake, schedules (`manual`, one-time, interval, and five-field cron with an IANA timezone), optimistic revision conflicts, and explicit resolution of uncertain wakes. It polls tasks, generic role inventory, and durable flow independently every two seconds and retains the last good projection when one source fails.
+
+The dashboard never sends browser commands directly. `POST /api/admin/tasks/{task_id}/wake` reserves one occurrence; the server scheduler verifies exact controller assignment, role presence, no active browser command, idle assistant, clean composer, and zero attachments before issuing the bounded userscript sequence `SET_PROMPT` followed by one `CLICK_SEND`. Ambiguous dispatch survives restart as `UNCERTAIN` and requires evidence-based resolution.
+
+Controllers should read `skills/ORCHESTRATOR.md`, re-read the exact task before each revisioned mutation, claim `READY -> RUNNING` with their exact assigned role, and update request/result/blocker fields through the task API. Phase 05 exposes `transport` and `external_target` metadata only; browser-target controls remain out of scope.
+
+Focused control-plane checks:
+
+```powershell
+uv run python -m pytest tests/test_task_store.py tests/test_task_scheduler.py tests/test_server.py -q
+node .\tests\test_dashboard_contract.mjs
 ```
 
 ## Verification

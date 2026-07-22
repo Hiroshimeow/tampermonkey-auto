@@ -1,0 +1,1390 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Stable Flow Runtime</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --canvas: #0b0f14;
+            --surface: #111820;
+            --surface-2: #17212b;
+            --surface-3: #1d2a36;
+            --line: #2b3b49;
+            --line-strong: #415667;
+            --text: #edf4f8;
+            --muted: #9aabba;
+            --cyan: #67d9e8;
+            --green: #74d59b;
+            --amber: #efbb62;
+            --red: #ef7c77;
+            --violet: #b39aef;
+            --radius: 12px;
+            font-family: "Segoe UI Variable", "Aptos", system-ui, sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background:
+                linear-gradient(rgba(103, 217, 232, .025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(103, 217, 232, .025) 1px, transparent 1px),
+                var(--canvas);
+            background-size: 28px 28px;
+            color: var(--text);
+        }
+        button, input, select, textarea { font: inherit; }
+        button, select, input, textarea {
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--text);
+        }
+        button { cursor: pointer; padding: 8px 11px; font-weight: 700; }
+        button:hover { border-color: var(--cyan); }
+        button:disabled { cursor: not-allowed; opacity: .42; }
+        input, select, textarea { width: 100%; padding: 8px 9px; }
+        textarea { resize: vertical; }
+        :focus-visible { outline: 3px solid var(--cyan); outline-offset: 2px; }
+        [hidden] { display: none !important; }
+        #dashboard-root { min-height: 100vh; padding: 14px; }
+        #dashboard-root[data-stale="true"] .topbar,
+        #dashboard-root[data-stalled="true"] .topbar { border-color: var(--amber); }
+        .topbar, .panel, dialog {
+            border: 1px solid var(--line);
+            background: rgba(17, 24, 32, .97);
+            box-shadow: 0 16px 44px rgba(0, 0, 0, .28);
+        }
+        .topbar {
+            position: sticky;
+            top: 8px;
+            z-index: 20;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 14px;
+            padding: 12px 14px;
+            border-radius: var(--radius);
+            backdrop-filter: blur(10px);
+        }
+        .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .brand-mark {
+            display: grid;
+            width: 42px;
+            height: 42px;
+            place-items: center;
+            border: 1px solid var(--cyan);
+            border-radius: 9px;
+            color: var(--cyan);
+            font: 800 13px/1 ui-monospace, Consolas, monospace;
+        }
+        .brand h1 { margin: 0; font-size: 18px; }
+        .brand p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+        .health-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+        .health-pill, .panel-count, .role-state, .tag {
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--surface-2);
+            font: 700 10px/1.2 ui-monospace, Consolas, monospace;
+        }
+        .health-pill { display: inline-flex; gap: 6px; padding: 6px 9px; color: var(--muted); }
+        .health-pill strong { color: var(--text); }
+        [data-tone="good"] { color: var(--green) !important; border-color: var(--green) !important; }
+        [data-tone="warn"] { color: var(--amber) !important; border-color: var(--amber) !important; }
+        [data-tone="bad"] { color: var(--red) !important; border-color: var(--red) !important; }
+        .notice-stack { display: grid; gap: 7px; margin: 10px 0; }
+        .notice {
+            padding: 9px 11px;
+            border: 1px solid var(--amber);
+            border-radius: 8px;
+            background: rgba(239, 187, 98, .09);
+            color: #ffdca2;
+            font: 600 12px/1.4 ui-monospace, Consolas, monospace;
+            white-space: pre-line;
+        }
+        .notice[data-kind="error"] { border-color: var(--red); color: #ffc1be; background: rgba(239, 124, 119, .09); }
+        .panel { min-width: 0; border-radius: var(--radius); overflow: hidden; }
+        .panel-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--line);
+        }
+        .panel-head h2 { margin: 0; font-size: 13px; }
+        .panel-count { min-width: 28px; padding: 4px 7px; text-align: center; }
+        .role-board-panel {
+            width: min(100%, 1120px);
+            margin: 10px auto 0;
+            contain: layout paint;
+        }
+        .role-board {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+            padding: 8px;
+        }
+        .role-card {
+            position: relative;
+            display: flex;
+            min-width: 0;
+            min-height: 154px;
+            flex-direction: column;
+            padding: 9px;
+            border: 1px solid var(--line);
+            border-left-width: 3px;
+            border-radius: 9px;
+            background: linear-gradient(155deg, rgba(29, 42, 54, .72), rgba(23, 33, 43, .92));
+            cursor: pointer;
+            contain: layout paint style;
+            content-visibility: auto;
+            contain-intrinsic-size: 154px;
+        }
+        .role-card[data-status-tone="good"] { border-left-color: var(--green); }
+        .role-card[data-status-tone="warn"] { border-left-color: var(--amber); }
+        .role-card[data-status-tone="bad"] { border-left-color: var(--red); }
+        .role-card:hover { background: linear-gradient(155deg, rgba(32, 48, 61, .88), rgba(23, 33, 43, .98)); }
+        .role-card.selected { border-color: var(--cyan); box-shadow: inset 0 0 0 1px rgba(103, 217, 232, .28), 0 0 0 1px rgba(103, 217, 232, .08); }
+        .role-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: start; }
+        .role-card-title { min-width: 0; }
+        .role-card-head h3 { min-width: 0; margin: 0; font: 800 12px/1.3 ui-monospace, Consolas, monospace; }
+        .role-title-link { display: block; overflow: hidden; color: var(--text); text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+        .role-title-link:hover { color: var(--cyan); text-decoration: underline; }
+        .role-evidence { margin-top: 2px; color: var(--muted); font: 700 8px/1.2 ui-monospace, Consolas, monospace; letter-spacing: .04em; text-transform: uppercase; }
+        .role-state { padding: 3px 5px; color: var(--muted); font-size: 8px; }
+        .role-card-meta { display: flex; flex-wrap: wrap; gap: 3px 9px; margin-top: 7px; color: var(--muted); font: 9px/1.25 ui-monospace, Consolas, monospace; }
+        .role-card-meta strong { color: var(--text); font-weight: 700; }
+        .role-chat { overflow: hidden; margin: 7px 0 6px; color: var(--muted); font: 9px/1.3 ui-monospace, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+        .role-composer { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid rgba(65, 86, 103, .45); color: var(--muted); font: 9px/1.3 ui-monospace, Consolas, monospace; }
+        .role-composer strong { overflow: hidden; color: var(--green); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+        .role-card-actions { display: flex; gap: 5px; margin-top: auto; }
+        .role-card-actions button { flex: 1; min-width: 0; min-height: 28px; padding: 5px 4px; font-size: 9px; }
+        .primary { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
+        .selected-role-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(360px, .9fr); gap: 10px; margin-top: 10px; }
+        .timeline-panel { grid-column: 1 / -1; min-width: 0; }
+        .role-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px 12px 0; }
+        .role-metric { padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .role-metric span { display: block; color: var(--muted); font: 700 9px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .role-metric strong { display: block; margin-top: 5px; font: 800 14px/1.2 ui-monospace, Consolas, monospace; }
+        .current-task { margin: 10px 12px 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
+        .current-task-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+        .current-task-head strong { font-size: 12px; }
+        .current-task-progress { color: var(--cyan); font: 700 10px/1.3 ui-monospace, Consolas, monospace; }
+        .current-task pre { max-height: 170px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #d6e4ea; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .runtime-kv { display: grid; grid-template-columns: 125px minmax(0, 1fr); padding: 5px 12px 10px; }
+        .runtime-kv dt, .runtime-kv dd { margin: 0; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); overflow-wrap: anywhere; }
+        .runtime-kv dt { color: var(--muted); font: 700 9px/1.35 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .runtime-kv dd { font: 10px/1.45 ui-monospace, Consolas, monospace; }
+        #role-responses { max-height: 430px; overflow: auto; padding: 10px; }
+        .role-response { margin-bottom: 8px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
+        .role-response[data-latest="true"] { border-color: var(--cyan); }
+        .role-response header { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font: 10px/1.3 ui-monospace, Consolas, monospace; }
+        .role-response pre { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        #runtime-events {
+            position: relative;
+            max-height: clamp(300px, 52vh, 560px);
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+            touch-action: pan-y;
+            padding: 10px 12px 12px 34px;
+        }
+        #runtime-events::before { content: ""; position: absolute; left: 19px; top: 18px; bottom: 20px; width: 1px; background: var(--line-strong); }
+        .flow-line { position: relative; display: grid; grid-template-columns: 86px 86px minmax(130px, .7fr) minmax(180px, 1.3fr); gap: 8px; align-items: center; min-height: 46px; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); font: 10px/1.4 ui-monospace, Consolas, monospace; }
+        .flow-line::before { content: ""; position: absolute; left: -20px; width: 9px; height: 9px; border: 2px solid var(--cyan); border-radius: 50%; background: var(--surface); }
+        .flow-line time { color: var(--muted); }
+        .flow-line .role-state { justify-self: start; }
+        .flow-route { color: var(--cyan); font-weight: 800; overflow-wrap: anywhere; }
+        .flow-summary { color: var(--text); }
+        .flow-evidence { grid-column: 3 / -1; }
+        .flow-evidence summary { cursor: pointer; color: var(--muted); }
+        .flow-evidence pre { margin: 6px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; color: var(--muted); }
+        .role-empty { padding: 24px 14px; color: var(--muted); text-align: center; }
+        dialog { width: min(880px, calc(100vw - 24px)); max-height: calc(100vh - 24px); padding: 0; border-color: var(--line-strong); border-radius: 14px; color: var(--text); }
+        dialog::backdrop { background: rgba(3, 7, 10, .78); }
+        .dialog-head, .dialog-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 14px; }
+        .dialog-head { border-bottom: 1px solid var(--line); }
+        .dialog-head h2 { margin: 0; font-size: 15px; }
+        .dialog-actions { justify-content: flex-end; border-top: 1px solid var(--line); }
+        .dialog-body { display: grid; gap: 12px; padding: 14px; }
+        .field { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+        .prompt-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        #task-prompt { min-height: 58px; max-height: 218px; overflow-y: auto; line-height: 20px; }
+        .prompt-samples, .role-order, .available-roles, .browser-targets { display: flex; flex-wrap: wrap; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+        .section-label { margin: 0 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .role-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border-radius: 8px; font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
+        .role-chip[data-source="true"] { border-color: var(--green); color: var(--green); }
+        .role-chip button { padding: 3px 6px; }
+        .mapping-grid { display: grid; gap: 7px; }
+        .mapping-row { display: grid; grid-template-columns: minmax(90px, .4fr) 28px minmax(180px, 1fr); gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font: 700 10px/1.3 ui-monospace, Consolas, monospace; }
+        .mapping-row .arrow { color: var(--cyan); text-align: center; }
+        .options-grid { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 9px; }
+        .command-preview { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; color: #cfe8ee; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .task-status { min-height: 18px; color: var(--green); font: 10px/1.4 ui-monospace, Consolas, monospace; }
+        @media (max-width: 1040px) {
+            .role-board { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+        @media (max-width: 920px) {
+            .topbar { align-items: flex-start; flex-direction: column; }
+            .selected-role-layout { grid-template-columns: 1fr; }
+            .timeline-panel { grid-column: auto; }
+            .flow-line { grid-template-columns: 72px 78px 1fr; }
+            .flow-summary { grid-column: 3; }
+            .flow-evidence { grid-column: 3; }
+        }
+        @media (max-width: 760px) {
+            .role-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 560px) {
+            #dashboard-root { padding: 8px; }
+            .role-board { grid-template-columns: 1fr; }
+            .role-metrics { grid-template-columns: 1fr 1fr; }
+            .runtime-kv { grid-template-columns: 90px minmax(0, 1fr); }
+            .options-grid { grid-template-columns: 1fr 1fr; }
+            .mapping-row { grid-template-columns: 70px 20px minmax(0, 1fr); }
+            #runtime-events { max-height: 60vh; padding: 8px 8px 10px 28px; }
+            #runtime-events::before { left: 15px; }
+            .flow-line { grid-template-columns: 62px minmax(0, 1fr); gap: 6px; padding: 9px 0; }
+            .flow-line::before { left: -17px; }
+            .flow-line .role-state { grid-column: 2; }
+            .flow-route, .flow-summary, .flow-evidence { grid-column: 2; min-width: 0; }
+            .dialog-actions button { flex: 1; }
+        }
+        @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+    </style>
+</head>
+<body>
+<main id="dashboard-root" data-dashboard-version="12" data-stale="true" data-stalled="false">
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark">SF</div>
+            <div>
+                <h1>Stable Flow Runtime</h1>
+                <p id="flow-summary">Loading runtime flow...</p>
+            </div>
+        </div>
+        <div class="health-strip">
+            <span id="connection-health" class="health-pill"><span>Connection</span><strong>CHECKING</strong></span>
+            <span id="runner-health" class="health-pill"><span>Runner</span><strong>UNKNOWN</strong></span>
+            <span class="health-pill"><span>Refresh</span><strong id="refresh-age">--</strong></span>
+        </div>
+    </header>
+
+    <div class="notice-stack" aria-live="polite">
+        <div id="connection-notice" class="notice" data-kind="error" hidden></div>
+        <div id="role-action-notice" class="notice" hidden></div>
+        <div id="flow-stall-notice" class="notice" hidden></div>
+    </div>
+
+    <section class="panel role-board-panel" aria-label="Role board">
+        <header class="panel-head"><h2>Role board</h2><span id="role-count" class="panel-count">0</span></header>
+        <div id="role-rail" class="role-board"></div>
+    </section>
+
+    <section class="selected-role-layout" aria-label="Selected role">
+        <section class="panel">
+            <header class="panel-head"><h2 id="role-detail-title">No role selected</h2><span id="selected-role-state" class="role-state">OFFLINE</span></header>
+            <div id="role-metrics" class="role-metrics"></div>
+            <section id="current-task" class="current-task">
+                <div class="current-task-head"><strong>Current task</strong><span id="current-task-progress" class="current-task-progress">not observed</span></div>
+                <pre id="current-task-text">No task observed.</pre>
+            </section>
+            <dl id="selected-role-detail" class="runtime-kv"></dl>
+        </section>
+        <section class="panel">
+            <header class="panel-head"><h2>Responses</h2><span id="response-count" class="panel-count">0</span></header>
+            <div id="role-responses"></div>
+        </section>
+        <section class="panel timeline-panel">
+            <header class="panel-head"><h2>Role timeline</h2><span id="event-count" class="panel-count">0</span></header>
+            <div id="runtime-events"></div>
+        </section>
+    </section>
+</main>
+
+<dialog id="task-dialog" aria-labelledby="task-dialog-title">
+    <form id="task-form">
+        <header class="dialog-head">
+            <h2 id="task-dialog-title">Create task</h2>
+            <button type="button" data-close-dialog="task-dialog" aria-label="Close task composer">Close</button>
+        </header>
+        <div class="dialog-body">
+            <label class="field">
+                <span class="prompt-head"><span>Task prompt</span><button id="toggle-prompt-samples" type="button">Prompt samples</button></span>
+                <div id="prompt-samples" class="prompt-samples" hidden></div>
+                <textarea id="task-prompt" rows="2" maxlength="12000" placeholder="Describe the task..."></textarea>
+            </label>
+            <section>
+                <p class="section-label">Logical roles - execution order</p>
+                <div id="task-logical-order" class="role-order"></div>
+                <div id="task-logical-available" class="available-roles"></div>
+            </section>
+            <section>
+                <p class="section-label">Online browser targets</p>
+                <div id="task-browser-targets" class="browser-targets"></div>
+            </section>
+            <section>
+                <p class="section-label">Role mapping</p>
+                <div id="task-role-mapping" class="mapping-grid"></div>
+            </section>
+            <section>
+                <p class="section-label">Execution options</p>
+                <div class="options-grid">
+                    <label class="field">Timeout<input id="task-timeout" type="number" value="1800" min="1" max="86400"></label>
+                    <label class="field">Request timeout<input id="task-request-timeout" type="number" value="1200" min="1" max="86400"></label>
+                    <label class="field multi-role-option">Parallelism<input id="task-parallelism" type="number" value="4" min="1" max="32"></label>
+                    <label class="field multi-role-option">Max turns<input id="task-max-turns" type="number" value="0" min="0" max="100000"></label>
+                    <label class="field multi-role-option">Reload after<input id="task-reload-after" type="number" value="10" min="0" max="3600"></label>
+                </div>
+            </section>
+            <section>
+                <p class="section-label">Generated command</p>
+                <pre id="task-command-preview" class="command-preview"></pre>
+                <div id="task-status" class="task-status" aria-live="polite"></div>
+            </section>
+        </div>
+        <footer class="dialog-actions">
+            <button type="button" data-close-dialog="task-dialog">Close</button>
+            <button id="create-task" class="primary" type="submit">Create</button>
+        </footer>
+    </form>
+</dialog>
+
+<script>
+(() => {
+    'use strict';
+    const DASHBOARD_CONTRACT_VERSION = 12;
+    const BASE_LOGICAL_ROLES = ['MANAGER', 'PLAN', 'DEV', 'REVIEW', 'AUDIT', 'A', 'B'];
+    const DEFAULT_EXECUTION_OPTIONS = {
+        timeout: 1800,
+        request_timeout: 1200,
+        parallelism: 4,
+        max_turns: 0,
+        reload_after: 10
+    };
+    const PROMPT_SAMPLES = [
+        ['Plan -> DEV -> REVIEW', 'Create a plan, implement it, then review the exact changes and tests.'],
+        ['Review current changes', 'Review the current repository changes and return blockers first.'],
+        ['Continue exact plan', 'Read the exact .plan handoff, continue only the authorized work, and verify it.']
+    ];
+    const ROLE_DATA_TTL_MS = 5000;
+    const TIMELINE_LIMIT = 30;
+
+    let lastGoodRoles = [];
+    let lastGoodFlow = null;
+    let lastGoodRoleDetail = null;
+    let lastGoodRoleEvents = [];
+    let lastSuccessfulAt = 0;
+    let refreshInFlight = false;
+    let sourceStale = { roles: true, flow: true, events: true };
+    let selectedRole = '';
+    let selectedRoleRefreshGeneration = 0;
+    let focusNewestResponse = true;
+    const roleDataCache = new Map();
+    const roleDataInflight = new Map();
+    const roleCardNodes = new Map();
+    const roleCardKeys = new Map();
+    let selectedRoleRenderKey = '';
+    let timelineRenderKey = '';
+    let editorOriginRole = '';
+    let editorLogicalOrder = [];
+    let editorRoleMap = {};
+
+    const byId = (id) => document.getElementById(id);
+    const setText = (target, value) => {
+        const text = value == null ? '' : String(value);
+        if (target.textContent !== text) target.textContent = text;
+    };
+    const clearNode = (target) => { while (target.firstChild) target.removeChild(target.firstChild); };
+    const textNode = (tag, value, className = '') => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        setText(element, value);
+        return element;
+    };
+    const onlineRoles = () => lastGoodRoles.filter((role) => role.online === true);
+    const visibleRoles = () => lastGoodRoles.filter((role) => (
+        role.online === true || ['OFFLINE', 'STALE'].includes(String(role.status || '').toUpperCase())
+    ));
+    const roleByName = (roleName) => lastGoodRoles.find((role) => role.role === roleName);
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function formatRoleAge(seconds) {
+        if (seconds == null || !Number.isFinite(Number(seconds))) return 'unknown';
+        const value = Math.max(0, Math.round(Number(seconds)));
+        if (value < 60) return `${value}s`;
+        if (value < 3600) return `${Math.floor(value / 60)}m`;
+        return `${Math.floor(value / 3600)}h`;
+    }
+
+    function chatPath(role) { return String(role?.page_path || ''); }
+    function shortConversationId(role) {
+        const path = chatPath(role);
+        const match = path.match(/^\/c\/([^/?#]+)/);
+        return match ? match[1].slice(0, 12) : (path === '/' ? 'new chat' : 'unobserved');
+    }
+
+    async function readJson(response) {
+        const body = await response.json().catch(() => ({}));
+        if (response.ok) return body;
+        const detail = typeof body.detail === 'string' ? body.detail : (body.detail?.message || body.detail?.code);
+        const error = new Error(detail || `Request failed: ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
+
+    async function fetchRoles() { return readJson(await fetch('/api/admin/roles')); }
+    async function fetchFlow() { return readJson(await fetch('/api/admin/flow')); }
+    async function fetchRoleDetail(role) {
+        return readJson(await fetch(`/api/admin/role/${encodeURIComponent(role)}?response_limit=10`));
+    }
+    async function fetchRoleEvents(role) {
+        return readJson(await fetch(`/api/admin/role/${encodeURIComponent(role)}/timeline?limit=${TIMELINE_LIMIT}`));
+    }
+
+    function roleState(role) {
+        if (!role?.online) return String(role?.status || 'OFFLINE').toUpperCase() === 'STALE' ? 'STALE' : 'OFFLINE';
+        if (role.current_flow_state) return String(role.current_flow_state).toUpperCase();
+        if (role.active_command) return String(role.active_command.state || role.active_command.action || 'ACTIVE').toUpperCase();
+        return 'IDLE';
+    }
+
+    function stateTone(state) {
+        const normalized = String(state || '').toUpperCase();
+        if (['RUNNING', 'ONLINE', 'DONE', 'RESPONSE'].includes(normalized)) return 'good';
+        if (['WAITING', 'DELIVERED', 'PENDING', 'COMMAND'].includes(normalized)) return 'warn';
+        if (['FAILED', 'STALLED', 'OFFLINE', 'STALE', 'ERROR'].includes(normalized)) return 'bad';
+        return '';
+    }
+
+    function showRoleNotice(message, error = false) {
+        const notice = byId('role-action-notice');
+        setText(notice, message);
+        notice.hidden = !message;
+        notice.dataset.kind = error ? 'error' : '';
+    }
+
+    function compactJson(value, limit = 800) {
+        const text = JSON.stringify(value || {}, null, 2);
+        return text.length > limit ? `${text.slice(0, limit)}...` : text;
+    }
+
+    function addDefinition(container, label, value) {
+        container.appendChild(textNode('dt', label));
+        container.appendChild(textNode('dd', value));
+    }
+
+    function addMetric(container, label, value, tone = '') {
+        const metric = document.createElement('div');
+        metric.className = 'role-metric';
+        metric.appendChild(textNode('span', label));
+        const strong = textNode('strong', value);
+        if (tone) strong.dataset.tone = tone;
+        metric.appendChild(strong);
+        container.appendChild(metric);
+        return strong;
+    }
+
+    function commandTerminalOutcome(action, terminal) {
+        const expected = { CLEAR_COMPOSER_TEXT: 'COMPOSER_TEXT_CLEARED', RELOAD_PAGE: 'PAGE_RELOADING' };
+        const normalizedAction = String(action || '').toUpperCase();
+        const normalizedTerminal = String(terminal || '').toUpperCase();
+        return { ok: expected[normalizedAction] === normalizedTerminal, terminal: normalizedTerminal || 'UNKNOWN' };
+    }
+
+    async function runRoleCommand(roleName, action) {
+        const label = action === 'CLEAR_COMPOSER_TEXT' ? 'Clear txt' : 'F5';
+        const role = roleByName(roleName);
+        if (!role?.online) {
+            showRoleNotice(`${roleName}: ${label} rejected because the Tamper bridge is offline.`, true);
+            return;
+        }
+        try {
+            const body = await readJson(await fetch('/api/admin/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: roleName, action, payload: {} })
+            }));
+            const commandId = body.command?.command_id;
+            if (!commandId) throw new Error('Server did not return a command ID.');
+            showRoleNotice(`${roleName}: ${label} queued.`);
+            for (let attempt = 0; attempt < 60; attempt += 1) {
+                await sleep(250);
+                const status = await readJson(await fetch(`/api/admin/command/${encodeURIComponent(commandId)}`));
+                if (!status.done) continue;
+                const result = commandTerminalOutcome(action, status.status || status.result?.state);
+                showRoleNotice(`${roleName}: ${label} ${result.ok ? 'completed' : `failed (${result.terminal})`}.`, !result.ok);
+                await refreshDashboard({ forceRole: true });
+                return;
+            }
+            showRoleNotice(`${roleName}: ${label} status timed out.`, true);
+        } catch (error) {
+            showRoleNotice(`${roleName}: ${label} failed: ${error.message}`, true);
+        }
+    }
+
+    function applyRoleCache(roleName) {
+        const cached = roleDataCache.get(roleName);
+        if (!cached || roleName !== selectedRole) return false;
+        lastGoodRoleDetail = cached.detail || null;
+        lastGoodRoleEvents = cached.events || [];
+        sourceStale.events = Boolean(cached.stale);
+        return true;
+    }
+
+    async function refreshSelectedRoleData(options) {
+        const force = Boolean(options && options.force);
+        const requestedRole = selectedRole;
+        if (!requestedRole) {
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+            return false;
+        }
+        const cached = roleDataCache.get(requestedRole);
+        if (cached) applyRoleCache(requestedRole);
+        if (!force && cached && Date.now() - cached.fetchedAt < ROLE_DATA_TTL_MS) return false;
+        if (roleDataInflight.has(requestedRole)) {
+            await roleDataInflight.get(requestedRole);
+            applyRoleCache(requestedRole);
+            return false;
+        }
+
+        const generation = ++selectedRoleRefreshGeneration;
+        const request = Promise.allSettled([
+            fetchRoleDetail(requestedRole),
+            fetchRoleEvents(requestedRole)
+        ]).then(([detailResult, timelineResult]) => {
+            const previous = roleDataCache.get(requestedRole) || {};
+            const detail = detailResult.status === 'fulfilled' && detailResult.value.role === requestedRole
+                ? detailResult.value
+                : previous.detail || null;
+            const timelineValid = (
+                timelineResult.status === 'fulfilled'
+                && timelineResult.value.role === requestedRole
+                && (timelineResult.value.events || []).every((event) => event.role === requestedRole)
+            );
+            roleDataCache.set(requestedRole, {
+                detail,
+                events: timelineValid ? timelineResult.value.events || [] : previous.events || [],
+                fetchedAt: Date.now(),
+                stale: detailResult.status !== 'fulfilled' || !timelineValid
+            });
+        }).finally(() => roleDataInflight.delete(requestedRole));
+        roleDataInflight.set(requestedRole, request);
+        await request;
+        if (generation !== selectedRoleRefreshGeneration || requestedRole !== selectedRole) return false;
+        return applyRoleCache(requestedRole);
+    }
+
+    async function selectRole(roleName) {
+        if (selectedRole === roleName) return;
+        selectedRole = roleName;
+        focusNewestResponse = true;
+        if (!applyRoleCache(roleName)) {
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+        }
+        showRoleNotice('');
+        renderRoles();
+        renderSelectedRole();
+        renderEvents();
+        await refreshSelectedRoleData();
+        renderSelectedRole();
+        renderEvents();
+        renderHealth();
+    }
+
+    function roleCardSignature(role) {
+        const dom = role.dom_summary || {};
+        const command = role.active_command || {};
+        return [
+            role.role,
+            role.configured_role || '',
+            role.online ? '1' : '0',
+            role.status || '',
+            role.current_logical_role || '',
+            role.current_flow_state || '',
+            Number(role.turn || 0),
+            role.page_path || '',
+            dom.composer ? '1' : '0',
+            Number(dom.composer_text_len || 0),
+            Number(dom.composer_attachment_count || 0),
+            command.action || '',
+            command.state || ''
+        ].join('\u001f');
+    }
+    function selectedRoleSignature() {
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        const inventory = roleByName(selectedRole);
+        const dom = detail?.observation?.dom_info || {};
+        return JSON.stringify({
+            selectedRole,
+            inventory: inventory ? {
+                role: inventory.role,
+                configured_role: inventory.configured_role,
+                online: inventory.online,
+                status: inventory.status,
+                page_path: inventory.page_path,
+                current_logical_role: inventory.current_logical_role,
+                current_flow_state: inventory.current_flow_state,
+                current_task_id: inventory.current_task_id,
+                reservation_state: inventory.reservation_state,
+                active_command: inventory.active_command,
+                dom_summary: inventory.dom_summary
+            } : null,
+            detail: detail ? {
+                configured_role: detail.configured_role,
+                current_logical_role: detail.current_logical_role,
+                turn: detail.turn,
+                responses: detail.responses,
+                message_counts: detail.message_counts,
+                current_task_id: detail.current_task_id,
+                current_request_id: detail.current_request_id,
+                flow_status: detail.flow_status,
+                last_user: detail.observation?.last_user || detail.last_user,
+                composer: {
+                    ready: dom.composer,
+                    text_len: dom.composer_text_len,
+                    attachments: Array.isArray(dom.composer_attachments) ? dom.composer_attachments.length : 0
+                },
+                active_command: detail.active_command
+            } : null
+        });
+    }
+
+    function timelineSignature() {
+        return JSON.stringify({ selectedRole, events: lastGoodRoleEvents });
+    }
+
+    function updateAgeLabels() {
+        for (const node of document.querySelectorAll('[data-role-age]')) {
+            const role = roleByName(node.dataset.roleAge);
+            if (role) setText(node, `seen ${formatRoleAge(role.last_seen_age_s)}`);
+        }
+        const selectedAge = byId('selected-role-age');
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        if (selectedAge && detail) setText(selectedAge, formatRoleAge(detail.presence?.last_seen_age_s));
+    }
+
+    function roleCard(role) {
+        const stateName = roleState(role);
+        const tone = stateTone(stateName);
+        const card = document.createElement('article');
+        card.className = 'role-card';
+        card.dataset.role = role.role;
+        card.dataset.statusTone = tone;
+        card.classList.toggle('selected', role.role === selectedRole);
+        card.addEventListener('click', () => selectRole(role.role));
+
+        const head = document.createElement('div');
+        head.className = 'role-card-head';
+        const title = document.createElement('div');
+        title.className = 'role-card-title';
+        const h3 = document.createElement('h3');
+        const link = document.createElement('a');
+        link.className = 'role-title-link';
+        link.href = chatPath(role).startsWith('/') ? `https://chatgpt.com${chatPath(role)}` : 'https://chatgpt.com/';
+        link.target = '_blank';
+        link.rel = 'noreferrer';
+        setText(link, `${role.role} · ${role.configured_role || role.role} ↗`);
+        link.addEventListener('click', (event) => event.stopPropagation());
+        h3.appendChild(link);
+        title.appendChild(h3);
+        title.appendChild(textNode('div', role.online ? 'live evidence' : 'cached evidence', 'role-evidence'));
+        head.appendChild(title);
+        const state = textNode('span', stateName, 'role-state');
+        state.dataset.tone = tone;
+        head.appendChild(state);
+        card.appendChild(head);
+
+        const meta = document.createElement('div');
+        meta.className = 'role-card-meta';
+        meta.appendChild(textNode('span', `logical ${role.current_logical_role || 'idle'}`));
+        meta.appendChild(textNode('span', `turn ${Number(role.turn || 0)}`));
+        const age = textNode('span', `seen ${formatRoleAge(role.last_seen_age_s)}`);
+        age.dataset.roleAge = role.role;
+        meta.appendChild(age);
+        card.appendChild(meta);
+        card.appendChild(textNode('div', `${role.role} · ${shortConversationId(role)}`, 'role-chat'));
+
+        const dom = role.dom_summary || {};
+        const composer = document.createElement('div');
+        composer.className = 'role-composer';
+        composer.appendChild(textNode('span', role.online ? 'composer' : 'composer · cached'));
+        composer.appendChild(textNode('strong', dom.composer
+            ? `ready · ${Number(dom.composer_text_len || 0)}c · ${Number(dom.composer_attachment_count || 0)}f`
+            : 'not observed'));
+        card.appendChild(composer);
+
+        const actions = document.createElement('div');
+        actions.className = 'role-card-actions';
+        const clearButton = textNode('button', 'Clear txt');
+        clearButton.type = 'button';
+        clearButton.title = 'Clear composer text';
+        clearButton.disabled = !role.online || !dom.composer || Number(dom.composer_text_len || 0) === 0;
+        clearButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'CLEAR_COMPOSER_TEXT'); });
+        const reloadButton = textNode('button', 'F5');
+        reloadButton.type = 'button';
+        reloadButton.title = 'Reload role page';
+        reloadButton.disabled = !role.online;
+        reloadButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'RELOAD_PAGE'); });
+        const taskButton = textNode('button', '+ task', 'primary');
+        taskButton.type = 'button';
+        taskButton.title = 'Create task for this controller';
+        taskButton.addEventListener('click', (event) => { event.stopPropagation(); openTaskComposer(role.role); });
+        actions.append(clearButton, reloadButton, taskButton);
+        card.appendChild(actions);
+        return card;
+    }
+
+    function renderRoles() {
+        const rail = byId('role-rail');
+        const roles = visibleRoles();
+        setText(byId('role-count'), roles.length);
+
+        if (!roles.length) {
+            if (rail.dataset.empty !== 'true') {
+                clearNode(rail);
+                roleCardNodes.clear();
+                roleCardKeys.clear();
+                rail.appendChild(textNode('div', 'No operational browser roles.', 'role-empty'));
+                rail.dataset.empty = 'true';
+            }
+            return;
+        }
+
+        if (rail.dataset.empty === 'true') {
+            clearNode(rail);
+            rail.dataset.empty = 'false';
+        }
+
+        const activeRoles = new Set(roles.map((role) => role.role));
+        for (const [roleName, card] of roleCardNodes) {
+            if (activeRoles.has(roleName)) continue;
+            card.remove();
+            roleCardNodes.delete(roleName);
+            roleCardKeys.delete(roleName);
+        }
+
+        const orderedCards = [];
+        for (const role of roles) {
+            const key = roleCardSignature(role);
+            let card = roleCardNodes.get(role.role);
+            if (!card || roleCardKeys.get(role.role) !== key) {
+                const replacement = roleCard(role);
+                if (card) card.replaceWith(replacement);
+                else rail.appendChild(replacement);
+                card = replacement;
+                roleCardNodes.set(role.role, card);
+                roleCardKeys.set(role.role, key);
+            }
+            card.classList.toggle('selected', role.role === selectedRole);
+            orderedCards.push(card);
+        }
+
+        let cursor = rail.firstElementChild;
+        for (const card of orderedCards) {
+            if (card === cursor) cursor = cursor.nextElementSibling;
+            else rail.insertBefore(card, cursor);
+        }
+        updateAgeLabels();
+    }
+    function latestTaskText(raw) {
+        const text = String(raw || '').trim();
+        if (!text) return '';
+        for (const marker of ['GOAL', 'INSTRUCTION_FROM_CALLER', 'USER_PROMPT']) {
+            const expression = new RegExp(`(?:^|\\n)${marker}:\\s*\\n([\\s\\S]*?)(?=\\n[A-Z][A-Z0-9_ ]*:\\s*\\n|$)`);
+            const match = text.match(expression);
+            if (match?.[1]?.trim()) return match[1].trim();
+        }
+        return text;
+    }
+
+    function renderSelectedRole() {
+        const renderKey = selectedRoleSignature();
+        if (renderKey === selectedRoleRenderKey) {
+            updateAgeLabels();
+            return;
+        }
+        selectedRoleRenderKey = renderKey;
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        const inventory = roleByName(selectedRole);
+        const metrics = byId('role-metrics');
+        const definitions = byId('selected-role-detail');
+        const responses = byId('role-responses');
+        const previousResponseTop = responses.scrollTop;
+        const responseWasNearBottom = responses.scrollHeight - responses.scrollTop - responses.clientHeight < 32;
+        clearNode(metrics);
+        clearNode(definitions);
+        clearNode(responses);
+        if (!selectedRole || !inventory || !detail) {
+            setText(byId('role-detail-title'), selectedRole ? `${selectedRole} · loading` : 'No role selected');
+            setText(byId('selected-role-state'), selectedRole ? 'LOADING' : 'OFFLINE');
+            setText(byId('current-task-progress'), 'not observed');
+            setText(byId('current-task-text'), 'No task observed.');
+            setText(byId('response-count'), 0);
+            responses.appendChild(textNode('div', 'No response evidence.', 'role-empty'));
+            return;
+        }
+
+        const state = roleState(inventory);
+        setText(byId('role-detail-title'), `${detail.role} · ${detail.configured_role} - logical ${detail.current_logical_role || 'idle'}`);
+        const statePill = byId('selected-role-state');
+        setText(statePill, state);
+        statePill.dataset.tone = stateTone(state);
+        const dom = detail.observation?.dom_info || {};
+        const counts = detail.message_counts || {};
+        addMetric(metrics, 'Status', state, stateTone(state));
+        addMetric(metrics, 'Turn', Number(detail.turn || 0));
+        const selectedAge = addMetric(metrics, 'Last seen', formatRoleAge(detail.presence?.last_seen_age_s));
+        selectedAge.id = 'selected-role-age';
+        addMetric(metrics, 'Composer', `${Number(dom.composer_text_len || 0)} chars`);
+
+        const currentTask = latestTaskText(detail.observation?.last_user || detail.last_user);
+        setText(byId('current-task-progress'), `user ${Number(counts.user || 0)} · assistant ${Number(counts.assistant || 0)} · ${state}`);
+        setText(byId('current-task-text'), currentTask || 'No task observed.');
+
+        addDefinition(definitions, 'Chat', `${detail.role} - ${shortConversationId(inventory)} · ${inventory.page_path || 'unobserved'}`);
+        addDefinition(definitions, 'Flow', flowStatusLine(detail.flow_status));
+        addDefinition(definitions, 'Messages', `user ${Number(counts.user || 0)} · assistant ${Number(counts.assistant || 0)} · images ${Number(counts.images || 0)}`);
+        addDefinition(definitions, 'Composer', dom.composer ? `ready · text ${Number(dom.composer_text_len || 0)} · attachments ${Array.isArray(dom.composer_attachments) ? dom.composer_attachments.length : 0}` : 'not observed');
+        addDefinition(definitions, 'Active command', detail.active_command ? `${detail.active_command.action} · ${detail.active_command.state}` : 'none');
+
+        const projected = detail.responses || [];
+        setText(byId('response-count'), projected.length);
+        if (!projected.length) responses.appendChild(textNode('div', 'No assistant response retained.', 'role-empty'));
+        projected.forEach((response, index) => {
+            const article = document.createElement('article');
+            article.className = 'role-response';
+            article.dataset.latest = String(index === projected.length - 1);
+            const head = document.createElement('header');
+            head.appendChild(textNode('span', `turn ${response.turn}`));
+            head.appendChild(textNode('span', `${response.text_len} chars · ${response.image_count} images`));
+            article.appendChild(head);
+            article.appendChild(textNode('pre', response.text || '(empty response)'));
+            responses.appendChild(article);
+        });
+        const followNewest = focusNewestResponse || responseWasNearBottom;
+        focusNewestResponse = false;
+        requestAnimationFrame(() => {
+            responses.scrollTop = followNewest ? responses.scrollHeight : previousResponseTop;
+        });
+    }
+
+    function flowStatusLine(flow) {
+        if (!flow) return 'none';
+        const state = String(flow.state || 'UNKNOWN').toUpperCase();
+        const logical = flow.logical_role || selectedRole || 'role';
+        if (state === 'RUNNING') return `${flow.from_role || 'User'} -> ${logical} · RUNNING`;
+        if (state === 'DONE') return `${logical}${flow.sent_to ? ` -> ${flow.sent_to}` : ''} · DONE`;
+        return `${logical} · ${state}`;
+    }
+
+    function flowEventView(event) {
+        const name = String(event?.event || 'EVENT').toUpperCase();
+        const inferred = name.startsWith('FLOW_') ? name.slice(5) : '';
+        const state = String(event?.state || inferred || (name.includes('FAILED') ? 'ERROR' : name === 'ASSISTANT_DONE' ? 'RESPONSE' : name === 'COMMAND_CREATED' ? 'COMMAND' : 'EVENT')).toUpperCase();
+        const logical = String(event?.logical_role || event?.role || 'role');
+        if (state === 'RUNNING') {
+            return { state, route: `${event?.from_role || 'User'} -> ${logical}`, summary: `${logical} is running` };
+        }
+        if (state === 'DONE') {
+            const origin = event?.done_from ? ` · from ${event.done_from}` : '';
+            return { state, route: event?.sent_to ? `${logical} -> ${event.sent_to}` : logical, summary: `${logical} completed${origin}` };
+        }
+        if (state === 'WAITING') {
+            return { state, route: logical, summary: `${logical} is waiting` };
+        }
+        if (state === 'COMMAND') {
+            return { state, route: logical, summary: `${event?.action || 'browser command'} created` };
+        }
+        if (state === 'RESPONSE') {
+            return { state, route: logical, summary: 'Assistant response completed' };
+        }
+        return { state, route: logical, summary: String(event?.reason || event?.text || name).replaceAll('_', ' ') };
+    }
+
+    function renderEvents() {
+        const renderKey = timelineSignature();
+        if (renderKey === timelineRenderKey) return;
+        timelineRenderKey = renderKey;
+        const container = byId('runtime-events');
+        const previousTimelineTop = container.scrollTop;
+        const timelineWasNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 32;
+        clearNode(container);
+        setText(byId('event-count'), lastGoodRoleEvents.length);
+        if (!selectedRole) {
+            container.appendChild(textNode('div', 'Select a role to inspect its flow.', 'role-empty'));
+            return;
+        }
+        if (!lastGoodRoleEvents.length) {
+            container.appendChild(textNode('div', `No flow events retained for ${selectedRole}.`, 'role-empty'));
+            return;
+        }
+        for (const event of lastGoodRoleEvents) {
+            const view = flowEventView(event);
+            const row = document.createElement('article');
+            row.className = 'flow-line';
+            row.appendChild(textNode('time', event.ts || ''));
+            const state = textNode('span', view.state, 'role-state');
+            state.dataset.tone = stateTone(view.state);
+            row.appendChild(state);
+            row.appendChild(textNode('span', view.route, 'flow-route'));
+            row.appendChild(textNode('span', view.summary, 'flow-summary'));
+            const evidence = { ...event };
+            delete evidence.ts;
+            delete evidence.role;
+            delete evidence.event;
+            if (Object.keys(evidence).length) {
+                const details = document.createElement('details');
+                details.className = 'flow-evidence';
+                details.appendChild(textNode('summary', 'Evidence'));
+                details.appendChild(textNode('pre', compactJson(evidence)));
+                row.appendChild(details);
+            }
+            container.appendChild(row);
+        }
+        requestAnimationFrame(() => {
+            container.scrollTop = timelineWasNearBottom ? container.scrollHeight : previousTimelineTop;
+        });
+    }
+
+    function renderHealth() {
+        const root = byId('dashboard-root');
+        const stale = sourceStale.roles || sourceStale.flow || sourceStale.events;
+        root.dataset.stale = String(stale);
+        const connection = byId('connection-health');
+        connection.dataset.tone = stale ? 'warn' : 'good';
+        setText(connection.querySelector('strong'), stale ? 'PARTIAL' : 'CONNECTED');
+        const notice = byId('connection-notice');
+        notice.hidden = !stale;
+        if (stale) setText(notice, 'One or more runtime sources failed. Last good role/flow evidence is retained.');
+
+        const flow = lastGoodFlow?.flow;
+        const liveness = lastGoodFlow?.liveness;
+        const runner = liveness?.runner || {};
+        const runnerHealth = byId('runner-health');
+        const terminal = Boolean(flow?.terminal_status);
+        const runnerState = terminal ? 'IDLE' : (runner.state || 'UNKNOWN');
+        const heartbeat = runner.last_heartbeat_age_s == null ? 'no heartbeat' : `${Math.round(runner.last_heartbeat_age_s)}s`;
+        setText(runnerHealth.querySelector('strong'), `${runnerState}${runner.pid == null ? '' : ` · PID ${runner.pid}`} · ${heartbeat}`);
+        runnerHealth.dataset.tone = terminal || runnerState === 'RUNNING' ? 'good' : (liveness?.stalled ? 'bad' : 'warn');
+        setText(byId('refresh-age'), lastSuccessfulAt ? `${Math.max(0, Math.floor((Date.now() - lastSuccessfulAt) / 1000))}s` : 'never');
+
+        const stallNotice = byId('flow-stall-notice');
+        if (liveness?.stalled) {
+            setText(stallNotice, `${liveness.logical_role || 'flow'} · STALLED\n${liveness.reason || 'Flow did not terminate'}\nNext: ${liveness.next_action || 'recover existing flow'}`);
+            stallNotice.hidden = false;
+            root.dataset.stalled = 'true';
+            setText(byId('flow-summary'), `${liveness.logical_role || 'flow'} · STALLED`);
+        } else {
+            stallNotice.hidden = true;
+            root.dataset.stalled = 'false';
+            setText(byId('flow-summary'), flow ? (terminal ? `Last flow ${flow.request_id} · ${String(flow.terminal_status).toUpperCase()}` : `Active flow ${flow.request_id} · ${flow.run_id}`) : 'No active flow');
+        }
+        updateAgeLabels();
+    }
+
+    function renderDashboard() {
+        renderRoles();
+        renderSelectedRole();
+        renderEvents();
+        renderHealth();
+    }
+
+    async function refreshDashboard(options) {
+        const forceRole = Boolean(options && options.forceRole);
+        if (refreshInFlight || (document.hidden && !forceRole)) return;
+        refreshInFlight = true;
+        try {
+            const [roleResult, flowResult] = await Promise.allSettled([fetchRoles(), fetchFlow()]);
+            if (roleResult.status === 'fulfilled') {
+                lastGoodRoles = roleResult.value.roles || [];
+                sourceStale.roles = false;
+                const roles = visibleRoles();
+                if (!roles.some((role) => role.role === selectedRole)) {
+                    selectedRole = roles[0]?.role || '';
+                    selectedRoleRefreshGeneration += 1;
+                    focusNewestResponse = true;
+                    if (!applyRoleCache(selectedRole)) {
+                        lastGoodRoleDetail = null;
+                        lastGoodRoleEvents = [];
+                    }
+                }
+            } else sourceStale.roles = true;
+            if (flowResult.status === 'fulfilled') {
+                lastGoodFlow = flowResult.value;
+                sourceStale.flow = false;
+            } else sourceStale.flow = true;
+            if (selectedRole) await refreshSelectedRoleData({ force: forceRole });
+            lastSuccessfulAt = Date.now();
+        } finally {
+            refreshInFlight = false;
+            renderDashboard();
+        }
+    }
+
+    function logicalChoices() {
+        return [...new Set([
+            ...BASE_LOGICAL_ROLES,
+            ...onlineRoles().map((role) => role.configured_role).filter(Boolean),
+            ...onlineRoles().map((role) => role.role),
+            ...editorLogicalOrder
+        ])];
+    }
+
+    function editorPhysicalTargets() {
+        return [...new Set(onlineRoles().map((role) => role.role).filter(Boolean))];
+    }
+
+    function validateOnlineTaskTargets(roleMap, onlineRoleNames) {
+        const online = new Set(onlineRoleNames);
+        for (const [logicalRole, physicalRole] of Object.entries(roleMap)) {
+            if (!online.has(physicalRole)) throw new Error(`${logicalRole} maps to ${physicalRole || '<empty>'}, which is offline.`);
+        }
+    }
+
+    function defaultPhysicalFor(logicalRole) {
+        const live = onlineRoles();
+        const exact = live.find((role) => role.role === logicalRole);
+        if (exact) return exact.role;
+        if (editorOriginRole && live.some((role) => role.role === editorOriginRole)) return editorOriginRole;
+        return live[0]?.role || '';
+    }
+
+    function deriveFinishRoles(logicalRoles) {
+        for (const preferred of ['MANAGER', 'PLAN', 'REVIEW']) {
+            if (logicalRoles.includes(preferred)) return [preferred];
+        }
+        return logicalRoles.length ? [logicalRoles[0]] : [];
+    }
+
+    function commandNumber(value) {
+        const number = Number(value);
+        return Number.isInteger(number) ? String(number) : String(number);
+    }
+
+    function quoteCli(value) {
+        const text = String(value ?? '');
+        let result = '"';
+        let backslashes = 0;
+        for (const char of text) {
+            if (char === '\\') {
+                backslashes += 1;
+                continue;
+            }
+            if (char === '"') {
+                result += '\\'.repeat(backslashes * 2 + 1) + '"';
+                backslashes = 0;
+                continue;
+            }
+            if (backslashes) {
+                result += '\\'.repeat(backslashes);
+                backslashes = 0;
+            }
+            result += char;
+        }
+        if (backslashes) result += '\\'.repeat(backslashes * 2);
+        return `${result}"`;
+    }
+
+    function executionOptionsFromForm() {
+        const options = {
+            timeout: Number(byId('task-timeout').value),
+            request_timeout: Number(byId('task-request-timeout').value),
+            parallelism: Number(byId('task-parallelism').value),
+            max_turns: Number(byId('task-max-turns').value),
+            reload_after: Number(byId('task-reload-after').value)
+        };
+        for (const name of ['timeout', 'request_timeout', 'reload_after']) {
+            if (!Number.isFinite(options[name])) throw new Error(`${name} must be a finite number.`);
+        }
+        for (const name of ['parallelism', 'max_turns']) {
+            if (!Number.isInteger(options[name])) throw new Error(`${name} must be a whole number.`);
+        }
+        if (options.timeout < 1 || options.timeout > 86400) throw new Error('timeout must be between 1 and 86400.');
+        if (options.request_timeout < 1 || options.request_timeout > 86400) throw new Error('request_timeout must be between 1 and 86400.');
+        if (options.parallelism < 1 || options.parallelism > 32) throw new Error('parallelism must be between 1 and 32.');
+        if (options.max_turns < 0 || options.max_turns > 100000) throw new Error('max_turns must be between 0 and 100000.');
+        if (options.reload_after < 0 || options.reload_after > 3600) throw new Error('reload_after must be between 0 and 3600.');
+        return options;
+    }
+
+    function buildMainCommand(logicalRoles, roleMap, finishRoles, options, prompt) {
+        const physicalRoles = [...new Set(logicalRoles.map((role) => roleMap[role]).filter(Boolean))];
+        const roleMapText = logicalRoles.map((role) => `${role}=${roleMap[role] || ''}`).join(' ');
+        return [
+            'uv run main.py',
+            `--role ${quoteCli(logicalRoles.join(','))}`,
+            `--browser-roles ${quoteCli(physicalRoles.join(','))}`,
+            `--role-map ${quoteCli(roleMapText)}`,
+            `--finish-roles ${quoteCli(finishRoles.join(','))}`,
+            `--timeout ${commandNumber(options.timeout)}`,
+            `--request-timeout ${commandNumber(options.request_timeout)}`,
+            `--parallelism ${options.parallelism}`,
+            `--max-turns ${options.max_turns}`,
+            `--reload-after ${commandNumber(options.reload_after)}`,
+            `--goal ${quoteCli(prompt || '<task prompt>')}`
+        ].join(' ');
+    }
+
+    function buildRoleCommand(logicalRoles, roleMap, options, prompt) {
+        const role = roleMap[logicalRoles[0]] || '';
+        return [
+            'uv run role.py',
+            `--role ${quoteCli(role)}`,
+            `--timeout ${commandNumber(options.timeout)}`,
+            `--request-timeout ${commandNumber(options.request_timeout)}`,
+            `--prompt ${quoteCli(prompt || '<task prompt>')}`
+        ].join(' ');
+    }
+
+    function buildLaunchCommand(logicalRoles, roleMap, finishRoles, options, prompt) {
+        return logicalRoles.length === 1
+            ? buildRoleCommand(logicalRoles, roleMap, options, prompt)
+            : buildMainCommand(logicalRoles, roleMap, finishRoles, options, prompt);
+    }
+
+    function addLogicalRole(roleName) {
+        const role = String(roleName || '').trim().toUpperCase();
+        if (!role || editorLogicalOrder.includes(role)) return;
+        editorLogicalOrder.push(role);
+        editorRoleMap[role] = defaultPhysicalFor(role);
+        renderTaskComposer();
+    }
+
+    function removeLogicalRole(roleName) {
+        editorLogicalOrder = editorLogicalOrder.filter((role) => role !== roleName);
+        delete editorRoleMap[roleName];
+        renderTaskComposer();
+    }
+
+    function moveLogicalRole(roleName, delta) {
+        const index = editorLogicalOrder.indexOf(roleName);
+        const destination = index + delta;
+        if (index < 0 || destination < 0 || destination >= editorLogicalOrder.length) return;
+        [editorLogicalOrder[index], editorLogicalOrder[destination]] = [editorLogicalOrder[destination], editorLogicalOrder[index]];
+        renderTaskComposer();
+    }
+
+    function renderTaskComposer() {
+        const order = byId('task-logical-order');
+        const available = byId('task-logical-available');
+        const targets = byId('task-browser-targets');
+        const mapping = byId('task-role-mapping');
+        clearNode(order);
+        clearNode(available);
+        clearNode(targets);
+        clearNode(mapping);
+
+        editorLogicalOrder.forEach((roleName, index) => {
+            const chip = document.createElement('span');
+            chip.className = 'role-chip';
+            chip.appendChild(textNode('strong', `${index + 1}. ${roleName}`));
+            const left = textNode('button', '←');
+            left.type = 'button';
+            left.disabled = index === 0;
+            left.addEventListener('click', () => moveLogicalRole(roleName, -1));
+            const right = textNode('button', '→');
+            right.type = 'button';
+            right.disabled = index === editorLogicalOrder.length - 1;
+            right.addEventListener('click', () => moveLogicalRole(roleName, 1));
+            const remove = textNode('button', '×');
+            remove.type = 'button';
+            remove.addEventListener('click', () => removeLogicalRole(roleName));
+            chip.append(left, right, remove);
+            order.appendChild(chip);
+        });
+        if (!order.firstChild) order.appendChild(textNode('span', 'Select at least one logical role.', 'role-empty'));
+
+        logicalChoices().filter((role) => !editorLogicalOrder.includes(role)).forEach((roleName) => {
+            const button = textNode('button', `+ ${roleName}`, 'role-chip');
+            button.type = 'button';
+            button.addEventListener('click', () => addLogicalRole(roleName));
+            available.appendChild(button);
+        });
+
+        const liveTargets = editorPhysicalTargets();
+        liveTargets.forEach((roleName) => {
+            const chip = textNode('span', `${roleName} · online`, 'role-chip');
+            chip.dataset.source = 'true';
+            targets.appendChild(chip);
+        });
+        if (!targets.firstChild) targets.appendChild(textNode('span', 'No online browser target.', 'role-empty'));
+
+        document.querySelectorAll('.multi-role-option').forEach((field) => {
+            field.hidden = editorLogicalOrder.length === 1;
+        });
+
+        editorLogicalOrder.forEach((roleName) => {
+            if (!editorRoleMap[roleName]) editorRoleMap[roleName] = defaultPhysicalFor(roleName);
+            const current = editorRoleMap[roleName] || '';
+            const row = document.createElement('div');
+            row.className = 'mapping-row';
+            row.appendChild(textNode('span', roleName));
+            row.appendChild(textNode('span', '→', 'arrow'));
+            const select = document.createElement('select');
+            select.setAttribute('aria-label', `Map ${roleName} to browser role`);
+            if (current && !liveTargets.includes(current)) {
+                const stale = new Option(`${current} - offline`, current);
+                stale.disabled = true;
+                stale.selected = true;
+                select.appendChild(stale);
+            }
+            liveTargets.forEach((physicalRole) => select.appendChild(new Option(physicalRole, physicalRole)));
+            if (select.options.length) select.value = current;
+            select.addEventListener('change', () => { editorRoleMap[roleName] = select.value; updateCommandPreview(); });
+            row.appendChild(select);
+            mapping.appendChild(row);
+        });
+        updateCommandPreview();
+    }
+
+    function updateCommandPreview() {
+        try {
+            if (!editorLogicalOrder.length) throw new Error('Select at least one logical role.');
+            const roleMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
+            validateOnlineTaskTargets(roleMap, editorPhysicalTargets());
+            setText(byId('task-command-preview'), buildLaunchCommand(
+                editorLogicalOrder,
+                roleMap,
+                deriveFinishRoles(editorLogicalOrder),
+                executionOptionsFromForm(),
+                byId('task-prompt').value.trim()
+            ));
+        } catch (error) {
+            setText(byId('task-command-preview'), `Invalid command: ${error.message}`);
+        }
+    }
+
+    function autoSizePrompt() {
+        const textarea = byId('task-prompt');
+        textarea.style.height = 'auto';
+        const lineHeight = 20;
+        const minimum = lineHeight * 2 + 18;
+        const maximum = lineHeight * 10 + 18;
+        textarea.style.height = `${Math.min(maximum, Math.max(minimum, textarea.scrollHeight))}px`;
+        textarea.style.overflowY = textarea.scrollHeight > maximum ? 'auto' : 'hidden';
+    }
+
+    function renderPromptSamples() {
+        const container = byId('prompt-samples');
+        clearNode(container);
+        PROMPT_SAMPLES.forEach(([label, prompt]) => {
+            const button = textNode('button', label);
+            button.type = 'button';
+            button.addEventListener('click', () => {
+                byId('task-prompt').value = prompt;
+                container.hidden = true;
+                autoSizePrompt();
+                updateCommandPreview();
+            });
+            container.appendChild(button);
+        });
+    }
+
+    function openTaskComposer(originRole) {
+        editorOriginRole = String(originRole || '').trim().toUpperCase();
+        const initialLogical = editorOriginRole || BASE_LOGICAL_ROLES[0];
+        editorLogicalOrder = initialLogical ? [initialLogical] : [];
+        editorRoleMap = initialLogical ? { [initialLogical]: defaultPhysicalFor(initialLogical) } : {};
+        byId('task-prompt').value = '';
+        byId('task-timeout').value = DEFAULT_EXECUTION_OPTIONS.timeout;
+        byId('task-request-timeout').value = DEFAULT_EXECUTION_OPTIONS.request_timeout;
+        byId('task-parallelism').value = DEFAULT_EXECUTION_OPTIONS.parallelism;
+        byId('task-max-turns').value = DEFAULT_EXECUTION_OPTIONS.max_turns;
+        byId('task-reload-after').value = DEFAULT_EXECUTION_OPTIONS.reload_after;
+        byId('prompt-samples').hidden = true;
+        setText(byId('task-status'), '');
+        setText(byId('task-dialog-title'), `Create task from ${editorOriginRole || initialLogical}`);
+        renderTaskComposer();
+        autoSizePrompt();
+        byId('task-dialog').showModal();
+        requestAnimationFrame(() => byId('task-prompt').focus());
+    }
+
+    function taskLaunchPayload() {
+        const prompt = byId('task-prompt').value.trim();
+        if (!prompt) throw new Error('Task prompt is required.');
+        if (!editorOriginRole || !editorPhysicalTargets().includes(editorOriginRole)) {
+            throw new Error(`Controller ${editorOriginRole || '<empty>'} is offline.`);
+        }
+        if (!editorLogicalOrder.length) throw new Error('Select at least one logical role.');
+        const roleMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
+        validateOnlineTaskTargets(roleMap, editorPhysicalTargets());
+        return {
+            controller_role: editorOriginRole,
+            prompt,
+            logical_roles: [...editorLogicalOrder],
+            physical_role_map: roleMap,
+            finish_roles: deriveFinishRoles(editorLogicalOrder),
+            execution_options: executionOptionsFromForm()
+        };
+    }
+
+    async function submitTask(event) {
+        event.preventDefault();
+        const createButton = byId('create-task');
+        try {
+            const payload = taskLaunchPayload();
+            createButton.disabled = true;
+            setText(byId('task-status'), 'Creating...');
+            const body = await readJson(await fetch('/api/admin/tasks/launch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }));
+            const run = body.run;
+            if (!run?.run_id || !Number(run.pid)) {
+                throw new Error('Server did not confirm a launched runner process.');
+            }
+            roleDataCache.delete(editorOriginRole);
+            byId('task-dialog').close();
+            showRoleNotice(`${editorOriginRole}: run ${run.run_id} started (PID ${run.pid}).`);
+            await refreshDashboard({ forceRole: true });
+        } catch (error) {
+            const message = error.status === 405
+                ? 'Task launch route is not active. Restart Tampermonkey-Auto, then retry.'
+                : error.message;
+            setText(byId('task-status'), `Create failed: ${message}`);
+        } finally {
+            createButton.disabled = false;
+        }
+    }
+
+    function installEvents() {
+        byId('toggle-prompt-samples').addEventListener('click', () => {
+            const samples = byId('prompt-samples');
+            samples.hidden = !samples.hidden;
+        });
+        byId('task-prompt').addEventListener('input', () => {
+            autoSizePrompt();
+            updateCommandPreview();
+        });
+        for (const id of ['task-timeout', 'task-request-timeout', 'task-parallelism', 'task-max-turns', 'task-reload-after']) {
+            byId(id).addEventListener('input', updateCommandPreview);
+            byId(id).addEventListener('change', updateCommandPreview);
+        }
+        byId('task-form').addEventListener('submit', submitTask);
+        for (const button of document.querySelectorAll('[data-close-dialog]')) {
+            button.addEventListener('click', () => byId(button.dataset.closeDialog).close());
+        }
+        renderPromptSamples();
+    }
+
+    installEvents();
+    refreshDashboard({ forceRole: true });
+    setInterval(() => {
+        if (!document.hidden) refreshDashboard();
+    }, 2000);
+    setInterval(renderHealth, 1000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshDashboard({ forceRole: true });
+    });
+})();
+</script>
+</body>
+</html>

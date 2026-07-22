@@ -27,7 +27,9 @@ def parse_route(text: str) -> Route:
         for key, value in parsed.items():
             raw_key = str(key or "").strip()
             if raw_key.lower() == "command":
-                command = str(value or "").strip().lower() or "none"
+                if not isinstance(value, str):
+                    return Route(raw=candidate, error="command must be a string")
+                command = value.strip().lower() or "none"
                 if command not in ALLOWED_COMMANDS:
                     return Route(raw=candidate, error=f"invalid command: {value}")
                 if command == "none":
@@ -36,7 +38,9 @@ def parse_route(text: str) -> Route:
             role = normalize_role(raw_key)
             if not ROUTE_KEY_RE.match(role):
                 return Route(raw=candidate, error=f"invalid role key: {key}")
-            msg = str(value).strip()
+            if not isinstance(value, str):
+                return Route(raw=candidate, error=f"message for {role} must be a string")
+            msg = value.strip()
             if not msg:
                 return Route(raw=candidate, error=f"empty message for {role}")
             targets[role] = msg

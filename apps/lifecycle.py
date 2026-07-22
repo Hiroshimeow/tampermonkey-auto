@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+from apps.bridge import BridgeClient
 from apps.models import FlowState, FlowStopError, TurnResult
 from apps.text import normalize_role
 
@@ -79,8 +80,38 @@ class BrowserLifecycleMixin:
         if self.dry_run:
             print(f"[new-chat] dry-run browser_role={physical_role}", flush=True)
             return {"done": True, "status": "DRY_RUN_NEW_CHAT"}
-        before_snapshot = self.client.role_snapshot(physical_role)
-        acknowledgement = self.client.new_chat(physical_role, timeout_s=self.args.preflight_timeout)
+
+        deadline = time.monotonic() + max(0.0, float(self.args.preflight_timeout))
+
+        def remaining(context: str) -> float:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise RuntimeError(f"{physical_role} NEW_CHAT exhausted deadline during {context}")
+            return budget
+
+        before_snapshot = self.client.role_snapshot(
+            physical_role,
+            timeout_s=remaining("initial snapshot"),
+        )
+        if BridgeClient.is_clean_root_snapshot(before_snapshot):
+            page_instance_id = BridgeClient._snapshot_page_generation(before_snapshot)
+            print(
+                f"[new-chat] browser_role={physical_role} terminal_status=NEW_CHAT_READY "
+                f"generation={page_instance_id} path=/ rule=already_clean_root",
+                flush=True,
+            )
+            return {
+                "done": True,
+                "status": "NEW_CHAT_READY",
+                "page_instance_id": page_instance_id,
+                "page_path": "/",
+                "readiness_rule": "already_clean_root",
+            }
+        acknowledgement = self.client.new_chat(
+            physical_role,
+            timeout_s=remaining("navigation acknowledgement"),
+            _deadline=deadline,
+        )
         acknowledgement_status = str(acknowledgement.get("status") or "")
         print(
             f"[new-chat] browser_role={physical_role} acknowledgement={acknowledgement_status or 'none'} "
@@ -95,7 +126,8 @@ class BrowserLifecycleMixin:
         ready = self.client.wait_new_chat_ready(
             physical_role,
             before_snapshot,
-            timeout_s=self.args.preflight_timeout,
+            timeout_s=remaining("terminal readiness"),
+            _deadline=deadline,
         )
         print(
             f"[new-chat] browser_role={physical_role} terminal_status={ready.get('status')} "

@@ -15,6 +15,7 @@ from apps.constants import (
     DEFAULT_RESPONSE_RECOVERY_PAGE_WAIT_S,
     DEFAULT_RESPONSE_RECOVERY_POLL_S,
     DEFAULT_RESPONSE_RECOVERY_RELOAD_DELAY_S,
+    DEFAULT_RESPONSE_STABLE_CONFIRM_S,
 )
 
 
@@ -851,6 +852,7 @@ class BridgeClient:
         baseline: ResponseActivity | None = None,
         require_fresh: bool = False,
         allow_reload: bool = True,
+        stable_confirm_s: float = DEFAULT_RESPONSE_STABLE_CONFIRM_S,
         *,
         _deadline: float | None = None,
     ) -> str:
@@ -862,6 +864,7 @@ class BridgeClient:
         active_reload_used = False
         stable_key: tuple[str, int, str] | None = None
         stable_samples = 0
+        stable_since = 0.0
         stable_last_seq = 0
         strongest_key: tuple[str, int, str] | None = None
         strongest_response = ""
@@ -961,12 +964,19 @@ class BridgeClient:
                 else:
                     stable_key = candidate_key
                     stable_samples = 1
+                    stable_since = time.monotonic()
                 stable_last_seq = activity.observation_seq
-                if stable_samples >= 2:
+                # A different observation_seq only proves another poll ran, not
+                # that the response has genuinely settled -- require real
+                # elapsed time since this candidate first looked complete
+                # before trusting it, so a mid-generation pause on a
+                # plausible-looking prefix can't be mistaken for "done".
+                if stable_samples >= 2 and (time.monotonic() - stable_since) >= max(0.0, stable_confirm_s):
                     return activity.response
             else:
                 stable_key = None
                 stable_samples = 0
+                stable_since = 0.0
                 stable_last_seq = 0
 
             if activity.has_response and self.looks_incomplete_response(activity.response):

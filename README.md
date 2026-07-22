@@ -1,11 +1,28 @@
 # Tampermonkey Auto Role Runner
 
-This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript.
+This repo automates ChatGPT browser roles through the MAuto bridge and a Tampermonkey userscript. It reads DOM, clicks buttons, and pretends to be several coworkers at once so you don't have to keep ten browser tabs straight in your own head.
 
 It has two common entrypoints:
 
 - `main.py`: multi-role coordination with route JSON.
 - `role.py`: send exactly one prompt to exactly one browser role and return one machine-readable JSON object.
+
+## How a response actually gets captured (read this before debugging "why is the answer cut off")
+
+The userscript owns exactly one job here: turn the live chat DOM into text. `tampermonkey.js` runs a **hybrid observer**:
+
+- A `MutationObserver` bound to the chat root (`<main>`, never `document.body`) is the primary signal — it notices when the DOM settles and debounces bursts into one clean capture (`observer_quiet_ms`, 400ms).
+- The status poll (`poll_ms`, 800ms) only keeps the tab's presence/commands alive and falls back to a forced recapture if the cache goes stale (`observer_fallback_ms`, 5s) — it does not read content on every tick.
+- "Is the turn actually done" requires the composer to exist, the Stop button to be gone, no streaming marker, and the same answer observed twice across a real elapsed quiet window (`completion_confirm_ms`, 2.5s) — not just "a different observation happened."
+
+If you ever see a suspiciously short captured response (a bare `"json"`, a lone word, a truncated sentence), it is almost always one of these two failure modes, not a new mystery:
+
+1. Extraction read the wrong DOM node (fixed once already: never read `innerText` of the whole message bubble — read `textContent` from the specific content node, or you'll eventually capture a code-fence language label instead of the code).
+2. The completion detector confirmed too early (fixed once already: two "different" observations are not proof of settling — require real elapsed time since the candidate first looked complete, or a bored assistant pausing mid-thought becomes a permanently truncated cached answer).
+
+**Do not add `attributes: true` to the chat-root `MutationObserver`.** We tried it once, for a good reason (catching an attribute-only Stop-button toggle), and it froze the tab solid: a live streaming ChatGPT page mutates style/class/data-* attributes constantly, MutationObserver callbacks run as microtasks (higher priority than `setTimeout`), and enough attribute churn will starve the JS event loop entirely — the tab stays open, still renders, and never talks to the server again. The tab looks fine. It is not fine. `childList`/`subtree`/`characterData` alone is the correct, tested scope.
+
+For debugging a role's actual current response without going through the completion heuristic at all, `GET /api/admin/role/{role}` returns the server's continuously-updated `last_response` — it reflects whatever the DOM currently shows, independent of whether any wait loop has decided the turn is "done." This is the ground truth when a captured `.role_state/responses/*.md` file looks wrong.
 
 ## Prerequisites
 
@@ -21,6 +38,15 @@ http://127.0.0.1:8500
 ```
 
 Override it with `--base-url` or `MAUTO_BASE_URL`.
+
+## Two ways an agent uses this repo (pick one, don't blend them)
+
+An agent calling into this repo through `role.py` operates in one of two modes, defined by `orches.md` and `coder.md`. They are not interchangeable, and mixing them is how you end up with an agent that both edits your code and pretends it's "just the transport."
+
+- **Transport-only (`orches.md`)**: the agent calls authorized browser roles, reads `response_path`, and moves the declared workflow (`PLAN -> DEV -> REVIEW -> ...`) forward. It never inspects source, never implements, never issues a technical verdict. A route key inside a response is a handoff hint, not permission to invent a new role.
+- **Coder (`coder.md`)**: the agent *is* the implementation worker. `PLAN` still plans and every user-named validator (`REVIEW`, `AUDIT`, ...) still validates, but a `DEV` route key returned by `PLAN` is work for the calling agent, not an instruction to dispatch a browser `DEV`. The agent implements, then runs every named validator in order, and loops back on any non-pass until all of them pass in the same final cycle.
+
+If an agent is quietly editing files while claiming to be "just relaying messages," it drifted from `orches.md` into `coder.md` without telling anyone. That's a process bug, not a feature.
 
 ## Main Multi-Role Flow
 

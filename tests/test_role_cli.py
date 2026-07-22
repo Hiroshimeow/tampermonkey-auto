@@ -1094,3 +1094,94 @@ def test_completed_configured_request_returns_before_bootstrap_probe(monkeypatch
     assert second["request_id"] == first["request_id"]
     assert second["recovered"] is True
     assert state["actions"] == actions_after_first
+
+
+def test_stale_incomplete_cache_is_reverified_against_live_transcript(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+
+    first_code = role.main(["--role", "DEV", "--prompt", "first task"])
+    first = stdout_json(capsys.readouterr().out)
+    assert first_code == 0
+    assert response_text(first) == "answer 1"
+    actions_after_first = list(state["actions"])
+
+    # Simulate a durable cache that ended up holding a premature/incomplete
+    # capture (the exact failure mode this fix targets), even though the live
+    # transcript already holds the correct, complete answer for this marker.
+    Path(first["response_path"]).write_text("json\n", encoding="utf-8")
+
+    second_code = role.main(["--role", "DEV", "--prompt", "first task"])
+    second = stdout_json(capsys.readouterr().out)
+
+    assert second_code == 0
+    assert second["request_id"] == first["request_id"]
+    assert second["recovered"] is True
+    assert response_text(second) == "answer 1"
+    new_actions = state["actions"][len(actions_after_first):]
+    assert ("DEV", "SYNC_TRANSCRIPT") in new_actions
+    assert ("DEV", "SEND") not in new_actions
+
+
+def test_stale_incomplete_cache_without_live_recovery_falls_back_without_resend(monkeypatch, tmp_path, capsys) -> None:
+    isolate_role_state(monkeypatch, tmp_path)
+    state = install_stateful_client(monkeypatch)
+
+    first_code = role.main(["--role", "DEV", "--prompt", "first task"])
+    first = stdout_json(capsys.readouterr().out)
+    assert first_code == 0
+
+    # Corrupt the cache AND clear the live transcript so no marker survives --
+    # simulating "cannot verify," which must never silently trigger a resend.
+    Path(first["response_path"]).write_text("json\n", encoding="utf-8")
+    state["messages"]["DEV"] = []
+    actions_after_first = list(state["actions"])
+
+    second_code = role.main(["--role", "DEV", "--prompt", "first task"])
+    second = stdout_json(capsys.readouterr().out)
+
+    assert second_code == 0
+    assert second["recovered"] is True
+    assert response_text(second) == "json"
+    assert state["actions"][len(actions_after_first):] == [("DEV", "SYNC_TRANSCRIPT")]
+
+
+def test_find_response_for_marker_does_not_cross_into_a_later_requests_answer() -> None:
+    snapshot = {
+        "dom_info": {
+            "messages": {
+                "messages": [
+                    {"role": "user", "text": "ROLE_REQUEST_ID: req_A"},
+                    {"role": "assistant", "text": "answer for A"},
+                    {"role": "user", "text": "ROLE_REQUEST_ID: req_B"},
+                    {"role": "assistant", "text": "answer for B"},
+                ]
+            }
+        }
+    }
+
+    text, marker_found, composer_marker = role.find_response_for_marker(snapshot, "req_A")
+
+    assert marker_found is True
+    assert composer_marker is False
+    assert text == "answer for A"
+
+
+def test_find_response_for_marker_finds_latest_answer_for_current_request() -> None:
+    snapshot = {
+        "dom_info": {
+            "messages": {
+                "messages": [
+                    {"role": "user", "text": "ROLE_REQUEST_ID: req_A"},
+                    {"role": "assistant", "text": "answer for A"},
+                    {"role": "user", "text": "ROLE_REQUEST_ID: req_B"},
+                    {"role": "assistant", "text": "answer for B"},
+                ]
+            }
+        }
+    }
+
+    text, marker_found, _composer_marker = role.find_response_for_marker(snapshot, "req_B")
+
+    assert marker_found is True
+    assert text == "answer for B"

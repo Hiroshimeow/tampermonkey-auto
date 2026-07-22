@@ -21,6 +21,11 @@ from apps.constants import DEFAULT_BASE_URL
 from apps.role_renderer import render_direct_role_prompt, rendered_hash_source
 from apps.text import normalize_role
 
+# Bound at import time so tests that monkeypatch role.BridgeClient with a fake
+# transport stub (to control network interaction) do not also need to
+# reimplement this pure, stateless text heuristic.
+_looks_incomplete_response = BridgeClient.looks_incomplete_response
+
 STATE_DIR = Path(".role_state")
 REQUESTS_DIR = STATE_DIR / "requests"
 RESPONSES_DIR = STATE_DIR / "responses"
@@ -360,16 +365,26 @@ def find_response_for_marker(snapshot: dict[str, Any], request_id: str) -> tuple
     marker = f"{REQUEST_MARKER}: {request_id}"
     messages = snapshot_messages(snapshot)
     marker_index = -1
+    next_marker_index = -1
     for index, item in enumerate(messages):
         if not isinstance(item, dict):
             continue
-        if marker in str(item.get("text") or ""):
+        text = str(item.get("text") or "")
+        if marker in text:
             marker_index = index
+            next_marker_index = -1
+            continue
+        if marker_index >= 0 and next_marker_index < 0 and REQUEST_MARKER in text:
+            next_marker_index = index
     if marker_index < 0:
         composer_text = str((snapshot.get("dom_info") or {}).get("composer_text") or "")
         return "", False, marker in composer_text
+    # Bound the search to end at the next distinct request's marker (if any),
+    # so a later, unrelated exchange in the same long-lived chat can never be
+    # mistaken for this request's answer.
+    scan_end = next_marker_index if next_marker_index >= 0 else len(messages)
     assistant_text = ""
-    for item in messages[marker_index + 1:]:
+    for item in messages[marker_index + 1:scan_end]:
         if isinstance(item, dict) and str(item.get("role") or "").lower() == "assistant":
             text = str(item.get("text") or "").strip()
             if text:
@@ -603,6 +618,38 @@ def main(argv: list[str] | None = None) -> int:
 
     existing_response_path = Path(str(ledger.get("response_path") or response_path(request_id)))
     if ledger.get("status") == "completed" and existing_response_path.exists():
+        cached_text = existing_response_path.read_text(encoding="utf-8")
+        if not _looks_incomplete_response(cached_text):
+            emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
+            return 0
+        # A cached "completed" response that looks incomplete must never be
+        # blindly replayed forever -- that is precisely how a premature
+        # completion (e.g. a completion detector locking onto a short prefix)
+        # would get permanently frozen into this request's durable record.
+        # Re-derive the answer tied to this exact request's marker from the
+        # live transcript before trusting anything; only fall back to the
+        # original cached text (never a silent duplicate resend) if that
+        # re-verification cannot find something better.
+        print(
+            f"[stale-cache-guard] cached response for {request_id} looks incomplete; re-verifying against live transcript",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            with redirect_stdout(sys.stderr):
+                if client is None:
+                    client = BridgeClient(args.base_url, args.request_timeout)
+                client.command_roundtrip(role, "SYNC_TRANSCRIPT", timeout_s=min(20.0, args.timeout))
+                live_snapshot = client.role_snapshot(role)
+            live_text, _marker_found, _composer_marker = find_response_for_marker(live_snapshot, request_id)
+            if live_text and live_text != cached_text and not _looks_incomplete_response(live_text):
+                path = save_response(request_id, live_text)
+                ledger["response_path"] = str(path)
+                save_ledger(ledger)
+                emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
+                return 0
+        except Exception as exc:
+            print(f"[stale-cache-guard] re-verification failed for {request_id}: {exc}", file=sys.stderr, flush=True)
         emit_json(success_payload(request_id=request_id, run_id=run_id, role=role, response_file=existing_response_path, uploaded=len(upload_paths), source_role=source_role, source_response_count=len(source_responses_for_key) if source_role else 0, recovered=True))
         return 0
 

@@ -55,15 +55,29 @@ assert.match(source, /root\.querySelectorAll\('\[data-message-author-role\]'\)/,
 assert.match(source, /function imageSummary\(root\)/, 'message parsing must include image metadata');
 assert.match(source, /image_count:\s*images\.length/, 'each parsed message must expose image_count');
 assert.match(source, /acc\.images = \(acc\.images \|\| 0\) \+ item\.image_count;/, 'message counts must include total images');
+assert.match(source, /function createContentExtractor\(/, 'assistant/user text extraction must live in an isolated content module');
+assert.match(source, /const ASSISTANT_CONTENT_SELECTORS = /, 'assistant content extraction must use an explicit scoped selector list');
+assert.doesNotMatch(source, /const text = textOf\(node\)/, 'assistant message extraction must not read the message bubble through textOf/innerText');
 assert.match(source, /lastAcceptedTurnContext = turnContext;/, 'CLICK_SEND must persist accepted turn context');
 assert.match(source, /reason:\s*'missing_send_accept_context'/, 'WAIT_ASSISTANT_DONE must fail without accepted turn context');
 assert.match(source, /const deadline = Date\.now\(\) \+[^;]*timeout_ms/, 'WAIT_ASSISTANT_DONE must have a command-scoped wall clock deadline');
 assert.match(source, /Date\.now\(\) >= deadline[\s\S]*?ASSISTANT_TIMEOUT/, 'WAIT_ASSISTANT_DONE deadline must terminate even while STOP remains visible');
-assert.match(source, /if \(snapshot\.stop_visible\) \{[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must keep waiting while stop_visible is true');
+// "must keep waiting while stop_visible is true" is now a behavioral guarantee
+// (completionDetector.observe() requires !snapshot.stop_visible to ever
+// complete), proven by the phase1SilentWait integration test below rather than
+// by matching a specific loop-branch source shape.
 assert.match(source, /function looksIncompleteAssistantText\(text\)/, 'WAIT_ASSISTANT_DONE must detect partial JSON/code block text');
-assert.match(source, /!looksIncompleteAssistantText\(finalText\)/, 'WAIT_ASSISTANT_DONE must not report done for incomplete final text');
-assert.match(source, /stableCandidateSamples/, 'WAIT_ASSISTANT_DONE must track repeated stable complete observations');
-assert.match(source, /stableCandidateSamples\s*>=\s*2/, 'WAIT_ASSISTANT_DONE must require two matching complete observations');
+assert.match(source, /&& !incompleteFn\(candidateText\)/, 'completion detection must not report done for incomplete candidate text');
+assert.match(source, /function createCompletionDetector\(/, 'completion detection must be an isolated module');
+assert.match(source, /if \(cursorRevision !== lastObservedRevision\)/, 'the completion loop must only feed the detector genuinely new committed observations, never a repeated stale read');
+assert.match(source, /let cursor = observationController\.ensureFresh\('wait_assistant_done_initial'\);/, 'WAIT_ASSISTANT_DONE must seed its cursor from the cached observation controller, not an unconditional domSnapshot');
+assert.match(source, /const waited = await observationController\.waitForRevision\(cursorRevision, boundedMs\);/, 'WAIT_ASSISTANT_DONE must wait for the next committed revision instead of blind polling');
+assert.doesNotMatch(source, /await syncTranscript\('wait_assistant_done'\)/, 'the redundant quiet-sync parallel completion path must be removed');
+assert.doesNotMatch(source, /await syncTranscript\('wait_assistant_done_force_sync'\)/, 'the redundant force-sync parallel completion path must be removed');
+assert.match(source, /capturedAt - confirmationScheduledAt >= completionConfirmMs/, 'sample 2 must be gated on real elapsed time since confirmation was armed, not merely a different revision number');
+assert.match(source, /observationController\.ensureFresh\('wait_assistant_done_stale_guard'\)/, 'a timed-out wait must fall back to a bounded freshness check, guarding against a missed mutation or replaced root');
+assert.match(source, /stableSamples/, 'completion detection must track repeated stable complete observations');
+assert.match(source, /stableSamples\s*>=\s*2/, 'completion detection must require two matching complete observations');
 assert.match(source, /snapshot\.composer\s*===\s*true/, 'WAIT_ASSISTANT_DONE stable completion must require an existing composer');
 assert.match(source, /stableCompletion[\s\S]*?ASSISTANT_DONE[\s\S]*?Date\.now\(\)\s*>=\s*deadline/, 'stable completion must be evaluated before timeout for the same sampled state');
 assert.match(source, /function hasManualComposerInput\(snapshot\)/, 'tampermonkey.js must centralize manual composer detection');
@@ -104,7 +118,8 @@ assert.match(source, /SEND_BLOCKED_OWNERSHIP_LOST/, 'CLICK_SEND must stop when e
 assert.match(source, /await sleep\(randomBetween\(config\.send_delay_min_ms,\s*config\.send_delay_max_ms\)\);\s*let submitAttempt = await attemptOwnedButtonClick\(expectedText\);/, 'CLICK_SEND must refresh ownership and readiness after the randomized delay');
 assert.match(source, /composerMatchesExpectedPrompt\(submitAttempt\.snapshot, expectedText\)[\s\S]*?submitAttempt = await attemptOwnedButtonClick\(expectedText\);/, 'CLICK_SEND must wait through a transient upload while the expected prompt text remains owned');
 assert.doesNotMatch(source, /requestSubmit/, 'userscript must not add hidden submit retries; Python owns the single retry budget');
-assert.match(source, /if \(hasManualComposerInput\(snapshot\)\) \{[\s\S]*?MANUAL_INPUT_PENDING[\s\S]*?continue;/, 'WAIT_ASSISTANT_DONE must not finish or overwrite while the user is steering or has attachments');
+assert.match(source, /const manualInputPending = hasManualComposerInput\(snapshot\);[\s\S]*?MANUAL_INPUT_PENDING/, 'WAIT_ASSISTANT_DONE must not finish or overwrite while the user is steering or has attachments');
+assert.match(source, /&& !hasManualComposerInput\(snapshot\)/, 'completion detection must require no manual composer input');
 assert.match(source, /function handleNavigateNewChat\(command\)/, 'tampermonkey.js must implement new-chat navigation');
 assert.match(source, /action === 'NEW_CHAT' \|\| action === 'NAVIGATE_NEW'/, 'NEW_CHAT and NAVIGATE_NEW must be supported');
 assert.match(source, /window\.location\.assign\('\/'\)/, 'new-chat navigation must use the current tab to open ChatGPT root');
@@ -330,6 +345,354 @@ assert.equal(looksIncompleteAssistantText('```json\n{"PLAN":"continue"}\n```'), 
 assert.equal(looksIncompleteAssistantText('{"PLAN":"continue"}'), false, 'valid unfenced route JSON may finish browser waiting');
 assert.equal(looksIncompleteAssistantText('JSON\n{"PLAN":"continue"}'), false, 'complete route JSON may finish browser waiting');
 
+// MODULE A — Content Extraction regression coverage.
+// Proves the innerText="json" truncation root cause can never recur: assistant
+// content is read from a specific content node via textContent, and innerText
+// is never touched (a throwing getter enforces it behaviorally).
+const extractorContext = {};
+vm.runInNewContext(
+    `const ASSISTANT_CONTENT_SELECTORS = ['.markdown', '.prose', '[data-message-content]', 'pre code'];
+     const USER_CONTENT_SELECTORS = ['[data-message-content]', '.whitespace-pre-wrap', '.text-message'];
+     ${extractFunction('normalizeMessageText')};
+     ${extractFunction('createContentExtractor')};
+     globalThis.createContentExtractor = createContentExtractor;`,
+    extractorContext,
+);
+const createContentExtractor = extractorContext.createContentExtractor;
+
+function makeContentNode(textContent) {
+    return {
+        textContent,
+        get innerText() { throw new Error('content extraction must never read innerText'); },
+    };
+}
+function makeMessageNode({ role, content = {}, bubbleText = '' }) {
+    return {
+        getAttribute: (name) => (name === 'data-message-author-role' ? role : null),
+        querySelector: (selector) => (Object.prototype.hasOwnProperty.call(content, selector) ? content[selector] : null),
+        querySelectorAll: () => [],
+        get innerText() { throw new Error('content extraction must never read innerText'); },
+        textContent: bubbleText,
+    };
+}
+function extractorFor(nodes) {
+    const root = { querySelectorAll: (selector) => (selector === '[data-message-author-role]' ? nodes : []) };
+    return createContentExtractor({
+        chatRootElement: () => root,
+        isVisible: () => true,
+        domPath: () => 'main>div',
+        imageSummary: () => [],
+    });
+}
+
+const mountingCodeBlock = makeMessageNode({
+    role: 'assistant',
+    bubbleText: 'json',
+    content: { '.markdown': makeContentNode('json\n{"REVIEW":"inspect"}') },
+});
+const mountingSummary = extractorFor([mountingCodeBlock]).summarizeMessages();
+assert.equal(
+    mountingSummary.last_assistant.text,
+    'json\n{"REVIEW":"inspect"}',
+    'a partially mounted code block whose bubble reads "json" must still yield the full nested textContent',
+);
+assert.equal(mountingSummary.counts.assistant, 1, 'the mounting assistant message must not be dropped by a visibility filter');
+
+const mixedProse = makeMessageNode({
+    role: 'assistant',
+    content: { '.markdown': makeContentNode('Here is the route:\n```json\n{"DEV":"go"}\n```') },
+});
+assert.equal(
+    extractorFor([mixedProse]).summarizeMessages().last_assistant.text,
+    'Here is the route:\n```json\n{"DEV":"go"}\n```',
+    'mixed prose and fenced route JSON must be preserved verbatim',
+);
+
+const codeFallback = makeMessageNode({
+    role: 'assistant',
+    bubbleText: 'json\nCopy code\n{"PLAN":"inspect"}',
+    content: { 'pre code': makeContentNode('{"PLAN":"inspect"}') },
+});
+const codeText = extractorFor([codeFallback]).summarizeMessages().last_assistant.text;
+assert.equal(codeText, '{"PLAN":"inspect"}', 'pre>code fallback must read the code node, not the toolbar/language label');
+assert.doesNotMatch(codeText, /Copy code/, 'code extraction must exclude the copy-code toolbar text');
+
+const noSelectorMatch = makeMessageNode({ role: 'assistant', bubbleText: 'Copy code\nRegenerate\nShare' });
+const noSelectorSummary = extractorFor([noSelectorMatch]).summarizeMessages();
+assert.equal(
+    noSelectorSummary.last_assistant.text,
+    '',
+    'assistant text must never fall back to the whole bubble when no content selector matches; empty means not-yet-ready, not contaminated toolbar text',
+);
+const userNoSelectorMatch = makeMessageNode({ role: 'user', bubbleText: 'plain user message' });
+assert.equal(
+    extractorFor([userNoSelectorMatch]).summarizeMessages().last_user.text,
+    'plain user message',
+    'user text may still fall back to the bubble when no content selector matches',
+);
+
+// MODULE C — Snapshot Assembly boundary.
+assert.match(source, /function createSnapshotAssembler\(/, 'snapshot assembly must be an isolated module');
+assert.match(source, /function detectAssistantStreaming\(/, 'streaming detection must be an explicit UI-evidence helper');
+assert.match(source, /return snapshotAssembler\.capture\('immediate'\)\.snapshot;/, 'domSnapshot must be a thin wrapper over the snapshot assembler');
+const streamingContext = {};
+vm.runInNewContext(
+    `${extractFunction('detectAssistantStreaming')}; globalThis.detectAssistantStreaming = detectAssistantStreaming;`,
+    streamingContext,
+);
+const detectAssistantStreaming = streamingContext.detectAssistantStreaming;
+assert.equal(
+    detectAssistantStreaming({ querySelector: (selector) => (selector.includes('result-streaming') ? {} : null) }),
+    true,
+    'a live streaming marker inside the chat root must report streaming',
+);
+assert.equal(
+    detectAssistantStreaming({ querySelector: () => null }),
+    false,
+    'no streaming marker must report not streaming',
+);
+
+// MODULE D — Observer Lifecycle / Observation Store.
+// A fully injected clock/timer/observer harness proves the hybrid semantics
+// deterministically without a real DOM.
+assert.match(source, /function createObservationController\(/, 'observer lifecycle must be an isolated module');
+assert.match(source, /observer_quiet_ms:\s*400/, 'observer quiet debounce must default to 400ms');
+assert.match(source, /observer_fallback_ms:\s*5000/, 'poll fallback capture age must default to 5000ms');
+assert.match(source, /completion_confirm_ms:\s*2500/, 'completion confirmation must tolerate multi-second mid-response pauses, not just a fast DOM paint settle');
+const observerContext = {};
+vm.runInNewContext(
+    `${extractFunction('deepFreezeObservation')}; ${extractFunction('createObservationController')}; globalThis.createObservationController = createObservationController;`,
+    observerContext,
+);
+const createObservationController = observerContext.createObservationController;
+
+function makeObserverHarness(overrides = {}) {
+    let clock = 0;
+    let seq = 0;
+    const timers = new Map();
+    const observers = [];
+    let captures = 0;
+    const setTimer = (fn, delay) => { seq += 1; timers.set(seq, { fn, at: clock + delay }); return seq; };
+    const clearTimer = (id) => { timers.delete(id); };
+    const tick = (ms) => {
+        const target = clock + ms;
+        while (true) {
+            let next = null;
+            for (const [id, timer] of timers) {
+                if (timer.at <= target && (!next || timer.at < next.at)) {
+                    next = { id, ...timer };
+                }
+            }
+            if (!next) break;
+            clock = next.at;
+            timers.delete(next.id);
+            next.fn();
+        }
+        clock = target;
+    };
+    class FakeObserver {
+        constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
+        observe(root) { this.root = root; }
+        disconnect() { this.disconnected = true; }
+    }
+    let root = overrides.root !== undefined ? overrides.root : { querySelectorAll: () => [] };
+    const controller = createObservationController({
+        rootProvider: () => root,
+        capture: (reason) => { captures += 1; return { snapshot: { reason }, ui: {}, capturedAt: clock, reason }; },
+        now: () => clock,
+        setTimer,
+        clearTimer,
+        MutationObserverImpl: FakeObserver,
+        quietMs: 400,
+        fallbackMaxAgeMs: 5000,
+        confirmMs: 400,
+    });
+    return {
+        controller,
+        tick,
+        observers,
+        fireMutation: () => observers[observers.length - 1].callback(),
+        setRoot: (value) => { root = value; },
+        get captures() { return captures; },
+    };
+}
+
+const burst = makeObserverHarness();
+burst.controller.start();
+assert.equal(burst.captures, 1, 'start captures exactly once before polling');
+burst.fireMutation();
+burst.tick(100);
+burst.fireMutation();
+burst.tick(100);
+burst.fireMutation();
+assert.equal(burst.captures, 1, 'mutation callbacks alone must never capture');
+burst.tick(400);
+assert.equal(burst.captures, 2, 'a debounced mutation burst yields exactly one settled capture');
+const revAfterBurst = burst.controller.revision();
+burst.fireMutation();
+burst.tick(400);
+assert.equal(burst.controller.revision(), revAfterBurst + 1, 'a later mutation produces a new revision');
+
+const rebind = makeObserverHarness();
+rebind.controller.start();
+const firstObserver = rebind.observers[rebind.observers.length - 1];
+rebind.setRoot({ querySelectorAll: () => [], replaced: true });
+rebind.controller.ensureRoot();
+assert.equal(firstObserver.disconnected, true, 'root replacement must disconnect the old observer');
+assert.equal(rebind.observers.length, 2, 'root replacement must bind a new observer');
+
+const fresh = makeObserverHarness();
+fresh.controller.start();
+fresh.tick(1000);
+let freshBefore = fresh.captures;
+fresh.controller.ensureFresh();
+assert.equal(fresh.captures, freshBefore, 'ensureFresh must reuse a cache younger than the fallback age');
+fresh.tick(5000);
+fresh.controller.ensureFresh();
+assert.equal(fresh.captures, freshBefore + 1, 'ensureFresh must force one capture past the fallback age');
+
+const confirm = makeObserverHarness();
+confirm.controller.start();
+const confirmBefore = confirm.captures;
+confirm.controller.scheduleConfirmation();
+confirm.tick(400);
+assert.equal(confirm.captures, confirmBefore + 1, 'an undisturbed confirmation commits exactly one capture');
+const cancel = makeObserverHarness();
+cancel.controller.start();
+const cancelBefore = cancel.captures;
+cancel.controller.scheduleConfirmation();
+cancel.fireMutation();
+cancel.tick(400);
+assert.equal(cancel.captures, cancelBefore + 1, 'a mutation cancels the pending confirmation; only the quiet capture commits');
+
+const stopHarness = makeObserverHarness();
+stopHarness.controller.start();
+const stoppedObserver = stopHarness.observers[stopHarness.observers.length - 1];
+stopHarness.fireMutation();
+stopHarness.controller.scheduleConfirmation();
+stopHarness.controller.stop();
+assert.equal(stoppedObserver.disconnected, true, 'stop must disconnect the observer');
+const stoppedCaptures = stopHarness.captures;
+stopHarness.tick(2000);
+assert.equal(stopHarness.captures, stoppedCaptures, 'stop must clear pending quiet and confirmation timers');
+
+const waitCommit = makeObserverHarness();
+waitCommit.controller.start();
+let committed = null;
+const waitCommitPromise = waitCommit.controller
+    .waitForRevision(waitCommit.controller.revision(), 2000)
+    .then((payload) => { committed = payload; });
+waitCommit.fireMutation();
+waitCommit.tick(400);
+await waitCommitPromise;
+assert.ok(committed && !committed.timedOut, 'waitForRevision must resolve on the next settled commit');
+
+const waitTimeout = makeObserverHarness();
+waitTimeout.controller.start();
+let timedOut = null;
+const waitTimeoutPromise = waitTimeout.controller
+    .waitForRevision(waitTimeout.controller.revision(), 500)
+    .then((payload) => { timedOut = payload; });
+waitTimeout.tick(500);
+await waitTimeoutPromise;
+assert.equal(timedOut.timedOut, true, 'waitForRevision must resolve with timedOut when no commit arrives');
+
+// Nested immutability (Object.isFrozen at every level, not just the outer
+// record) -- a shallow freeze would leave snapshot/ui/messages mutable and
+// silently corrupt data shared across poll/sync/waiter/completion consumers.
+const frozenController = createObservationController({
+    rootProvider: () => ({ querySelectorAll: () => [] }),
+    capture: () => ({
+        snapshot: { messages: { messages: [{ role: 'assistant', text: 'hello' }] } },
+        ui: { streaming: false },
+        capturedAt: 0,
+        reason: 'test',
+    }),
+    now: () => 0,
+    setTimer: () => 0,
+    clearTimer: () => {},
+    MutationObserverImpl: null,
+    quietMs: 400,
+    fallbackMaxAgeMs: 5000,
+    confirmMs: 400,
+});
+frozenController.start();
+const observation = frozenController.current();
+assert.ok(Object.isFrozen(observation), 'the outer observation record must be frozen');
+assert.ok(Object.isFrozen(observation.snapshot), 'the nested snapshot must be frozen');
+assert.ok(Object.isFrozen(observation.ui), 'the nested ui record must be frozen');
+assert.ok(Object.isFrozen(observation.snapshot.messages), 'nested snapshot.messages must be frozen');
+assert.ok(Object.isFrozen(observation.snapshot.messages.messages), 'the messages array must be frozen');
+assert.ok(Object.isFrozen(observation.snapshot.messages.messages[0]), 'an individual message entry must be frozen');
+const textBeforeMutationAttempt = observation.snapshot.messages.messages[0].text;
+try {
+    observation.snapshot.messages.messages[0].text = 'mutated';
+} catch (error) {
+    // strict-mode assignment to a frozen property throws; that is acceptable.
+}
+assert.equal(
+    observation.snapshot.messages.messages[0].text,
+    textBeforeMutationAttempt,
+    'a nested message must remain unchanged after an attempted mutation',
+);
+
+// MODULE B unit coverage — the streaming guard, in isolation from the loop.
+const detectorContext = {};
+vm.runInNewContext(
+    `function hasManualComposerInput(snapshot) { return false; }
+     ${extractFunction('looksIncompleteAssistantText')};
+     ${extractFunction('jsonBraceDepth')};
+     ${extractFunction('createCompletionDetector')};
+     globalThis.createCompletionDetector = createCompletionDetector;`,
+    detectorContext,
+);
+const detectorFactory = detectorContext.createCompletionDetector;
+const completeSnapshot = { composer: true, stop_visible: false };
+const routeText = '{"REVIEW":"inspect"}';
+const streamingDetector = detectorFactory();
+streamingDetector.reset({ before_last_assistant_text: '', before_assistant_count: 0 });
+assert.equal(
+    streamingDetector.observe(completeSnapshot, routeText, 1, { streaming: true }),
+    null,
+    'a streaming marker must block completion even with stop_visible=false and complete JSON text',
+);
+assert.equal(
+    streamingDetector.observe(completeSnapshot, routeText, 1, { streaming: true }),
+    null,
+    'completion must stay blocked while streaming remains true across repeated samples',
+);
+const settledDetector = detectorFactory();
+settledDetector.reset({ before_last_assistant_text: '', before_assistant_count: 0 });
+assert.equal(settledDetector.observe(completeSnapshot, routeText, 1, { streaming: false }), null, 'first settled sample is only the first of two required');
+assert.equal(settledDetector.samples(), 1, 'exactly one sample must be recorded after the first settled observation');
+const settledCompletion = settledDetector.observe(completeSnapshot, routeText, 1, { streaming: false });
+assert.ok(settledCompletion, 'a second matching settled sample with streaming=false must complete');
+assert.equal(settledCompletion.text, routeText);
+
+// MODULE E integration — hybrid poll/observer wiring.
+assert.match(source, /const observationController = createObservationController\(\{\s*onCommit: syncOnCommit,\s*rootProvider: observerRootElement\s*\}\);/, 'a single observation controller must own the observer and drive commit-based sync, bound through the body-safe root resolver');
+assert.match(source, /function observerRootElement\(\)\s*\{\s*return document\.querySelector\('main'\) \|\| null;\s*\}/, 'the observer root resolver must never fall back to document.body');
+assert.match(source, /latest = deepFreezeObservation\(record\);/, 'a committed observation must be deep-frozen, not a mutable object handed to callers');
+assert.match(source, /function deepFreezeObservation\(value\)/, 'observation immutability must be an isolated, reusable helper');
+
+const sentinelBody = { sentinel: 'body' };
+const rootResolverWithMain = { document: { querySelector: (selector) => (selector === 'main' ? { tag: 'main' } : null), body: sentinelBody } };
+vm.runInNewContext(`${extractFunction('observerRootElement')}; globalThis.result = observerRootElement();`, rootResolverWithMain);
+assert.deepEqual(rootResolverWithMain.result, { tag: 'main' }, 'observerRootElement must return the real <main> when present');
+const rootResolverWithoutMain = { document: { querySelector: () => null, body: sentinelBody } };
+vm.runInNewContext(`${extractFunction('observerRootElement')}; globalThis.result = observerRootElement();`, rootResolverWithoutMain);
+assert.equal(rootResolverWithoutMain.result, null, 'observerRootElement must return null, not document.body, when <main> is absent');
+assert.notEqual(rootResolverWithoutMain.result, sentinelBody, 'observerRootElement must never resolve to document.body');
+assert.match(source, /dom_info: observationController\.ensureFresh\('status_poll'\)\.snapshot/, 'status poll must reuse the cached observation instead of an unconditional domSnapshot');
+assert.match(source, /observationController\.start\(\);/, 'start must bring the observation controller online');
+assert.match(source, /observationController\.stop\(\);/, 'stop must tear the observation controller down');
+assert.match(source, /function syncOnCommit\(record\)/, 'transcript sync must run as a commit hook over an already-captured snapshot');
+assert.doesNotMatch(source, /function attachObserver\(/, 'the legacy document.body observer must be deleted');
+assert.doesNotMatch(source, /function scheduleSync\(/, 'the legacy debounced sync timer must be deleted');
+assert.doesNotMatch(source, /observer\.observe\(document\.body/, 'no observer may watch the entire document body');
+assert.match(source, /observer\.observe\(observedRoot, \{ childList: true, subtree: true, characterData: true \}\);/, 'the observer must never watch attribute mutations across the whole subtree -- on a live streaming chat page this can flood the JS thread with microtask callbacks fast enough to starve setTimeout-based polling entirely, appearing as a frozen bridge on a tab that is still visually open');
+assert.doesNotMatch(source, /let syncTimer = null;/, 'the legacy sync timer global must be removed');
+
 const watchdogContext = {};
 vm.runInNewContext(
     `${extractFunction('composerWatchdogTransition')}; ${extractFunction('isComposerTransportActive')}; ${extractFunction('rebaseComposerWatchdogDuringTransport')}; ${extractFunction('watchdogComposerElement')}; globalThis.composerWatchdogTransition = composerWatchdogTransition; globalThis.isComposerTransportActive = isComposerTransportActive; globalThis.rebaseComposerWatchdogDuringTransport = rebaseComposerWatchdogDuringTransport; globalThis.watchdogComposerElement = watchdogComposerElement;`,
@@ -376,7 +739,7 @@ vm.runInNewContext(
      let activeCommandAction = 'UPLOAD_FILES';
      let composerWatchdogState = { signature: 'automation-prompt', started_at: 1000, action: 'WAIT' };
      const config = { composer_watchdog_ms: 60000 };
-     function scheduleSync() {}
+     const observationController = { markDirty() {} };
      ${extractFunction('composerWatchdogTransition')};
      ${extractFunction('isComposerTransportActive')};
      ${extractFunction('rebaseComposerWatchdogDuringTransport')};
@@ -570,8 +933,6 @@ vm.runInNewContext(
      };
      const config = {
          report_wait_every_ms: 20000,
-         assistant_quiet_ms: 1000,
-         assistant_force_sync_quiet_ms: 5000,
          assistant_post_stop_timeout_ms: 15000,
          auto_reload_on_assistant_timeout: false,
          reload_after_timeout_ms: 0
@@ -600,6 +961,91 @@ vm.runInNewContext(
              response: { status: 'OK' }
          };
      }
+     let streamingOverride = false;
+     function detectAssistantStreaming() { return streamingOverride; }
+     let confirmationCalls = 0;
+     const OBS_QUIET_MS = 400;
+     const OBS_CONFIRM_MS = 2500;
+     const OBS_FALLBACK_MS = 5000;
+     let obsRevision = 0;
+     let obsLatest = null;
+     let obsPendingMutationAt = null;
+     let obsPendingUnrelatedCommitAt = null;
+     let obsPendingConfirmationAt = null;
+     let confirmationDisabledForTest = false;
+     // Simulates a benign mutation (e.g. an unrelated attribute toggle) that
+     // commits a new revision without changing the visible text -- proving
+     // completion cannot be satisfied by "any new revision", only one that
+     // genuinely postdates the scheduled confirmation by completion_confirm_ms.
+     function scheduleUnrelatedCommitAt(atClock) { obsPendingUnrelatedCommitAt = atClock; }
+     function captureObservation() {
+         return { snapshot: snapshotFactory(clockMs), ui: { streaming: streamingOverride }, capturedAt: clockMs };
+     }
+     function resetObservationController() {
+         obsRevision = 0;
+         obsPendingMutationAt = null;
+         obsPendingUnrelatedCommitAt = null;
+         obsPendingConfirmationAt = null;
+         obsLatest = captureObservation();
+     }
+     // A test scenario calls this to register the exact clock time its DOM
+     // would actually change -- the fake honors a debounced settle exactly
+     // like the real MutationObserver quiet-timer (OBS_QUIET_MS after the
+     // registered change), rather than polling snapshotFactory to guess when
+     // something happened.
+     function scheduleContentChangeAt(atClock) { obsPendingMutationAt = atClock; }
+     const observationController = {
+         revision() { return obsRevision; },
+         current() { return obsLatest; },
+         ensureFresh() {
+             if (!obsLatest || clockMs - obsLatest.capturedAt >= OBS_FALLBACK_MS) {
+                 obsLatest = captureObservation();
+                 obsRevision += 1;
+             }
+             return obsLatest;
+         },
+         scheduleConfirmation() {
+             confirmationCalls += 1;
+             if (!confirmationDisabledForTest) {
+                 obsPendingConfirmationAt = clockMs + OBS_CONFIRM_MS;
+             }
+         },
+         async waitForRevision(afterRevision, ms) {
+             const target = clockMs + ms;
+             let commitAt = null;
+             if (obsPendingMutationAt != null && obsPendingMutationAt <= target) {
+                 const settleAt = obsPendingMutationAt + OBS_QUIET_MS;
+                 if (settleAt <= target) {
+                     commitAt = settleAt;
+                 }
+             }
+             if (obsPendingUnrelatedCommitAt != null && obsPendingUnrelatedCommitAt <= target) {
+                 const settleAt = obsPendingUnrelatedCommitAt + OBS_QUIET_MS;
+                 if (settleAt <= target) {
+                     commitAt = commitAt == null ? settleAt : Math.min(commitAt, settleAt);
+                 }
+             }
+             if (obsPendingConfirmationAt != null && obsPendingConfirmationAt <= target) {
+                 commitAt = commitAt == null ? obsPendingConfirmationAt : Math.min(commitAt, obsPendingConfirmationAt);
+             }
+             if (commitAt != null) {
+                 await sleep(commitAt - clockMs);
+                 if (obsPendingMutationAt != null && obsPendingMutationAt <= commitAt) {
+                     obsPendingMutationAt = null;
+                 }
+                 if (obsPendingUnrelatedCommitAt != null && obsPendingUnrelatedCommitAt <= commitAt) {
+                     obsPendingUnrelatedCommitAt = null;
+                 }
+                 obsPendingConfirmationAt = null;
+                 obsRevision += 1;
+                 obsLatest = captureObservation();
+                 return { observation: obsLatest, revision: obsRevision };
+             }
+             await sleep(target - clockMs);
+             return { observation: obsLatest, revision: afterRevision, timedOut: true };
+         },
+     };
+     ${extractFunction('createCompletionDetector')};
      ${extractFunction('handleWaitAssistantDone')};
      globalThis.runSilentTimeout = async () => {
          clockMs = 0;
@@ -617,6 +1063,7 @@ vm.runInNewContext(
                  last_assistant: { text: '' }
              }
          });
+         resetObservationController();
          lastAcceptedTurnContext = {
              before_user_count: 1,
              before_assistant_count: 0,
@@ -645,6 +1092,8 @@ vm.runInNewContext(
                  }
              };
          };
+         resetObservationController();
+         scheduleContentChangeAt(6000);
          lastAcceptedTurnContext = {
              before_user_count: 1,
              before_assistant_count: 0,
@@ -673,6 +1122,8 @@ vm.runInNewContext(
                  }
              };
          };
+         resetObservationController();
+         scheduleContentChangeAt(5000);
          lastAcceptedTurnContext = {
              before_user_count: 1,
              before_assistant_count: 0,
@@ -704,6 +1155,8 @@ vm.runInNewContext(
              }
              return snapshot;
          };
+         resetObservationController();
+         scheduleContentChangeAt(5000);
          lastAcceptedTurnContext = {
              before_user_count: 1,
              before_assistant_count: 0,
@@ -712,7 +1165,139 @@ vm.runInNewContext(
          };
          await handleWaitAssistantDone({ command_id: 'cmd-composer-' + composerMode, payload: { timeout_ms: 10000 } });
          return { reports, clockMs };
-     };`,
+     };
+     globalThis.runStreamingBlockedCompletion = async () => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         streamingOverride = true;
+         snapshotFactory = (now) => {
+             const done = now >= 5000;
+             return {
+                 composer: true,
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"PLAN\":\"must not complete while streaming\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"PLAN\":\"must not complete while streaming\"}' } : { text: '' }
+                 }
+             };
+         };
+         resetObservationController();
+         scheduleContentChangeAt(5000);
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-streaming', payload: { timeout_ms: 10000 } });
+         streamingOverride = false;
+         return { reports, clockMs };
+     };
+     globalThis.runConfirmationDisabledCompletion = async () => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         confirmationDisabledForTest = true;
+         snapshotFactory = (now) => {
+             const done = now >= 1000;
+             return {
+                 composer: true,
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"PLAN\":\"single sample only\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"PLAN\":\"single sample only\"}' } : { text: '' }
+                 }
+             };
+         };
+         resetObservationController();
+         scheduleContentChangeAt(1000);
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-no-confirm', payload: { timeout_ms: 5000 } });
+         confirmationDisabledForTest = false;
+         return { reports, clockMs };
+     };
+     globalThis.runEarlyUnrelatedMutationCompletion = async () => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         snapshotFactory = (now) => {
+             const done = now >= 1000;
+             return {
+                 composer: true,
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"PLAN\":\"only confirm after real quiet window\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"PLAN\":\"only confirm after real quiet window\"}' } : { text: '' }
+                 }
+             };
+         };
+         resetObservationController();
+         scheduleContentChangeAt(1000);
+         // An unrelated mutation (same text, new revision) lands well before
+         // the real confirmation would fire -- must not be accepted as sample 2.
+         scheduleUnrelatedCommitAt(2000);
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-early-mutation', payload: { timeout_ms: 15000 } });
+         return { reports, clockMs };
+     };
+     globalThis.runMissedMutationStaleGuardCompletion = async () => {
+         clockMs = 0;
+         reports = [];
+         stopped = false;
+         snapshotFactory = (now) => {
+             const done = now >= 6000;
+             return {
+                 composer: true,
+                 stop_visible: !done,
+                 composer_text_len: 0,
+                 composer_attachments: [],
+                 messages: {
+                     counts: { user: 1, assistant: done ? 1 : 0, images: 0 },
+                     messages: done ? [{ role: 'assistant', text: '{\"PLAN\":\"recovered via stale guard\"}' }] : [],
+                     last_user: { text: 'prompt' },
+                     last_assistant: done ? { text: '{\"PLAN\":\"recovered via stale guard\"}' } : { text: '' }
+                 }
+             };
+         };
+         resetObservationController();
+         // Deliberately never call scheduleContentChangeAt: the observer is
+         // simulated as having missed the mutation entirely. Only the
+         // stale-guard's periodic ensureFresh() (bounded by OBS_FALLBACK_MS)
+         // can ever discover that the DOM actually changed at t=6000.
+         lastAcceptedTurnContext = {
+             before_user_count: 1,
+             before_assistant_count: 0,
+             before_last_assistant_text: '',
+             accepted_at: 1
+         };
+         await handleWaitAssistantDone({ command_id: 'cmd-missed-mutation', payload: { timeout_ms: 30000 } });
+         return { reports, clockMs };
+     };
+     globalThis.getConfirmationCalls = () => confirmationCalls;
+     globalThis.resetConfirmationCalls = () => { confirmationCalls = 0; };`,
     phase1HeartbeatContext,
 );
 const phase1SilentWait = await phase1HeartbeatContext.runSilentTimeout();
@@ -728,17 +1313,65 @@ assert.equal(phase1SilentTerminals[0].state, 'ASSISTANT_TIMEOUT');
 assert.equal(phase1SilentTerminals[0].at, 30000, 'heartbeats must not move the original command deadline');
 assert.equal(phase1SilentWait.reports.at(-1).state, 'ASSISTANT_TIMEOUT', 'no heartbeat may occur after terminal timeout');
 
+phase1HeartbeatContext.resetConfirmationCalls();
 const phase1HydratedWait = await phase1HeartbeatContext.runHydratedCompletion();
 const phase1HydratedTerminals = phase1HydratedWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
 assert.equal(phase1HydratedTerminals.length, 1, 'hydrated completion must emit one terminal result');
 assert.equal(phase1HydratedTerminals[0].state, 'ASSISTANT_DONE');
 assert.equal(phase1HydratedWait.reports.at(-1).state, 'ASSISTANT_DONE', 'no heartbeat may occur after hydrated completion');
+assert.ok(phase1HeartbeatContext.getConfirmationCalls() >= 1, 'observationController.scheduleConfirmation must actually run in production completion flow, not remain dead code');
+
+const phase1StreamingBlocked = await phase1HeartbeatContext.runStreamingBlockedCompletion();
+const phase1StreamingTerminals = phase1StreamingBlocked.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+assert.equal(phase1StreamingTerminals.length, 1, 'a streaming-blocked wait must still emit exactly one terminal result');
+assert.equal(phase1StreamingTerminals[0].state, 'ASSISTANT_TIMEOUT', 'a live streaming marker must prevent ASSISTANT_DONE even with stop_visible=false and complete route JSON');
 
 const phase1BoundaryWait = await phase1HeartbeatContext.runBoundaryCompletion();
 const phase1BoundaryTerminals = phase1BoundaryWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
 assert.equal(phase1BoundaryTerminals.length, 1, 'deadline-boundary completion must emit exactly one terminal result');
 assert.equal(phase1BoundaryTerminals[0].state, 'ASSISTANT_DONE', 'stable completion must beat timeout in the same sampled state');
-assert.equal(phase1BoundaryTerminals[0].at, 10000, 'deadline-boundary completion must use the original deadline');
+// Content becomes ready at t=5000 with a 10000ms deadline. The event-driven
+// design confirms via one settle (quiet debounce) plus one scheduled
+// confirmation -- roughly 800ms after readiness -- rather than waiting for
+// two arbitrary fixed-cadence heartbeat ticks to land after the change (the
+// old polling design's ~10000ms was an artifact of that cadence, not a real
+// requirement). The real requirement is: complete well before the deadline,
+// and not before content was actually ready.
+assert.ok(phase1BoundaryTerminals[0].at >= 5000, 'completion must not be reported before content actually became ready');
+assert.ok(phase1BoundaryTerminals[0].at < 10000, 'event-driven completion must beat the deadline with margin, not just barely tie it');
+
+const phase1NoConfirmWait = await phase1HeartbeatContext.runConfirmationDisabledCompletion();
+const phase1NoConfirmTerminals = phase1NoConfirmWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+assert.equal(phase1NoConfirmTerminals.length, 1, 'a single-sample-only run must still emit exactly one terminal result');
+assert.equal(
+    phase1NoConfirmTerminals[0].state,
+    'ASSISTANT_TIMEOUT',
+    'without a genuine second committed revision, repeated timeouts on the same stale cursor must never manufacture a second stable sample',
+);
+assert.equal(phase1NoConfirmTerminals[0].at, 5000, 'a single-sample candidate must time out at the original deadline, never completing early');
+
+const phase1EarlyMutationWait = await phase1HeartbeatContext.runEarlyUnrelatedMutationCompletion();
+const phase1EarlyMutationTerminals = phase1EarlyMutationWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+assert.equal(phase1EarlyMutationTerminals.length, 1, 'the early-unrelated-mutation run must still emit exactly one terminal result');
+assert.equal(phase1EarlyMutationTerminals[0].state, 'ASSISTANT_DONE', 'completion must still happen once the text is genuinely quiet');
+assert.ok(
+    phase1EarlyMutationTerminals[0].at >= 3800,
+    'a same-text revision arriving before completion_confirm_ms has elapsed must not count as the confirmation; ' +
+    `completion must be deferred until a genuine confirmMs-quiet window is observed (got at=${phase1EarlyMutationTerminals[0].at})`,
+);
+
+const phase1StaleGuardWait = await phase1HeartbeatContext.runMissedMutationStaleGuardCompletion();
+const phase1StaleGuardTerminals = phase1StaleGuardWait.reports.filter((item) => item.state === 'ASSISTANT_TIMEOUT' || item.state === 'ASSISTANT_DONE');
+assert.equal(phase1StaleGuardTerminals.length, 1, 'a completely missed mutation must still emit exactly one terminal result');
+assert.equal(
+    phase1StaleGuardTerminals[0].state,
+    'ASSISTANT_DONE',
+    'the stale-guard fallback must recover a change the observer never reported via a real mutation/confirmation commit',
+);
+assert.ok(
+    phase1StaleGuardTerminals[0].at < 30000,
+    'stale-guard recovery must complete well before the command deadline, not merely time out on stuck stale data',
+);
 
 for (const composerMode of ['missing', 'false']) {
     const rejectedWait = await phase1HeartbeatContext.runComposerRejectedCompletion(composerMode);
@@ -1033,6 +1666,7 @@ vm.runInNewContext(
      function domSnapshot() { return { messages: { messages: [], counts: {}, last_user: null, last_assistant: null } }; }
      async function claimQueuedRole() { return 'NONE'; }
      async function request(method, url, payload) { requests.push({ url, payload }); if (url.endsWith('/api/status')) return new Promise((resolve) => { resolveStatus = resolve; }); if (url.endsWith('/api/reserve-role-claim')) return { role_claim_id: 'g-2-opaque', config: {} }; return { status: 'OK' }; }
+     const observationController = { ensureFresh() { return { snapshot: domSnapshot() }; } };
      ${extractFunction('clearRole')};
      ${extractFunction('setRole')};
      ${extractFunction('releaseRoleClaim')};
@@ -1092,8 +1726,6 @@ vm.runInNewContext(
      const config = {
          poll_ms: 800,
          report_wait_every_ms: 20000,
-         assistant_quiet_ms: 1000,
-         assistant_force_sync_quiet_ms: 5000,
          assistant_post_stop_timeout_ms: 15000,
          auto_reload_on_assistant_timeout: false,
          reload_after_timeout_ms: 0
@@ -1142,8 +1774,16 @@ vm.runInNewContext(
          }
          throw new Error('unexpected request ' + url);
      }
+     function detectAssistantStreaming() { return false; }
+     const observationController = {
+         ensureFresh() { return { snapshot: domSnapshot() }; },
+         revision() { return 0; },
+         scheduleConfirmation() {},
+         async waitForRevision(afterRevision, ms) { await sleep(ms); return { timedOut: true }; },
+     };
      ${extractFunction('requestRole')};
      ${extractFunction('report')};
+     ${extractFunction('createCompletionDetector')};
      ${extractFunction('handleWaitAssistantDone')};
      ${extractFunction('executeCommand')};
      ${extractFunction('hydrateFlowStatus')};

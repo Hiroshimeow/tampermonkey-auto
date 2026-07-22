@@ -40,23 +40,30 @@
         composer_stable_sample_ms: 300,
         composer_watchdog_ms: 60000,
         composer_watchdog_poll_ms: 20000,
-        assistant_quiet_ms: 2500,
         report_wait_every_ms: 1500,
         max_button_dump: 80,
         send_accept_timeout_ms: 60000,
         send_accept_poll_ms: 400,
-        assistant_force_sync_quiet_ms: 5000,
         assistant_post_stop_timeout_ms: 15000,
         auto_reload_on_assistant_timeout: true,
-        reload_after_timeout_ms: 1500
+        reload_after_timeout_ms: 1500,
+        observer_quiet_ms: 400,
+        observer_fallback_ms: 5000,
+        // Deliberately much longer than observer_quiet_ms: that value settles a
+        // DOM paint/mutation batch (fast, ~400ms is plenty); this value confirms
+        // the MODEL has genuinely stopped responding, which must tolerate the
+        // same multi-second pauses between reasoning/tool-call chunks that the
+        // old assistant_quiet_ms/assistant_force_sync_quiet_ms thresholds
+        // (2500-5000ms) protected against. Too short here reintroduces
+        // premature-completion risk on a real streaming response that briefly
+        // pauses mid-answer.
+        completion_confirm_ms: 2500
     };
 
     let stopped = false;
     let pollTimer = null;
-    let syncTimer = null;
     let composerWatchdogTimer = null;
     let composerWatchdogState = null;
-    let observer = null;
     let uiContainer = null;
     let config = { ...DEFAULT_CONFIG };
     let activeCommandId = '';
@@ -164,7 +171,7 @@
         if (assigned) {
             if (current !== 'NONE' && current !== normalized) releaseRoleClaim(current).catch(() => {});
             updateUI();
-            scheduleSync('role_changed');
+            observationController.markDirty();
         }
     }
 
@@ -338,12 +345,110 @@
         return document.querySelector('main') || document.body;
     }
 
-    function messageElements() {
-        const root = chatRootElement();
-        return Array.from(root.querySelectorAll('[data-message-author-role]')).filter((node) => {
-            const role = node.getAttribute('data-message-author-role') || '';
-            return ['user', 'assistant'].includes(role) && isVisible(node);
-        });
+    // The observer must never watch document.body: the diagnostic overlay is
+    // appended there, and body-wide observation both reintroduces the CPU cost
+    // this refactor removes and can self-trigger on the overlay's own updates.
+    // Returns null when no chat root exists yet; the controller stays unbound
+    // until ensureRoot()/ensureFresh() finds one on a later call.
+    function observerRootElement() {
+        return document.querySelector('main') || null;
+    }
+
+    // MODULE A — Content Extraction.
+    // Single responsibility: turn the chat DOM into the transcript summary.
+    // Reads assistant/user content through textContent of a specific content
+    // node so a partially mounted code block can never truncate the response to
+    // a bare renderer label (the innerText "json" root cause).
+    const ASSISTANT_CONTENT_SELECTORS = ['.markdown', '.prose', '[data-message-content]', 'pre code'];
+    const USER_CONTENT_SELECTORS = ['[data-message-content]', '.whitespace-pre-wrap', '.text-message'];
+
+    function normalizeMessageText(value) {
+        return String(value == null ? '' : value)
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n')
+            .trim();
+    }
+
+    function createContentExtractor(dependencies = {}) {
+        const resolveRoot = dependencies.chatRootElement || chatRootElement;
+        const visibleFn = dependencies.isVisible || isVisible;
+        const pathFn = dependencies.domPath || domPath;
+        const imagesFn = dependencies.imageSummary || imageSummary;
+
+        function messageElements(root) {
+            root = root || resolveRoot();
+            if (!root || typeof root.querySelectorAll !== 'function') {
+                return [];
+            }
+            return Array.from(root.querySelectorAll('[data-message-author-role]')).filter((node) => {
+                const role = node.getAttribute('data-message-author-role') || '';
+                return role === 'user' || role === 'assistant';
+            });
+        }
+
+        function findMessageContentNode(messageNode, role) {
+            if (!messageNode || typeof messageNode.querySelector !== 'function') {
+                return role === 'user' ? (messageNode || null) : null;
+            }
+            const selectors = role === 'user' ? USER_CONTENT_SELECTORS : ASSISTANT_CONTENT_SELECTORS;
+            for (const selector of selectors) {
+                let found = null;
+                try {
+                    found = messageNode.querySelector(selector);
+                } catch (error) {
+                    found = null;
+                }
+                if (found) {
+                    return found;
+                }
+            }
+            // Assistant text must never fall back to the whole bubble: it can
+            // carry toolbar/"Copy code"/reaction text that would contaminate
+            // route JSON parsing. Returning null yields '' text, which the
+            // incomplete-text guard correctly treats as not-yet-ready.
+            return role === 'user' ? messageNode : null;
+        }
+
+        function extractMessageText(messageNode, role) {
+            const contentNode = findMessageContentNode(messageNode, role);
+            return normalizeMessageText(contentNode ? contentNode.textContent : '');
+        }
+
+        function summarizeMessages(root) {
+            const scope = root || resolveRoot();
+            const messages = messageElements(scope).map((node) => {
+                const role = node.getAttribute('data-message-author-role') || 'unknown';
+                const text = extractMessageText(node, role);
+                const images = imagesFn(node);
+                return {
+                    role,
+                    text,
+                    length: text.length,
+                    image_count: images.length,
+                    images,
+                    path: pathFn(node),
+                    visible: visibleFn(node)
+                };
+            });
+
+            const counts = messages.reduce((acc, item) => {
+                acc[item.role] = (acc[item.role] || 0) + 1;
+                acc.images = (acc.images || 0) + item.image_count;
+                return acc;
+            }, {});
+
+            const assistants = messages.filter((item) => item.role === 'assistant');
+            const users = messages.filter((item) => item.role === 'user');
+
+            return {
+                messages,
+                counts,
+                last_assistant: assistants.length ? assistants[assistants.length - 1] : null,
+                last_user: users.length ? users[users.length - 1] : null
+            };
+        }
+
+        return { messageElements, findMessageContentNode, extractMessageText, summarizeMessages };
     }
 
     function imageSummary(root) {
@@ -553,7 +658,7 @@
         }
         clearFn();
         composerWatchdogState = null;
-        scheduleSync('composer_watchdog_cleared');
+        observationController.markDirty();
     }
 
     function clearComposerText(el) {
@@ -1149,98 +1254,325 @@
         return null;
     }
 
+    const contentExtractor = createContentExtractor();
+
     function messageSummary() {
-        const messages = messageElements().map((node) => {
-            const role = node.getAttribute('data-message-author-role') || 'unknown';
-            const text = textOf(node);
-            const images = imageSummary(node);
-            return {
-                role,
-                text,
-                length: text.length,
-                image_count: images.length,
-                images,
-                path: domPath(node),
-                visible: isVisible(node)
-            };
-        });
-
-        const counts = messages.reduce((acc, item) => {
-            acc[item.role] = (acc[item.role] || 0) + 1;
-            acc.images = (acc.images || 0) + item.image_count;
-            return acc;
-        }, {});
-
-        const assistants = messages.filter((item) => item.role === 'assistant');
-        const users = messages.filter((item) => item.role === 'user');
-
-        return {
-            messages,
-            counts,
-            last_assistant: assistants.length ? assistants[assistants.length - 1] : null,
-            last_user: users.length ? users[users.length - 1] : null
-        };
+        return contentExtractor.summarizeMessages();
     }
 
+    // Explicit streaming evidence: a ChatGPT streaming marker inside the chat
+    // root. This is an internal completion signal only; it is never added to
+    // the public snapshot shape.
+    function detectAssistantStreaming(root) {
+        const scope = root || chatRootElement();
+        if (!scope || typeof scope.querySelector !== 'function') {
+            return false;
+        }
+        try {
+            return !!scope.querySelector('.result-streaming, [data-message-streaming="true"], [data-streaming="true"]');
+        } catch (error) {
+            return false;
+        }
+    }
+
+    // MODULE C — Snapshot Assembly.
+    // Single responsibility: collect the live DOM into the exact public
+    // domSnapshot shape plus an internal-only UI state record. The public shape
+    // is a hard contract (server.py and apps/bridge.py read it verbatim), so no
+    // streaming/capture/revision metadata is ever mixed into it.
+    function createSnapshotAssembler(dependencies = {}) {
+        const summarize = dependencies.messageSummary || messageSummary;
+        const streamingFn = dependencies.detectStreaming || detectAssistantStreaming;
+
+        function capture(reason) {
+            const composer = composerElement();
+            const sendButtonRef = findSendButton();
+            const sendButton = sendButtonRef ? sendButtonRef.element : null;
+            const stopButton = stopElement();
+            const messages = summarize();
+            const composerRoot = closestComposerRoot(composer);
+            const composerText = composerTextOf(composer);
+            const composerAttachments = composerAttachmentSummary(composerRoot);
+            const composerButtons = scopedSendButtonCandidates().slice(0, 12).map((item) => ({
+                meta: item.meta,
+                scores: item.scores,
+                total: item.total
+            }));
+            const buttons = sendButtonCandidates().slice(0, config.max_button_dump).map((item) => ({
+                meta: item.meta,
+                scores: item.scores,
+                total: item.total
+            }));
+            const choicePrompts = composer ? [] : choicePromptSummary();
+            const stopVisible = isVisible(stopButton);
+
+            const snapshot = {
+                bridge_version: BRIDGE_VERSION,
+                page_instance_id: PAGE_INSTANCE_ID,
+                role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
+                role_claim_id: typeof roleClaimId === 'function' ? roleClaimId() : '',
+                page_path: window.location.pathname || '',
+                page_href: window.location.href,
+                composer: !!composer,
+                composer_text: composerText,
+                composer_text_len: composerText.length,
+                composer_prompt_hash: stableHash(normalizeComposerText(composerText)),
+                composer_watchdog_enabled: !!composerWatchdogTimer,
+                composer_watchdog_age_ms: composerWatchdogState && composerWatchdogState.started_at
+                    ? Math.max(0, Date.now() - composerWatchdogState.started_at)
+                    : 0,
+                manual_input_pending: hasManualComposerInput({ composer_text_len: composerText.length, composer_attachments: composerAttachments }),
+                composer_path: composer ? domPath(composer) : '',
+                composer_root_path: composerRoot ? domPath(composerRoot) : '',
+                composer_buttons: composerButtons,
+                composer_attachments: composerAttachments,
+                choice_prompt_pending: choicePrompts.length > 0,
+                choice_prompt_candidates: choicePrompts,
+                file_inputs: visibleFileInputs().map((item) => ({
+                    accept: item.accept,
+                    multiple: item.multiple,
+                    disabled: item.disabled,
+                    visible: item.visible,
+                    path: item.path
+                })),
+                send_enabled: sendButton ? isClickableSendButton(sendButton) : null,
+                selected_button: sendButton ? buttonMeta(sendButton) : null,
+                selection_strategy: sendButtonRef ? sendButtonRef.strategy : null,
+                selected_button_path: sendButton ? domPath(sendButton) : '',
+                matched_selector: sendButtonRef ? sendButtonRef.matched_selector : null,
+                stop_visible: stopVisible,
+                voice_visible: !!selectFirst(['button[aria-label*="voice"]', 'button[aria-label*="Voice"]']),
+                buttons,
+                messages
+            };
+
+            const ui = {
+                stopVisible,
+                streaming: streamingFn(),
+                composerAvailable: !!composer,
+                manualInputPending: snapshot.manual_input_pending
+            };
+
+            return { snapshot, ui, capturedAt: Date.now(), reason: reason || 'immediate' };
+        }
+
+        return { capture };
+    }
+
+    const snapshotAssembler = createSnapshotAssembler();
+
     function domSnapshot() {
-        const composer = composerElement();
-        const sendButtonRef = findSendButton();
-        const sendButton = sendButtonRef ? sendButtonRef.element : null;
-        const stopButton = stopElement();
-        const messages = messageSummary();
-        const composerRoot = closestComposerRoot(composer);
-        const composerText = composerTextOf(composer);
-        const composerAttachments = composerAttachmentSummary(composerRoot);
-        const composerButtons = scopedSendButtonCandidates().slice(0, 12).map((item) => ({
-            meta: item.meta,
-            scores: item.scores,
-            total: item.total
-        }));
-        const buttons = sendButtonCandidates().slice(0, config.max_button_dump).map((item) => ({
-            meta: item.meta,
-            scores: item.scores,
-            total: item.total
-        }));
-        const choicePrompts = composer ? [] : choicePromptSummary();
+        return snapshotAssembler.capture('immediate').snapshot;
+    }
+
+    // MODULE D — Observer Lifecycle / Observation Store.
+    // Single responsibility: own the MutationObserver bound to the chat root,
+    // debounce mutation bursts into one settled capture, and hold the latest
+    // immutable observation plus a monotonic revision. The mutation callback is
+    // intentionally cheap: it only marks dirty state and restarts one debounce
+    // timer. All clock/timer/observer dependencies are injectable for tests.
+    // A committed observation is shared, unmodified, across poll/sync/waiter/
+    // completion consumers, so the whole plain-data graph must be immutable,
+    // not just the outer record (a shallow freeze leaves snapshot/ui/messages
+    // still mutable).
+    function deepFreezeObservation(value) {
+        if (!value || typeof value !== 'object' || Object.isFrozen(value)) {
+            return value;
+        }
+        Object.freeze(value);
+        for (const key of Object.keys(value)) {
+            deepFreezeObservation(value[key]);
+        }
+        return value;
+    }
+
+    function createObservationController(options = {}) {
+        const rootProvider = options.rootProvider || chatRootElement;
+        const captureFn = options.capture || ((reason) => snapshotAssembler.capture(reason));
+        const nowFn = options.now || (() => Date.now());
+        const setTimer = options.setTimer || setTimeout;
+        const clearTimer = options.clearTimer || clearTimeout;
+        const ObserverImpl = options.MutationObserverImpl
+            || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
+        const onCommit = typeof options.onCommit === 'function' ? options.onCommit : null;
+        const quietMs = Number(options.quietMs != null ? options.quietMs : config.observer_quiet_ms) || 400;
+        const fallbackMaxAgeMs = Number(
+            options.fallbackMaxAgeMs != null ? options.fallbackMaxAgeMs : config.observer_fallback_ms
+        ) || 5000;
+        const confirmMs = Number(options.confirmMs != null ? options.confirmMs : config.completion_confirm_ms) || 400;
+
+        let observer = null;
+        let observedRoot = null;
+        let quietTimer = null;
+        let confirmationTimer = null;
+        let latest = null;
+        let revision = 0;
+        let mutationGeneration = 0;
+        let lastMutationAt = 0;
+        let waiters = [];
+
+        function observeRoot(root) {
+            if (observer) {
+                observer.disconnect();
+                observer = null;
+            }
+            observedRoot = root || null;
+            if (!ObserverImpl || !observedRoot || typeof observedRoot.querySelectorAll !== 'function') {
+                return;
+            }
+            observer = new ObserverImpl(handleMutations);
+            // attributes: true was tried and reverted -- on a live streaming
+            // chat page, watching every attribute mutation across the whole
+            // subtree (React re-renders touch style/class/data-* constantly
+            // during generation) can flood the JS thread with microtask
+            // callbacks fast enough to starve setTimeout-based polling
+            // entirely, freezing the bridge while the tab stays visually
+            // open. The 5s ensureFresh staleness fallback + 800ms status poll
+            // already bound the cost of missing an attribute-only change.
+            observer.observe(observedRoot, { childList: true, subtree: true, characterData: true });
+        }
+
+        function ensureRoot() {
+            const root = rootProvider();
+            if (root !== observedRoot) {
+                observeRoot(root);
+            }
+            return observedRoot;
+        }
+
+        function restartQuietTimer() {
+            if (quietTimer) {
+                clearTimer(quietTimer);
+            }
+            quietTimer = setTimer(() => {
+                quietTimer = null;
+                commitCapture('mutation_quiet');
+            }, quietMs);
+        }
+
+        function handleMutations() {
+            mutationGeneration += 1;
+            lastMutationAt = nowFn();
+            if (confirmationTimer) {
+                clearTimer(confirmationTimer);
+                confirmationTimer = null;
+            }
+            restartQuietTimer();
+        }
+
+        function resolveWaiters(payload) {
+            const pending = waiters;
+            waiters = [];
+            for (const waiter of pending) {
+                waiter.resolve(payload);
+            }
+        }
+
+        function commitCapture(reason) {
+            ensureRoot();
+            const record = captureFn(reason);
+            latest = deepFreezeObservation(record);
+            revision += 1;
+            resolveWaiters({ observation: latest, revision });
+            if (onCommit) {
+                try {
+                    onCommit(latest, revision);
+                } catch (error) {
+                    console.warn('[MAuto Bridge] observation commit hook failed', error);
+                }
+            }
+            return latest;
+        }
+
+        function forceCapture(reason) {
+            return commitCapture(reason || 'force');
+        }
+
+        function ageMs() {
+            return latest ? Math.max(0, nowFn() - latest.capturedAt) : Infinity;
+        }
+
+        function ensureFresh(reason) {
+            if (latest && rootProvider() === observedRoot && ageMs() < fallbackMaxAgeMs) {
+                return latest;
+            }
+            return commitCapture(reason || 'ensure_fresh');
+        }
+
+        function waitForRevision(afterRevision, timeoutMs) {
+            if (latest && revision > afterRevision) {
+                return Promise.resolve({ observation: latest, revision });
+            }
+            return new Promise((resolve) => {
+                let timer = null;
+                const waiter = {
+                    resolve(payload) {
+                        if (timer) {
+                            clearTimer(timer);
+                            timer = null;
+                        }
+                        resolve(payload);
+                    }
+                };
+                waiters.push(waiter);
+                if (timeoutMs != null && timeoutMs >= 0) {
+                    timer = setTimer(() => {
+                        waiters = waiters.filter((entry) => entry !== waiter);
+                        resolve({ observation: latest, revision, timedOut: true });
+                    }, timeoutMs);
+                }
+            });
+        }
+
+        function scheduleConfirmation(reason) {
+            if (confirmationTimer) {
+                clearTimer(confirmationTimer);
+            }
+            confirmationTimer = setTimer(() => {
+                confirmationTimer = null;
+                commitCapture(reason || 'confirmation');
+            }, confirmMs);
+        }
+
+        function markDirty() {
+            handleMutations();
+        }
+
+        function start() {
+            ensureRoot();
+            commitCapture('start');
+        }
+
+        function stop() {
+            if (observer) {
+                observer.disconnect();
+                observer = null;
+            }
+            observedRoot = null;
+            if (quietTimer) {
+                clearTimer(quietTimer);
+                quietTimer = null;
+            }
+            if (confirmationTimer) {
+                clearTimer(confirmationTimer);
+                confirmationTimer = null;
+            }
+            resolveWaiters({ observation: latest, revision, stopped: true });
+        }
 
         return {
-            bridge_version: BRIDGE_VERSION,
-            page_instance_id: PAGE_INSTANCE_ID,
-            role_owner_id: typeof ROLE_OWNER_ID !== 'undefined' ? ROLE_OWNER_ID : '',
-            role_claim_id: typeof roleClaimId === 'function' ? roleClaimId() : '',
-            page_path: window.location.pathname || '',
-            page_href: window.location.href,
-            composer: !!composer,
-            composer_text: composerText,
-            composer_text_len: composerText.length,
-            composer_prompt_hash: stableHash(normalizeComposerText(composerText)),
-            composer_watchdog_enabled: !!composerWatchdogTimer,
-            composer_watchdog_age_ms: composerWatchdogState && composerWatchdogState.started_at
-                ? Math.max(0, Date.now() - composerWatchdogState.started_at)
-                : 0,
-            manual_input_pending: hasManualComposerInput({ composer_text_len: composerText.length, composer_attachments: composerAttachments }),
-            composer_path: composer ? domPath(composer) : '',
-            composer_root_path: composerRoot ? domPath(composerRoot) : '',
-            composer_buttons: composerButtons,
-            composer_attachments: composerAttachments,
-            choice_prompt_pending: choicePrompts.length > 0,
-            choice_prompt_candidates: choicePrompts,
-            file_inputs: visibleFileInputs().map((item) => ({
-                accept: item.accept,
-                multiple: item.multiple,
-                disabled: item.disabled,
-                visible: item.visible,
-                path: item.path
-            })),
-            send_enabled: sendButton ? isClickableSendButton(sendButton) : null,
-            selected_button: sendButton ? buttonMeta(sendButton) : null,
-            selection_strategy: sendButtonRef ? sendButtonRef.strategy : null,
-            selected_button_path: sendButton ? domPath(sendButton) : '',
-            matched_selector: sendButtonRef ? sendButtonRef.matched_selector : null,
-            stop_visible: isVisible(stopButton),
-            voice_visible: !!selectFirst(['button[aria-label*="voice"]', 'button[aria-label*="Voice"]']),
-            buttons,
-            messages
+            start,
+            stop,
+            ensureRoot,
+            markDirty,
+            forceCapture,
+            ensureFresh,
+            scheduleConfirmation,
+            waitForRevision,
+            current: () => latest,
+            revision: () => revision,
+            mutationGeneration: () => mutationGeneration,
+            observedRoot: () => observedRoot
         };
     }
 
@@ -1429,7 +1761,7 @@
         return response;
     }
 
-    async function syncTranscript(reason) {
+    async function syncTranscript(reason, capturedSnapshot) {
         if (stopped) {
             return null;
         }
@@ -1437,7 +1769,7 @@
         if (role === 'NONE') {
             return null;
         }
-        const snapshot = domSnapshot();
+        const snapshot = capturedSnapshot || domSnapshot();
         const transcript = {
             messages: snapshot.messages.messages,
             counts: snapshot.messages.counts,
@@ -1459,30 +1791,33 @@
         return { snapshot, transcript, response };
     }
 
-    function scheduleSync(reason) {
-        if (syncTimer) {
-            clearTimeout(syncTimer);
+    // Observation commit hook: hash the already-captured settled snapshot (no
+    // recapture) and sync the transcript only when the relevant content changed.
+    function syncOnCommit(record) {
+        const snapshot = record && record.snapshot;
+        if (!snapshot) {
+            return;
         }
-        syncTimer = setTimeout(async () => {
-            syncTimer = null;
-            const snapshot = domSnapshot();
-            const hash = stableHash({
-                composer_text: snapshot.composer_text,
-                send_enabled: snapshot.send_enabled,
-                stop_visible: snapshot.stop_visible,
-                counts: snapshot.messages.counts,
-                last_assistant: snapshot.messages.last_assistant ? snapshot.messages.last_assistant.text : ''
-            });
-            if (hash !== lastSyncHash) {
-                lastSyncHash = hash;
-                try {
-                    await syncTranscript(reason);
-                } catch (error) {
-                    console.warn('[MAuto Bridge] sync failed', error);
-                }
-            }
-        }, config.sync_debounce_ms);
+        const hash = stableHash({
+            composer_text: snapshot.composer_text,
+            send_enabled: snapshot.send_enabled,
+            stop_visible: snapshot.stop_visible,
+            counts: snapshot.messages.counts,
+            last_assistant: snapshot.messages.last_assistant ? snapshot.messages.last_assistant.text : ''
+        });
+        if (hash === lastSyncHash) {
+            return;
+        }
+        lastSyncHash = hash;
+        Promise.resolve(syncTranscript(record.reason || 'observation', snapshot)).catch((error) => {
+            console.warn('[MAuto Bridge] sync failed', error);
+        });
     }
+
+    const observationController = createObservationController({
+        onCommit: syncOnCommit,
+        rootProvider: observerRootElement
+    });
 
     async function handleProbe(command) {
         const snapshot = domSnapshot();
@@ -1952,6 +2287,94 @@
         });
     }
 
+    // MODULE B — Completion Detection.
+    // Single responsibility: turn (snapshot, text, assistantCount, ui) plus the
+    // accepted-turn baseline into a stable completion verdict. Intentional UI
+    // state is primary (fresh turn, composer present, no stop control, no
+    // streaming marker, no manual input); the incomplete-text check is only a
+    // final guard. It rejects a shorter/truncated prefix of a stronger
+    // candidate and requires two matching complete samples before declaring
+    // completion.
+    function createCompletionDetector(options = {}) {
+        const incompleteFn = options.looksIncompleteText || looksIncompleteAssistantText;
+        let initialText = '';
+        let initialCount = 0;
+        let stableKey = '';
+        let stableSamples = 0;
+        let strongestText = '';
+        let strongestCount = 0;
+        let strongestPage = '';
+
+        function reset(turnContext) {
+            initialText = (turnContext && turnContext.before_last_assistant_text) || '';
+            initialCount = (turnContext && turnContext.before_assistant_count) || 0;
+            stableKey = '';
+            stableSamples = 0;
+            strongestText = '';
+            strongestCount = 0;
+            strongestPage = '';
+        }
+
+        function samples() {
+            return stableSamples;
+        }
+
+        function observe(snapshot, text, assistantCount, ui = {}) {
+            const candidateText = String(text || '');
+            const hasFreshTurn = assistantCount > initialCount;
+            const hasFreshText = candidateText && candidateText !== initialText;
+            const complete = Boolean(
+                (hasFreshTurn || hasFreshText)
+                && snapshot.composer === true
+                && !snapshot.stop_visible
+                && !ui.streaming
+                && !hasManualComposerInput(snapshot)
+                && !incompleteFn(candidateText)
+            );
+            if (!complete) {
+                stableKey = '';
+                stableSamples = 0;
+                return null;
+            }
+            const pageGeneration = String(
+                snapshot.page_instance_id
+                || (typeof PAGE_INSTANCE_ID !== 'undefined' ? PAGE_INSTANCE_ID : '')
+            );
+            const shorterPrefix = Boolean(
+                strongestText
+                && strongestCount === assistantCount
+                && strongestPage === pageGeneration
+                && strongestText.startsWith(candidateText)
+                && candidateText.length < strongestText.length
+            );
+            if (shorterPrefix) {
+                stableKey = '';
+                stableSamples = 0;
+                return null;
+            }
+            if (
+                !strongestText
+                || strongestCount !== assistantCount
+                || strongestPage !== pageGeneration
+                || candidateText.length >= strongestText.length
+                || !candidateText.startsWith(strongestText)
+            ) {
+                strongestText = candidateText;
+                strongestCount = assistantCount;
+                strongestPage = pageGeneration;
+            }
+            const candidateKey = JSON.stringify([candidateText, assistantCount, pageGeneration]);
+            stableSamples = candidateKey === stableKey ? stableSamples + 1 : 1;
+            stableKey = candidateKey;
+            if (stableSamples >= 2) {
+                return { snapshot, text: candidateText, assistant_count: assistantCount };
+            }
+            return null;
+        }
+
+        return { reset, observe, samples };
+    }
+
     async function handleWaitAssistantDone(command) {
         const turnContext = lastAcceptedTurnContext;
         if (!turnContext) {
@@ -1967,83 +2390,26 @@
 
         const payload = command.payload || {};
         const deadline = Date.now() + Math.max(1000, Number(payload.timeout_ms || 120000));
-        const currentSnapshot = domSnapshot();
+        let cursor = observationController.ensureFresh('wait_assistant_done_initial');
+        let cursorRevision = observationController.revision();
+        let lastObservedRevision = -1;
         const initialAssistantText = turnContext.before_last_assistant_text || '';
         const initialAssistantCount = turnContext.before_assistant_count || 0;
-        let lastText = currentSnapshot.messages.last_assistant ? currentSnapshot.messages.last_assistant.text : '';
-        let lastAssistantCount = currentSnapshot.messages.counts.assistant || 0;
-        let lastStopVisible = currentSnapshot.stop_visible;
+        let lastText = cursor.snapshot.messages.last_assistant ? cursor.snapshot.messages.last_assistant.text : '';
+        let lastAssistantCount = cursor.snapshot.messages.counts.assistant || 0;
+        let lastStopVisible = cursor.snapshot.stop_visible;
         let quietSince = Date.now();
-        let postStopSince = currentSnapshot.stop_visible ? 0 : Date.now();
+        let postStopSince = cursor.snapshot.stop_visible ? 0 : Date.now();
         const heartbeatEveryMs = Math.min(
             5000,
             Math.max(1000, Number(config.report_wait_every_ms) || 1500)
         );
         let lastActivityAt = Date.now();
-        let stableCandidateKey = '';
-        let stableCandidateSamples = 0;
-        let strongestCandidateText = '';
-        let strongestCandidateCount = 0;
-        let strongestCandidatePage = '';
-
-        function resetStableCandidate() {
-            stableCandidateKey = '';
-            stableCandidateSamples = 0;
-        }
-
-        function observeStableCandidate(snapshot, text, assistantCount) {
-            const candidateText = String(text || '');
-            const hasFreshTurn = assistantCount > initialAssistantCount;
-            const hasFreshText = candidateText && candidateText !== initialAssistantText;
-            const complete = Boolean(
-                (hasFreshTurn || hasFreshText)
-                && snapshot.composer === true
-                && !snapshot.stop_visible
-                && !hasManualComposerInput(snapshot)
-                && !looksIncompleteAssistantText(candidateText)
-            );
-            if (!complete) {
-                resetStableCandidate();
-                return null;
-            }
-            const pageGeneration = String(
-                snapshot.page_instance_id
-                || (typeof PAGE_INSTANCE_ID !== 'undefined' ? PAGE_INSTANCE_ID : '')
-            );
-            const shorterPrefix = Boolean(
-                strongestCandidateText
-                && strongestCandidateCount === assistantCount
-                && strongestCandidatePage === pageGeneration
-                && strongestCandidateText.startsWith(candidateText)
-                && candidateText.length < strongestCandidateText.length
-            );
-            if (shorterPrefix) {
-                resetStableCandidate();
-                return null;
-            }
-            if (
-                !strongestCandidateText
-                || strongestCandidateCount !== assistantCount
-                || strongestCandidatePage !== pageGeneration
-                || candidateText.length >= strongestCandidateText.length
-                || !candidateText.startsWith(strongestCandidateText)
-            ) {
-                strongestCandidateText = candidateText;
-                strongestCandidateCount = assistantCount;
-                strongestCandidatePage = pageGeneration;
-            }
-            const candidateKey = JSON.stringify([candidateText, assistantCount, pageGeneration]);
-            stableCandidateSamples = candidateKey === stableCandidateKey ? stableCandidateSamples + 1 : 1;
-            stableCandidateKey = candidateKey;
-            if (stableCandidateSamples >= 2) {
-                return {
-                    snapshot,
-                    text: candidateText,
-                    assistant_count: assistantCount
-                };
-            }
-            return null;
-        }
+        const completionDetector = createCompletionDetector();
+        completionDetector.reset(turnContext);
+        let confirmationScheduledForRevision = -1;
+        let confirmationScheduledAt = 0;
+        const completionConfirmMs = Number(config.completion_confirm_ms) || 2500;
 
         async function reportStableCompletion(stableCompletion, extraResult = {}) {
             await report('ASSISTANT_DONE', command.command_id, {
@@ -2051,7 +2417,7 @@
                 result: {
                     assistant_len: stableCompletion.text.length,
                     counts: stableCompletion.snapshot.messages.counts,
-                    stable_samples: stableCandidateSamples,
+                    stable_samples: completionDetector.samples(),
                     ...extraResult,
                     turn_context: {
                         before_user_count: turnContext.before_user_count,
@@ -2065,20 +2431,52 @@
         }
 
         while (!stopped) {
-            const snapshot = domSnapshot();
+            const snapshot = cursor.snapshot;
+            const ui = cursor.ui || {};
             const assistantText = snapshot.messages.last_assistant ? snapshot.messages.last_assistant.text : '';
             const assistantCount = snapshot.messages.counts.assistant || 0;
             const textChanged = assistantText !== lastText;
             const countChanged = assistantCount !== lastAssistantCount;
             const stopChanged = snapshot.stop_visible !== lastStopVisible;
-            const hasNewAssistantTurn = assistantCount > initialAssistantCount;
-            const hasFreshAssistantText = assistantText && assistantText !== initialAssistantText;
-            const hasFreshAssistantOutput = hasNewAssistantTurn || hasFreshAssistantText;
 
-            const stableCompletion = observeStableCandidate(snapshot, assistantText, assistantCount);
-            if (stableCompletion) {
-                await reportStableCompletion(stableCompletion);
-                return;
+            // Feed the detector only genuinely new committed observations.
+            // Re-seeing the same cached revision (a waitForRevision timeout with
+            // nothing new committed) must never count as a second sample --
+            // that is precisely how a premature/partial answer could otherwise
+            // get "confirmed" by re-reading the same stale state twice.
+            if (cursorRevision !== lastObservedRevision) {
+                lastObservedRevision = cursorRevision;
+                const stableCompletion = completionDetector.observe(snapshot, assistantText, assistantCount, ui);
+                const capturedAt = Number(cursor.capturedAt);
+                if (stableCompletion) {
+                    // The detector sees two matching samples, but that alone is
+                    // not proof the second one is the genuine confirmation: an
+                    // unrelated mutation (e.g. an attribute toggle) can commit a
+                    // new revision with the same visible text well before the
+                    // scheduled confirmation actually fires. Require the real
+                    // elapsed time since confirmation was armed to have reached
+                    // completion_confirm_ms before trusting it.
+                    const confirmedLongEnough = Boolean(
+                        confirmationScheduledForRevision !== -1
+                        && Number.isFinite(capturedAt)
+                        && capturedAt - confirmationScheduledAt >= completionConfirmMs
+                    );
+                    if (confirmedLongEnough) {
+                        await reportStableCompletion(stableCompletion);
+                        return;
+                    }
+                    confirmationScheduledForRevision = cursorRevision;
+                    confirmationScheduledAt = capturedAt;
+                    observationController.scheduleConfirmation('wait_assistant_done_confirm');
+                } else if (completionDetector.samples() === 1) {
+                    if (confirmationScheduledForRevision !== cursorRevision) {
+                        confirmationScheduledForRevision = cursorRevision;
+                        confirmationScheduledAt = capturedAt;
+                        observationController.scheduleConfirmation('wait_assistant_done_confirm');
+                    }
+                } else {
+                    confirmationScheduledForRevision = -1;
+                }
             }
 
             if (Date.now() >= deadline) {
@@ -2137,12 +2535,8 @@
                 postStopSince = Date.now();
             }
 
-            if (snapshot.stop_visible) {
-                await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
-                continue;
-            }
-
-            if (hasManualComposerInput(snapshot)) {
+            const manualInputPending = hasManualComposerInput(snapshot);
+            if (manualInputPending && !snapshot.stop_visible) {
                 await report('MANUAL_INPUT_PENDING', command.command_id, {
                     text: assistantText,
                     result: {
@@ -2154,53 +2548,9 @@
                     dom_info: snapshot
                 });
                 lastActivityAt = Date.now();
-                await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
-                continue;
             }
 
-            if (Date.now() - quietSince >= config.assistant_quiet_ms && hasFreshAssistantOutput) {
-                const synced = await syncTranscript('wait_assistant_done');
-                lastActivityAt = Date.now();
-                const finalSnapshot = synced ? synced.snapshot : snapshot;
-                const finalText = synced && synced.transcript.last_assistant ? synced.transcript.last_assistant.text : assistantText;
-                const finalAssistantCount = (finalSnapshot.messages.counts.assistant || 0);
-                const finalHasFreshText = finalText && finalText !== initialAssistantText;
-                const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
-                    const syncedStableCompletion = observeStableCandidate(
-                        finalSnapshot,
-                        finalText,
-                        finalAssistantCount
-                    );
-                    if (syncedStableCompletion) {
-                        await reportStableCompletion(syncedStableCompletion);
-                        return;
-                    }
-                }
-            }
-
-            if (Date.now() - quietSince >= config.assistant_force_sync_quiet_ms && hasFreshAssistantOutput) {
-                const synced = await syncTranscript('wait_assistant_done_force_sync');
-                lastActivityAt = Date.now();
-                const finalSnapshot = synced ? synced.snapshot : snapshot;
-                const finalText = synced && synced.transcript.last_assistant ? synced.transcript.last_assistant.text : assistantText;
-                const finalAssistantCount = finalSnapshot.messages.counts.assistant || 0;
-                const finalHasFreshText = finalText && finalText !== initialAssistantText;
-                const finalHasFreshTurn = finalAssistantCount > initialAssistantCount;
-                if ((finalHasFreshText || finalHasFreshTurn) && !looksIncompleteAssistantText(finalText)) {
-                    const forceSyncedStableCompletion = observeStableCandidate(
-                        finalSnapshot,
-                        finalText,
-                        finalAssistantCount
-                    );
-                    if (forceSyncedStableCompletion) {
-                        await reportStableCompletion(forceSyncedStableCompletion, { force_sync: true });
-                        return;
-                    }
-                }
-            }
-
-            if (postStopSince && Date.now() - postStopSince >= config.assistant_post_stop_timeout_ms) {
+            if (!manualInputPending && postStopSince && Date.now() - postStopSince >= config.assistant_post_stop_timeout_ms) {
                 await report('ASSISTANT_TIMEOUT', command.command_id, {
                     text: assistantText,
                     result: {
@@ -2219,7 +2569,24 @@
                 return;
             }
 
-            await sleep(Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now())));
+            const boundedMs = Math.min(heartbeatEveryMs, Math.max(1, deadline - Date.now()));
+            const waited = await observationController.waitForRevision(cursorRevision, boundedMs);
+            cursorRevision = waited.revision;
+            cursor = waited.observation || cursor;
+            if (waited.timedOut) {
+                // Guard against a missed mutation or a replaced chat root: a
+                // bounded wait timing out with nothing committed does not by
+                // itself prove the DOM is unchanged, only that the observer
+                // has not told us otherwise. Ask the controller to verify
+                // freshness (and rebind/recapture if the cache is stale or the
+                // root changed) instead of trusting a possibly-stuck cursor
+                // all the way to the command deadline.
+                const fresh = observationController.ensureFresh('wait_assistant_done_stale_guard');
+                if (fresh !== cursor) {
+                    cursor = fresh;
+                    cursorRevision = observationController.revision();
+                }
+            }
         }
     }
 
@@ -2516,7 +2883,7 @@
                 role_claim_id: typeof roleClaimId === 'function' ? roleClaimId(role) : '',
                 claim_role: typeof roleClaimPending !== 'undefined' && roleClaimPending,
                 observation_seq: typeof nextObservationSeq === 'function' ? nextObservationSeq() : 0,
-                dom_info: domSnapshot()
+                dom_info: observationController.ensureFresh('status_poll').snapshot
             });
             if ((typeof roleAssignmentGeneration !== 'undefined' && requestGeneration !== roleAssignmentGeneration) || nextRole() !== requestRole) {
                 return;
@@ -2701,21 +3068,6 @@
         }
     }
 
-    function attachObserver() {
-        if (observer) {
-            observer.disconnect();
-        }
-        observer = new MutationObserver(() => {
-            ensureUIAttached();
-            scheduleSync('mutation');
-        });
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true
-        });
-    }
-
     function start() {
         stopped = false;
         activeCommandId = '';
@@ -2724,8 +3076,7 @@
         lastAcceptedTurnContext = null;
         composerWatchdogState = null;
         createUI();
-        attachObserver();
-        scheduleSync('start');
+        observationController.start();
         schedulePoll();
         composerWatchdogTimer = setInterval(checkComposerWatchdog, Math.max(1000, Number(config.composer_watchdog_poll_ms || 20000)));
         console.log('[MAuto Bridge] start', BRIDGE_VERSION);
@@ -2742,18 +3093,11 @@
             clearTimeout(pollTimer);
             pollTimer = null;
         }
-        if (syncTimer) {
-            clearTimeout(syncTimer);
-            syncTimer = null;
-        }
         if (composerWatchdogTimer) {
             clearInterval(composerWatchdogTimer);
             composerWatchdogTimer = null;
         }
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
+        observationController.stop();
         if (uiContainer) {
             uiContainer.remove();
             uiContainer = null;

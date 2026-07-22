@@ -1857,14 +1857,20 @@ def test_wait_assistant_done_preserves_exact_parent_deadline_through_nested_comm
     ids=["missing-composer", "false-composer"],
 )
 def test_assistant_done_without_clean_composer_hydrates_two_role_observations(
+    monkeypatch: pytest.MonkeyPatch,
     dom_info: dict[str, Any],
 ) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: clock.__setitem__("now", clock["now"] + 1.0) or clock["now"])
     baseline = BridgeClient.response_activity(response_snapshot("old", assistant_count=1, observation_seq=1))
     hydrated = '{"PLAN":"hydrated from clean observations"}'
+    # Enough genuinely fresh (strictly increasing observation_seq) snapshots to
+    # let the fallback keep observing real settle time via the fake clock
+    # rather than plateauing on a single repeated observation_seq.
     bridge = ScriptedBridge(
         [
-            response_snapshot(hydrated, assistant_count=2, observation_seq=2),
-            response_snapshot(hydrated, assistant_count=2, observation_seq=3),
+            response_snapshot(hydrated, assistant_count=2, observation_seq=seq)
+            for seq in range(2, 22)
         ],
         command_results={
             "WAIT_ASSISTANT_DONE": [
@@ -1881,7 +1887,7 @@ def test_assistant_done_without_clean_composer_hydrates_two_role_observations(
         },
     )
 
-    response = bridge.wait_assistant_done("DEV", timeout_s=3.0, baseline=baseline)
+    response = bridge.wait_assistant_done("DEV", timeout_s=60.0, baseline=baseline)
 
     assert response == hydrated
     assert bridge.snapshot_calls >= 2
@@ -1901,10 +1907,54 @@ def test_response_recovery_requires_two_identical_complete_observations() -> Non
         active_wait_s=60.0,
         poll_s=0.001,
         require_response=True,
+        stable_confirm_s=0.0,
     )
 
     assert response == complete
     assert bridge.snapshot_calls >= 3
+
+
+def test_wait_for_current_response_requires_real_elapsed_confirm_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: clock.__setitem__("now", clock["now"] + 0.1) or clock["now"])
+    complete = '{"PLAN":"settled"}'
+    bridge = ScriptedBridge([
+        response_snapshot(complete, assistant_count=2, observation_seq=seq)
+        for seq in range(1, 200)
+    ])
+
+    response = bridge.wait_for_current_response(
+        "DEV",
+        timeout_s=1000.0,
+        active_wait_s=1000.0,
+        poll_s=0.001,
+        require_response=True,
+        stable_confirm_s=5.0,
+    )
+
+    assert response == complete
+    # A merely-different observation_seq (the bare two-sample minimum) must not
+    # be enough on its own -- reaching a real 5s-elapsed confirm window with
+    # the fake clock advancing 0.1s per call requires meaningfully more reads.
+    assert bridge.snapshot_calls > 5
+
+
+def test_wait_for_current_response_times_out_before_confirm_window_elapses() -> None:
+    complete = '{"PLAN":"settled"}'
+    bridge = ScriptedBridge([
+        response_snapshot(complete, assistant_count=2, observation_seq=1),
+        response_snapshot(complete, assistant_count=2, observation_seq=2),
+    ])
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        bridge.wait_for_current_response(
+            "DEV",
+            timeout_s=0.05,
+            active_wait_s=1.0,
+            poll_s=0.001,
+            require_response=True,
+            stable_confirm_s=5.0,
+        )
 
 
 def test_response_recovery_does_not_downgrade_to_shorter_prefix() -> None:
@@ -1923,19 +1973,22 @@ def test_response_recovery_does_not_downgrade_to_shorter_prefix() -> None:
         active_wait_s=60.0,
         poll_s=0.001,
         require_response=True,
+        stable_confirm_s=0.0,
     )
 
     assert response == complete
     assert bridge.snapshot_calls >= 4
 
 
-def test_owner_page_replaced_wait_recovers_without_resend_or_second_wait() -> None:
+def test_owner_page_replaced_wait_recovers_without_resend_or_second_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr("apps.bridge.time.monotonic", lambda: clock.__setitem__("now", clock["now"] + 1.0) or clock["now"])
     baseline = BridgeClient.response_activity(response_snapshot("old", assistant_count=1, observation_seq=1))
     complete = '{"REVIEW":"inspect"}'
     bridge = ScriptedBridge(
         [
-            response_snapshot(complete, assistant_count=2, page_instance_id="page-new", observation_seq=1),
-            response_snapshot(complete, assistant_count=2, page_instance_id="page-new", observation_seq=2),
+            response_snapshot(complete, assistant_count=2, page_instance_id="page-new", observation_seq=seq)
+            for seq in range(1, 21)
         ],
         command_results={
             "WAIT_ASSISTANT_DONE": [
@@ -1948,7 +2001,7 @@ def test_owner_page_replaced_wait_recovers_without_resend_or_second_wait() -> No
         },
     )
 
-    response = bridge.wait_assistant_done("DEV", timeout_s=3.0, baseline=baseline)
+    response = bridge.wait_assistant_done("DEV", timeout_s=60.0, baseline=baseline)
 
     actions = [action for action, _payload in bridge.commands]
     assert response == complete
@@ -2077,6 +2130,7 @@ def test_recovery_rejects_stale_pre_send_response_until_fresh_output_arrives() -
         require_response=True,
         baseline=baseline,
         require_fresh=True,
+        stable_confirm_s=0.0,
     )
 
     assert response == "fresh"

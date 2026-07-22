@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from apps.task_scheduler import TaskScheduler, build_wake_prompt
+from apps.task_scheduler import TaskScheduler, build_launch_argv, build_main_argv, build_wake_prompt
 from apps.task_store import TaskStore, TaskStoreMutationError, next_after_success, normalize_schedule
 
 
@@ -128,6 +128,44 @@ def test_schedule_math_manual_once_interval_cron_and_coalescing():
     assert next_after_success(cron, datetime(2026, 7, 20, 1, tzinfo=timezone.utc))[1] == "2026-07-21T00:00:00Z"
 
 
+def test_main_argv_matches_generated_command_without_shell(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks.json")
+    task = store.create(task_payload())
+
+    assert build_main_argv(task, r"C:\tools\uv.exe") == [
+        r"C:\tools\uv.exe", "run", "main.py",
+        "--role", "DEV1,REVIEW2,PLAN_Z",
+        "--browser-roles", "WORKER-A,WORKER-B",
+        "--role-map", "DEV1=WORKER-A REVIEW2=WORKER-B PLAN_Z=WORKER-A",
+        "--finish-roles", "PLAN_Z",
+        "--timeout", "1800",
+        "--request-timeout", "1200",
+        "--parallelism", "4",
+        "--max-turns", "0",
+        "--reload-after", "10",
+        "--goal", "Inspect current evidence and execute only the authorized task.",
+    ]
+
+
+def test_single_role_launch_argv_uses_role_runner(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks.json")
+    task = store.create(task_payload(
+        controller_role="worker-a",
+        logical_roles=["worker-a"],
+        physical_role_map={"worker-a": "worker-a"},
+        finish_roles=["worker-a"],
+        prompt="chỉ cần nói ok.",
+    ))
+
+    assert build_launch_argv(task, r"C:\tools\uv.exe") == [
+        r"C:\tools\uv.exe", "run", "role.py",
+        "--role", "WORKER-A",
+        "--timeout", "1800",
+        "--request-timeout", "1200",
+        "--prompt", "chỉ cần nói ok.",
+    ]
+
+
 def test_due_order_and_one_controller_reservation(tmp_path: Path):
     clock = Clock(datetime(2026, 7, 19, 0, 0, tzinfo=timezone.utc))
     store = TaskStore(tmp_path / "tasks.json", clock=clock)
@@ -198,7 +236,7 @@ def test_exact_prompt_and_set_then_single_click_payloads(tmp_path: Path):
     assert "fresh GET" in prompt
     assert "Expected task revision:" not in prompt
     assert "Execution options:" in prompt
-    assert "uv run python main.py" in prompt
+    assert "uv run main.py" in prompt
     assert '--role "DEV1,REVIEW2,PLAN_Z"' in prompt
     assert '--browser-roles "WORKER-A,WORKER-B"' in prompt
     assert '--role-map "DEV1=WORKER-A REVIEW2=WORKER-B PLAN_Z=WORKER-A"' in prompt

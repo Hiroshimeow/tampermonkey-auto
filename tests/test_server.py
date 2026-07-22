@@ -4,7 +4,7 @@ import threading
 import unittest
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -684,6 +684,21 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(detail["responses"][0]["image_count"], 1)
         self.assertEqual(detail["message_counts"]["assistant"], 2)
 
+    def test_admin_role_response_limit_bounds_payload_without_changing_turn_count(self):
+        role = "C1"
+        controller.state.role_seen_at[role] = time.time()
+        controller.state.transcripts[role] = [
+            {"role": "assistant", "text": f"response {index}"}
+            for index in range(15)
+        ]
+
+        detail = self.client.get(f"/api/admin/role/{role}?response_limit=10").json()
+
+        self.assertEqual(detail["turn"], 15)
+        self.assertEqual(len(detail["responses"]), 10)
+        self.assertEqual(detail["responses"][0]["turn"], 6)
+        self.assertEqual(detail["responses"][-1]["turn"], 15)
+
     def test_admin_roles_excludes_stale_historical_cache_and_removes_released_role_immediately(self):
         stale_role = "C3"
         controller.state.status[stale_role] = "OFFLINE"
@@ -720,7 +735,9 @@ class DiagnosticControllerTests(unittest.TestCase):
         roles_released = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
         self.assertNotIn("TEMP", roles_released)
 
-    def test_admin_roles_keeps_offline_role_only_when_it_has_active_work(self):
+    def test_admin_roles_keeps_offline_operational_roles_and_recent_cached_evidence_bounded(self):
+        now = time.time()
+        controller.state.config["dashboard_role_retention_s"] = 60
         controller.state.create_command("COMMANDER", "PROBE", {})
         controller.state.update_flow_statuses(
             "run-active",
@@ -728,11 +745,38 @@ class DiagnosticControllerTests(unittest.TestCase):
             request_id="request-active",
             activate=True,
         )
+        controller.state.role_seen_at["FLOWER"] = now
+        controller.state.current_sessions["FLOWER"] = "session-flower"
+        controller.state.dom_info["FLOWER"] = {"page_path": "/c/flower"}
+        initially_online = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+        self.assertTrue(initially_online["FLOWER"]["online"])
+        self.assertEqual(initially_online["FLOWER"]["status"], "ONLINE")
 
-        roles = {item["role"] for item in self.client.get("/api/admin/roles").json()["roles"]}
+        controller.state.role_seen_at["FLOWER"] = now - 3600
+        controller.state.role_seen_at["RECENT"] = now - 30
+        controller.state.current_sessions["RECENT"] = "session-recent"
+        controller.state.dom_info["RECENT"] = {"page_path": "/c/recent-cached"}
+        controller.state.role_seen_at["EXPIRED"] = now - 61
+        controller.state.current_sessions["EXPIRED"] = "session-expired"
+        controller.state.dom_info["EXPIRED"] = {"page_path": "/c/expired-cached"}
 
-        self.assertIn("COMMANDER", roles)
-        self.assertIn("FLOWER", roles)
+        inventory = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+
+        self.assertEqual(inventory["COMMANDER"]["status"], "OFFLINE")
+        self.assertEqual(inventory["FLOWER"]["status"], "OFFLINE")
+        self.assertTrue(inventory["COMMANDER"]["evidence_cached"])
+        self.assertEqual(inventory["RECENT"]["status"], "STALE")
+        self.assertEqual(inventory["RECENT"]["page_path"], "/c/recent-cached")
+        self.assertTrue(inventory["RECENT"]["evidence_cached"])
+        self.assertNotIn("EXPIRED", inventory)
+
+        controller.state.role_seen_at["FLOWER"] = time.time()
+        controller.state.role_seen_at["RECENT"] = time.time()
+        recovered = {item["role"]: item for item in self.client.get("/api/admin/roles").json()["roles"]}
+        for role in ("FLOWER", "RECENT"):
+            self.assertTrue(recovered[role]["online"])
+            self.assertEqual(recovered[role]["status"], "ONLINE")
+            self.assertFalse(recovered[role]["evidence_cached"])
 
     def test_current_claim_releases_after_normal_path_change(self):
         self.client.post(
@@ -1377,6 +1421,10 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertEqual(self.flow_path.read_bytes(), corrupt)
 
     def test_admin_command_and_result_endpoints(self):
+        self.client.post(
+            "/api/status",
+            json={"role": "A", "session_id": "sess-admin", "page_instance_id": "page-admin"},
+        )
         create_response = self.client.post(
             "/api/admin/command",
             json={
@@ -1413,6 +1461,37 @@ class DiagnosticControllerTests(unittest.TestCase):
         result_payload = result_response.json()
         self.assertEqual(result_payload["status"], "PROBE_DONE")
         self.assertEqual(result_payload["result"]["state"], "PROBE_DONE")
+
+    def test_admin_live_browser_actions_reject_offline_without_delayed_command_after_recovery(self):
+        for action in ("CLEAR_COMPOSER_TEXT", "RELOAD_PAGE"):
+            rejected = self.client.post(
+                "/api/admin/command",
+                json={"role": "OFFLINE-A", "action": action, "payload": {}},
+            )
+            self.assertEqual(rejected.status_code, 409)
+            self.assertIn("bridge is offline", rejected.json()["detail"])
+            self.assertIsNone(controller.state.active_command("OFFLINE-A"))
+            self.assertEqual(controller.state.command_status, {})
+
+        self.client.post(
+            "/api/status",
+            json={"role": "OFFLINE-A", "session_id": "sess-recovered", "page_instance_id": "page-recovered"},
+        )
+        self.assertIsNone(controller.state.active_command("OFFLINE-A"))
+        accepted = self.client.post(
+            "/api/admin/command",
+            json={"role": "OFFLINE-A", "action": "RELOAD_PAGE", "payload": {}},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["command"]["status"], "PENDING")
+
+    def test_admin_non_bridge_command_flow_is_not_blocked_by_role_presence(self):
+        accepted = self.client.post(
+            "/api/admin/command",
+            json={"role": "OFFLINE-SERVER", "action": "server_bookkeeping", "payload": {}},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["command"]["action"], "server_bookkeeping")
 
     def test_fail_closed_browser_states_are_terminal_command_results(self):
         for state_name in (
@@ -1571,7 +1650,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("<title>Stable Flow Runtime</title>", response.text)
         self.assertIn('id="dashboard-root"', response.text)
-        self.assertIn('data-dashboard-version="9"', response.text)
+        self.assertIn('data-dashboard-version="12"', response.text)
 
     def test_admin_routes_lists_samples(self):
         response = self.client.get("/api/admin/routes")
@@ -1582,6 +1661,7 @@ class DiagnosticControllerTests(unittest.TestCase):
         self.assertIn("/api/admin/role/A", samples)
         self.assertIn("/api/admin/role/A/timeline?limit=20", samples)
         self.assertIn("/api/admin/events?role=A&limit=20", samples)
+        self.assertIn("/api/admin/tasks/launch", samples)
         dashboard_route = next(route for route in routes if route["path"] == "/dashboard")
         self.assertEqual(dashboard_route["method"], "GET")
         self.assertEqual(dashboard_route["group"], "presentation")
@@ -2384,6 +2464,179 @@ class TaskControlPlaneTests(unittest.TestCase):
         response = self.client.post("/api/admin/tasks", json=self.payload(**overrides))
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["task"]
+
+    @staticmethod
+    def mark_role_ready(role: str):
+        normalized = role.upper()
+        controller.state.role_seen_at[normalized] = time.time()
+        controller.state.dom_info[normalized] = {
+            "composer": True,
+            "composer_text": "",
+            "composer_text_len": 0,
+            "composer_attachments": [],
+            "stop_visible": False,
+            "manual_input_pending": False,
+        }
+
+    @staticmethod
+    def launch_payload(**overrides):
+        data = {
+            "controller_role": "C2",
+            "prompt": "Implement compact live dashboard updates.",
+            "logical_roles": ["C2", "REVIEW"],
+            "physical_role_map": {"C2": "C2", "REVIEW": "C3"},
+            "finish_roles": ["REVIEW"],
+            "execution_options": {
+                "timeout": 1800,
+                "request_timeout": 1200,
+                "parallelism": 4,
+                "max_turns": 0,
+                "reload_after": 10,
+            },
+        }
+        data.update(overrides)
+        return data
+
+    @staticmethod
+    def single_launch_payload(**overrides):
+        data = {
+            "controller_role": "C2",
+            "prompt": "chỉ cần nói ok.",
+            "logical_roles": ["C2"],
+            "physical_role_map": {"C2": "C2"},
+            "finish_roles": ["C2"],
+            "execution_options": {
+                "timeout": 1800,
+                "request_timeout": 1200,
+                "parallelism": 4,
+                "max_turns": 0,
+                "reload_after": 10,
+            },
+        }
+        data.update(overrides)
+        return data
+
+    def test_compact_task_launch_starts_exact_main_process_without_task_persistence(self):
+        self.mark_role_ready("C2")
+        self.mark_role_ready("C3")
+        process = MagicMock()
+        process.pid = 43210
+        process.poll.return_value = None
+        launch_dir = Path(self.temp_dir.name) / "dashboard-launches"
+
+        with (
+            patch.object(controller, "DASHBOARD_LAUNCH_DIR", launch_dir),
+            patch("server.shutil.which", return_value=r"C:\tools\uv.exe"),
+            patch("server.subprocess.Popen", return_value=process) as popen,
+            patch("server.time.sleep"),
+        ):
+            response = self.client.post("/api/admin/tasks/launch", json=self.launch_payload())
+
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            run = body["run"]
+            self.assertEqual(body["status"], "STARTED")
+            self.assertEqual(run["pid"], 43210)
+            self.assertTrue(run["run_id"].startswith("dashboard-"))
+            self.assertEqual(run["physical_roles"], ["C2", "C3"])
+            self.assertEqual(
+                run["command"],
+                'uv run main.py --role "C2,REVIEW" --browser-roles "C2,C3" '
+                '--role-map "C2=C2 REVIEW=C3" --finish-roles "REVIEW" '
+                '--timeout 1800 --request-timeout 1200 --parallelism 4 '
+                '--max-turns 0 --reload-after 10 --goal "Implement compact live dashboard updates."',
+            )
+            argv = popen.call_args.args[0]
+            self.assertEqual(
+                argv,
+                [
+                    r"C:\tools\uv.exe", "run", "main.py",
+                    "--role", "C2,REVIEW",
+                    "--browser-roles", "C2,C3",
+                    "--role-map", "C2=C2 REVIEW=C3",
+                    "--finish-roles", "REVIEW",
+                    "--timeout", "1800",
+                    "--request-timeout", "1200",
+                    "--parallelism", "4",
+                    "--max-turns", "0",
+                    "--reload-after", "10",
+                    "--goal", "Implement compact live dashboard updates.",
+                ],
+            )
+            kwargs = popen.call_args.kwargs
+            self.assertEqual(kwargs["cwd"], controller.CONTROL_REPOSITORY)
+            self.assertFalse(kwargs["shell"])
+            for variable in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_INTERNAL__PYTHONHOME", "UV_RUN_RECURSION_DEPTH"):
+                self.assertNotIn(variable, kwargs["env"])
+            self.assertEqual(controller.state.task_store.list_tasks(), [])
+
+            conflict = self.client.post("/api/admin/tasks/launch", json=self.launch_payload(prompt="second"))
+            self.assertEqual(conflict.status_code, 409)
+            self.assertEqual(conflict.json()["detail"]["code"], "controller_busy")
+            self.assertEqual(popen.call_count, 1)
+
+    def test_compact_single_role_launch_uses_role_runner(self):
+        self.mark_role_ready("C2")
+        process = MagicMock()
+        process.pid = 43211
+        process.poll.return_value = None
+        launch_dir = Path(self.temp_dir.name) / "dashboard-launches"
+
+        with (
+            patch.object(controller, "DASHBOARD_LAUNCH_DIR", launch_dir),
+            patch("server.shutil.which", return_value=r"C:\tools\uv.exe"),
+            patch("server.subprocess.Popen", return_value=process) as popen,
+            patch("server.time.sleep"),
+        ):
+            response = self.client.post("/api/admin/tasks/launch", json=self.single_launch_payload())
+
+        self.assertEqual(response.status_code, 200, response.text)
+        run = response.json()["run"]
+        self.assertEqual(
+            run["command"],
+            'uv run role.py --role "C2" --timeout 1800 --request-timeout 1200 '
+            '--prompt "chỉ cần nói ok."',
+        )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                r"C:\tools\uv.exe", "run", "role.py",
+                "--role", "C2",
+                "--timeout", "1800",
+                "--request-timeout", "1200",
+                "--prompt", "chỉ cần nói ok.",
+            ],
+        )
+        self.assertNotIn("main.py", run["command"])
+        self.assertNotIn("--finish-roles", run["command"])
+        self.assertEqual(controller.state.task_store.list_tasks(), [])
+
+    def test_compact_task_launch_rejects_offline_role_without_spawning(self):
+        self.mark_role_ready("C2")
+        with patch("server.subprocess.Popen") as popen:
+            response = self.client.post("/api/admin/tasks/launch", json=self.launch_payload())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["code"], "role_offline")
+        popen.assert_not_called()
+        self.assertEqual(controller.state.task_store.list_tasks(), [])
+
+    def test_compact_task_launch_reports_process_start_failure(self):
+        self.mark_role_ready("C2")
+        self.mark_role_ready("C3")
+        launch_dir = Path(self.temp_dir.name) / "dashboard-launches"
+        with (
+            patch.object(controller, "DASHBOARD_LAUNCH_DIR", launch_dir),
+            patch("server.shutil.which", return_value=r"C:\tools\uv.exe"),
+            patch("server.subprocess.Popen", side_effect=OSError("spawn blocked")),
+        ):
+            response = self.client.post("/api/admin/tasks/launch", json=self.launch_payload())
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["code"], "launch_failed")
+        self.assertIn("spawn blocked", response.json()["detail"]["message"])
+        self.assertEqual(controller.state.dashboard_processes, {})
+        self.assertEqual(controller.state.task_store.list_tasks(), [])
 
     def test_task_crud_move_archive_and_revision_conflicts(self):
         task = self.create()

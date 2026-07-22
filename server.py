@@ -1,4 +1,5 @@
 import os
+import shutil
 import signal
 
 import subprocess
@@ -20,13 +21,15 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from apps.flow_store import DEFAULT_FLOW_PATH, FlowStore, FlowStoreMutationError
-from apps.task_scheduler import TaskScheduler
+from apps.task_scheduler import CONTROL_REPOSITORY, TaskScheduler, build_launch_argv, build_launch_command
 from apps.task_store import (
     DEFAULT_TASK_PATH,
     RESERVING_WAKE_STATES,
     TaskConflictError,
     TaskStore,
     TaskStoreMutationError,
+    bounded_text,
+    normalize_execution_options,
     normalize_role,
     task_reserves_controller,
 )
@@ -35,6 +38,7 @@ from apps.task_store import (
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8500
 DASHBOARD_PATH = Path(__file__).resolve().with_name("dashboard.html")
+DASHBOARD_LAUNCH_DIR = Path(CONTROL_REPOSITORY) / ".runtime" / "dashboard-launches"
 
 
 TERMINAL_STATES = {
@@ -77,6 +81,13 @@ TERMINAL_STATES = {
 
 
 PAGE_HANDOFF_SAFE_ACTIONS = {"PROBE", "SYNC_TRANSCRIPT", "WAIT_ASSISTANT_DONE"}
+BRIDGE_REQUIRED_ADMIN_ACTIONS = {
+    "PROBE", "DUMP_BUTTONS", "WAIT_COMPOSER_STABLE", "SET_PROMPT", "CLEAR_COMPOSER_TEXT",
+    "UPLOAD_FILE", "UPLOAD_FILES", "PASTE_IMAGE", "PASTE_FILES", "FIND_SEND", "CLICK_SEND",
+    "WAIT_ASSISTANT_DONE", "SYNC_TRANSCRIPT", "CLICK_CHOICE_PROMPT", "SET_ROLE", "TAKEOVER_ROLE",
+    "PHYSICAL_TAKEOVER_ROLE", "OPEN_ROLE_WINDOW", "WAKE_ROLE", "PHYSICAL_OPEN_ROLE", "NEW_CHAT",
+    "NAVIGATE_NEW", "RESET_PAGE", "RELOAD_PAGE", "RELOAD", "HARD_RELOAD", "CLOSE_WINDOW", "CLOSE_TAB",
+}
 COMMAND_CANCEL_STATES = {"CANCELLED", "EXPIRED"}
 NON_TERMINAL_FLOW_STATES = {"RUNNING", "WAITING"}
 SEMANTIC_ROLE_EVENTS = {
@@ -194,6 +205,16 @@ class TaskCreateRequest(BaseModel):
     execution_options: Dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskLaunchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    controller_role: str
+    prompt: str
+    logical_roles: list[str]
+    physical_role_map: Dict[str, str]
+    finish_roles: list[str]
+    execution_options: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TaskPatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int
@@ -220,6 +241,7 @@ class DiagnosticState:
         self.commands = {}
         self.command_results = {}
         self.command_status = {}
+        self.dashboard_processes = {}
         self.status = defaultdict(lambda: "OFFLINE")
         self.sessions = defaultdict(set)
         self.current_sessions = defaultdict(str)
@@ -277,6 +299,7 @@ class DiagnosticState:
             "runner_heartbeat_interval_s": 5,
             "runner_stale_after_s": 20,
             "command_stale_after_s": 120,
+            "dashboard_role_retention_s": 900,
         }
         self.runner_heartbeats: Dict[str, Dict[str, Any]] = {}
 
@@ -415,39 +438,53 @@ class DiagnosticState:
         }
 
     def role_inventory(self) -> list[Dict[str, Any]]:
-        """Return roles that are live or still own active operational work.
+        """Return live roles, offline operational owners, and bounded recent evidence.
 
-        Historical status, DOM, transcript, and owner caches remain available from
-        the explicit per-role diagnostic endpoint, but must not keep deleted or
-        long-offline roles in the dashboard's live inventory forever.
+        Recent last-known browser evidence remains visible for the configured dashboard
+        retention window. Long-expired historical caches are omitted unless the role
+        still owns a nonterminal flow, active command, or controller-reserving task.
         """
         with self.lock:
             tasks = self.task_store.list_tasks(include_archived=True)
-            roles: set[str] = set()
+            role_reasons: Dict[str, set[str]] = defaultdict(set)
+            retention_s = max(10.0, float(self.config.get("dashboard_role_retention_s", 900) or 900))
+
+            def retain(role: str, reason: str) -> None:
+                role_reasons[normalize_role(role)].add(reason)
 
             for role in self.role_seen_at:
                 normalized = normalize_role(role)
-                online, _ = self.role_is_online(normalized)
+                online, age = self.role_is_online(normalized)
                 if online:
-                    roles.add(normalized)
+                    retain(normalized, "online")
+                    continue
+                has_cached_evidence = bool(
+                    self.current_sessions.get(normalized)
+                    or (self.dom_info.get(normalized) or {}).get("page_path")
+                    or (self.dom_info.get(normalized) or {}).get("pathname")
+                    or self.observation_pages.get(normalized)
+                )
+                if age is not None and age <= retention_s and has_cached_evidence:
+                    retain(normalized, "recent_cached_evidence")
 
             for role in self.commands:
                 normalized = normalize_role(role)
                 if self.active_command(normalized):
-                    roles.add(normalized)
+                    retain(normalized, "active_command")
 
             for role, flow in self.flow_statuses.items():
                 if str((flow or {}).get("state") or "").upper() in NON_TERMINAL_FLOW_STATES:
-                    roles.add(normalize_role(role))
+                    retain(role, "active_flow")
 
             for task in tasks:
                 if task.get("archived_at") or not task_reserves_controller(task):
                     continue
-                roles.add(normalize_role(task["controller_role"]))
-                roles.update(normalize_role(role) for role in task["physical_role_map"].values())
+                retain(task["controller_role"], "reserved_task")
+                for role in task["physical_role_map"].values():
+                    retain(role, "reserved_task")
 
             result = []
-            for role in sorted(roles):
+            for role in sorted(role_reasons):
                 normalized = normalize_role(role)
                 online, age = self.role_is_online(normalized)
                 dom = dict(self.dom_info.get(normalized) or {})
@@ -466,12 +503,17 @@ class DiagnosticState:
                     None,
                 )
                 responses = self.response_projection(normalized)
+                retention_reasons = sorted(role_reasons[normalized])
+                operational = any(reason in {"active_command", "active_flow", "reserved_task"} for reason in retention_reasons)
+                presence_status = "ONLINE" if online else "OFFLINE" if operational else "STALE"
                 result.append({
                     "role": normalized,
                     "configured_role": self.configured_role_for(normalized),
                     "turn": len(responses),
                     "online": online,
-                    "status": "ONLINE" if online else "OFFLINE",
+                    "status": presence_status,
+                    "evidence_cached": not online,
+                    "retention_reasons": retention_reasons,
                     "last_seen_age_s": age,
                     "current_logical_role": flow.get("logical_role") or None,
                     "current_flow_state": flow.get("state") or None,
@@ -946,6 +988,8 @@ class DiagnosticState:
         action: str,
         payload: Optional[dict] = None,
         command_id: str = "",
+        *,
+        require_online: bool = False,
     ):
         command_id = str(command_id or uuid.uuid4()).strip()
         if not command_id or len(command_id) > 160:
@@ -962,6 +1006,13 @@ class DiagnosticState:
             "owner_session_id": "",
         }
         with self.lock:
+            if require_online:
+                online, age = self.role_is_online(role)
+                if not online:
+                    age_text = "never seen" if age is None else f"last seen {age:.1f}s ago"
+                    raise RuntimeError(
+                        f"role {normalize_role(role)} bridge is offline ({age_text}); {str(action).upper()} was not queued"
+                    )
             if (
                 command_id in self.command_status
                 or command_id in self.command_results
@@ -1354,8 +1405,16 @@ def api_sync(req: SyncRequest):
 
 @app.post("/api/admin/command")
 def api_admin_command(req: AdminCommandRequest):
+    role = normalize_role(req.role)
+    action = str(req.action or "").strip()
+    normalized_action = action.upper()
     try:
-        cmd = state.create_command(req.role, req.action, req.payload)
+        cmd = state.create_command(
+            role,
+            action,
+            req.payload,
+            require_online=normalized_action in BRIDGE_REQUIRED_ADMIN_ACTIONS,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"command": cmd}
@@ -1435,6 +1494,129 @@ def _task_mutation_response(task: Dict[str, Any]):
     return {"task": task, "store_revision": state.task_store.document["revision"]}
 
 
+def _normalized_dashboard_launch(req: TaskLaunchRequest) -> Dict[str, Any]:
+    prompt = bounded_text(req.prompt, field="prompt", limit=200000, allow_empty=False)
+    controller_role = normalize_role(req.controller_role, field="controller_role")
+    logical_roles = [normalize_role(role, field="logical_roles") for role in req.logical_roles]
+    if not logical_roles:
+        raise ValueError("logical_roles must be a non-empty array")
+    if len(set(logical_roles)) != len(logical_roles):
+        raise ValueError("logical_roles must be unique")
+    physical_role_map = {
+        normalize_role(logical, field="physical_role_map key"): normalize_role(physical, field="physical_role_map value")
+        for logical, physical in req.physical_role_map.items()
+    }
+    if set(physical_role_map) != set(logical_roles):
+        raise ValueError("physical_role_map keys must exactly match logical_roles")
+    if physical_role_map[logical_roles[0]] != controller_role:
+        raise ValueError("controller_role must match the first logical role mapping")
+    finish_roles = [normalize_role(role, field="finish_roles") for role in req.finish_roles]
+    if not finish_roles:
+        raise ValueError("finish_roles must be a non-empty array")
+    if len(set(finish_roles)) != len(finish_roles):
+        raise ValueError("finish_roles must be unique")
+    if not set(finish_roles).issubset(logical_roles):
+        raise ValueError("finish_roles must be a subset of logical_roles")
+    return {
+        "controller_role": controller_role,
+        "prompt": prompt,
+        "logical_roles": logical_roles,
+        "physical_role_map": {role: physical_role_map[role] for role in logical_roles},
+        "finish_roles": finish_roles,
+        "execution_options": normalize_execution_options(req.execution_options),
+    }
+
+
+def _dashboard_launch_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_INTERNAL__PYTHONHOME", "UV_RUN_RECURSION_DEPTH"):
+        env.pop(name, None)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def _start_dashboard_process(task: Dict[str, Any]) -> Dict[str, Any]:
+    physical_roles = list(dict.fromkeys(task["physical_role_map"][role] for role in task["logical_roles"]))
+    unavailable = {}
+    for role in physical_roles:
+        reason = TaskScheduler._readiness_error(state.controller_readiness(role))
+        if reason:
+            unavailable[role] = reason
+    offline = sorted(role for role, reason in unavailable.items() if reason == "controller_offline")
+    if offline:
+        raise TaskConflictError("role_offline", f"offline physical roles: {', '.join(offline)}")
+    if unavailable:
+        detail = ", ".join(f"{role}:{reason}" for role, reason in sorted(unavailable.items()))
+        raise TaskConflictError("role_not_ready", detail)
+
+    env = _dashboard_launch_env()
+    uv_executable = shutil.which("uv", path=env.get("PATH"))
+    if not uv_executable:
+        raise OSError("uv executable is unavailable")
+    run_id = f"dashboard-{uuid.uuid4().hex}"
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    command = build_launch_command(task)
+    argv = build_launch_argv(task, uv_executable)
+    DASHBOARD_LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+    stdout_path = DASHBOARD_LAUNCH_DIR / f"{run_id}.out.log"
+    stderr_path = DASHBOARD_LAUNCH_DIR / f"{run_id}.err.log"
+
+    with state.lock:
+        for existing_id, record in list(state.dashboard_processes.items()):
+            if record["process"].poll() is not None:
+                state.dashboard_processes.pop(existing_id, None)
+        requested = set(physical_roles)
+        for record in state.dashboard_processes.values():
+            if requested.intersection(record["physical_roles"]):
+                raise TaskConflictError("controller_busy", "a dashboard-launched main.py process already owns one of these roles")
+
+        stdout_handle = stdout_path.open("ab", buffering=0)
+        stderr_handle = stderr_path.open("ab", buffering=0)
+        try:
+            popen_args = {
+                "cwd": CONTROL_REPOSITORY,
+                "env": env,
+                "stdin": subprocess.DEVNULL,
+                "stdout": stdout_handle,
+                "stderr": stderr_handle,
+                "shell": False,
+                "close_fds": True,
+            }
+            if os.name == "nt":
+                popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            else:
+                popen_args["start_new_session"] = True
+            process = subprocess.Popen(argv, **popen_args)
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
+
+        state.dashboard_processes[run_id] = {
+            "process": process,
+            "physical_roles": set(physical_roles),
+            "started_at": started_at,
+        }
+
+    time.sleep(0.15)
+    return_code = process.poll()
+    if return_code is not None:
+        with state.lock:
+            state.dashboard_processes.pop(run_id, None)
+        tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-800:].strip() if stderr_path.exists() else ""
+        raise RuntimeError(f"main.py exited immediately with code {return_code}: {tail or 'no stderr'}")
+
+    return {
+        "run_id": run_id,
+        "pid": process.pid,
+        "started_at": started_at,
+        "command": command,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "physical_roles": physical_roles,
+    }
+
+
 @app.get("/api/admin/tasks")
 def api_admin_tasks(include_archived: bool = False):
     payload = state.task_store.read(include_archived=include_archived)
@@ -1460,6 +1642,21 @@ def api_admin_task_create(body: Any = Body(...)):
         return _task_mutation_response(task)
     except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
         _task_error(exc)
+
+
+@app.post("/api/admin/tasks/launch")
+def api_admin_task_launch(body: Any = Body(...)):
+    req = _validated_task_body(TaskLaunchRequest, body)
+    try:
+        task = _normalized_dashboard_launch(req)
+        return {"status": "STARTED", "run": _start_dashboard_process(task)}
+    except (KeyError, TaskConflictError, TaskStoreMutationError, ValueError) as exc:
+        _task_error(exc)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "launch_failed", "message": str(exc)},
+        ) from exc
 
 
 @app.patch("/api/admin/tasks/{task_id}")
@@ -1565,6 +1762,7 @@ def api_route_catalog(base_url: str = ""):
         item("tasks", "GET", "/api/admin/tasks", "Read durable Kanban tasks and scheduler health."),
         item("tasks", "GET", "/api/admin/tasks/{task_id}", "Read one durable task.", "/api/admin/tasks/task-demo"),
         item("tasks", "POST", "/api/admin/tasks", "Create a validated dashboard task."),
+        item("tasks", "POST", "/api/admin/tasks/launch", "Launch the generated role.py or main.py command for a clean set of online browser roles."),
         item("tasks", "PATCH", "/api/admin/tasks/{task_id}", "Optimistically update task metadata/result or resolve a wake."),
         item("tasks", "POST", "/api/admin/tasks/{task_id}/move", "Optimistically move or claim a Kanban task."),
         item("tasks", "POST", "/api/admin/tasks/{task_id}/wake", "Reserve one manual wake occurrence."),
@@ -1578,7 +1776,7 @@ def api_route_catalog(base_url: str = ""):
         item("admin", "GET", "/api/admin/config", "Read runtime config."),
         item("admin", "POST", "/api/admin/config", "Update runtime config."),
         item("admin", "GET", "/api/admin/routes", "List available server endpoints."),
-        item("presentation", "GET", "/dashboard", "Polling Kanban task control plane with live flow and role status."),
+        item("presentation", "GET", "/dashboard", "Polling physical-role board with live flow, current-task evidence, and command preview."),
     ]
 
 
@@ -1602,7 +1800,7 @@ def api_admin_command_result(command_id: str):
 
 
 @app.get("/api/admin/role/{role}")
-def api_admin_role(role: str):
+def api_admin_role(role: str, response_limit: int = 100):
     normalized_role = str(role or "").strip().upper()
     with state.lock:
         seen_at = float(state.role_seen_at.get(normalized_role, 0.0) or 0.0)
@@ -1614,7 +1812,9 @@ def api_admin_role(role: str):
         dom_info = state.dom_info.get(normalized_role, {})
         last_user = state.last_user_message.get(normalized_role, "")
         last_response = state.last_response.get(normalized_role, "")
-        responses = state.response_projection(normalized_role)
+        all_responses = state.response_projection(normalized_role)
+        bounded_response_limit = max(1, min(int(response_limit), 500))
+        responses = all_responses[-bounded_response_limit:]
         flow_status = dict(state.flow_statuses.get(normalized_role) or {})
         tasks = state.task_store.list_tasks(include_archived=False)
         current_task = next(
@@ -1658,7 +1858,7 @@ def api_admin_role(role: str):
             "role": normalized_role,
             "configured_role": state.configured_role_for(normalized_role),
             "current_logical_role": flow_status.get("logical_role") or None,
-            "turn": len(responses),
+            "turn": len(all_responses),
             "responses": responses,
             "message_counts": state.dom_summary(dom_info).get("message_counts") or {},
             "current_task_id": current_task.get("task_id") if current_task else None,

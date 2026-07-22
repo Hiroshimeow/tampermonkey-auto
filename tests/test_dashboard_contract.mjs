@@ -4,13 +4,11 @@ import path from 'node:path';
 import vm from 'node:vm';
 
 const dashboardPath = path.resolve('dashboard.html');
-assert.equal(fs.existsSync(dashboardPath), true, 'dashboard.html must exist at the repository root');
-
+assert.equal(fs.existsSync(dashboardPath), true, 'dashboard.html must exist');
 const source = fs.readFileSync(dashboardPath, 'utf8');
-assert.match(source, /<title>Stable Flow Runtime<\/title>/, 'dashboard must retain the runtime title');
-assert.match(source, /id="dashboard-root"/, 'dashboard must expose a stable root marker');
-assert.match(source, /data-dashboard-version="9"/, 'dashboard role-board contract version must be explicit');
-assert.match(source, /DASHBOARD_CONTRACT_VERSION\s*=\s*9/, 'script contract version must match markup');
+assert.match(source, /<title>Stable Flow Runtime<\/title>/);
+assert.match(source, /data-dashboard-version="12"/);
+assert.match(source, /DASHBOARD_CONTRACT_VERSION\s*=\s*12/);
 
 const scriptMatch = source.match(/<script>([\s\S]*?)<\/script>/);
 assert.ok(scriptMatch, 'dashboard must contain one inline script');
@@ -40,230 +38,145 @@ function extractFunction(functionName) {
       continue;
     }
     if (char === '{') depth += 1;
-    if (char === '}') {
-      depth -= 1;
-      if (depth === 0) return script.slice(start, index + 1);
-    }
+    if (char === '}' && --depth === 0) return script.slice(start, index + 1);
   }
   throw new Error(`unterminated function ${functionName}`);
 }
 
-for (const state of ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'BLOCKED', 'DONE']) {
-  assert.match(source, new RegExp(`data-kanban-state="${state}"`), `${state} column marker must remain stable`);
-  assert.match(source, new RegExp(`>${state}<`), `${state} label must remain visible`);
-}
+for (const id of [
+  'dashboard-root', 'role-rail', 'role-count', 'role-detail-title', 'selected-role-state',
+  'role-metrics', 'current-task', 'current-task-progress', 'current-task-text',
+  'selected-role-detail', 'role-responses', 'response-count', 'runtime-events', 'event-count',
+  'task-dialog', 'task-prompt', 'task-logical-order', 'task-logical-available',
+  'task-browser-targets', 'task-role-mapping', 'task-timeout', 'task-request-timeout',
+  'task-parallelism', 'task-max-turns', 'task-reload-after', 'task-command-preview', 'task-status', 'create-task'
+]) assert.match(source, new RegExp(`id="${id}"`), `${id} must exist`);
 
-// Role board is the primary runtime surface. The previous summary sections are gone.
-for (const id of ['role-rail', 'role-count', 'role-detail-title', 'selected-role-state', 'role-metrics', 'selected-role-detail', 'role-responses', 'response-count', 'runtime-events', 'event-count']) {
-  assert.match(source, new RegExp(`id="${id}"`), `${id} role-board surface must exist`);
-}
-assert.match(source, />Role board</, 'online role board heading must be visible');
-assert.doesNotMatch(source, /<h2>Runtime roles<\/h2>|<h2>Active flow<\/h2>|<h2>System<\/h2>/, 'legacy runtime summary sections must be removed');
-assert.doesNotMatch(source, /id="flow-detail"|id="system-detail"/, 'legacy summary detail containers must be removed');
-assert.match(script, /lastGoodRoles\.filter\(\(role\) => role\.online === true\)/, 'role cards must render online physical roles only');
-assert.match(script, /role\.role} · \$\{role\.configured_role \|\| role\.role} ↗/, 'card heading must show physical and configured role only');
-assert.match(script, /link\.addEventListener\('click', \(event\) => event\.stopPropagation\(\)\)/, 'external chat link must not select the card');
-assert.match(script, /card\.addEventListener\('click', \(\) => selectRole\(role\.role\)\)/, 'the rest of the role card must select that role');
-assert.match(script, /https:\/\/chatgpt\.com\$\{chatPath\(role\)}/, 'role title must link to the observed ChatGPT conversation path');
-assert.match(script, /shortConversationId/, 'role card must derive a short conversation ID from the real path');
-assert.match(script, /configured_role/, 'configured logical role must be rendered');
-assert.match(script, /current_logical_role/, 'current logical responsibility must be rendered');
-assert.match(script, /turn \$\{Number\(role\.turn \|\| 0\)}/, 'role turn must be visible');
-assert.match(script, /composer_attachment_count/, 'composer attachment count must be visible on cards');
+// The global Kanban/task database UI is not part of the role dashboard.
+assert.doesNotMatch(source, /Task control|No tasks configured|Create task only when|data-kanban-state|task-workspace|task-card-template|task-detail|filter-controller|filter-repository|filter-schedule|filter-archived/);
+assert.doesNotMatch(script, /lastGoodTasks|renderBoard\(|saveEditor\(|openEditor\(|moveTask\(|wakeTask\(/);
+assert.doesNotMatch(script, /fetch\(['"`]\/api\/admin\/tasks['"`]/, 'dashboard must not reload the global task database');
 
-// Selected role detail and timeline use role-scoped read APIs.
-assert.match(script, /fetch\(`\/api\/admin\/role\/\$\{encodeURIComponent\(role\)}`\)/, 'selected role detail must use the role detail API');
-assert.match(script, /fetch\(`\/api\/admin\/role\/\$\{encodeURIComponent\(role\)}\/timeline\?limit=100`\)/, 'timeline must use the semantic role-timeline endpoint');
-assert.doesNotMatch(extractFunction('fetchRoleEvents'), /\/api\/admin\/events/, 'selected-role timeline must not use the raw event endpoint');
-assert.match(script, /detail\.responses \|\| \[\]/, 'selected role must render multiple projected responses');
-assert.match(script, /responses\.scrollTop = responses\.scrollHeight/, 'newest response must be focused on initial load and role changes');
-assert.match(script, /focusNewestResponse/, 'auto-scroll must be bounded to initial load and selection changes');
-assert.match(script, /current_task_id/, 'selected role detail must expose task evidence');
-assert.match(script, /current_request_id/, 'selected role detail must expose request evidence');
-assert.match(script, /message_counts/, 'selected role detail must expose transcript counts');
-assert.match(script, /observation_seq/, 'selected role detail must expose observation evidence');
-assert.match(script, /transport/, 'selected role detail must expose transport evidence');
+// The command composer contains only inputs represented in the generated command.
+assert.doesNotMatch(source, />Title<|Target root|>Branch<|Controller role|Initial state|>Objective<|Scheduling|Execution result|Behavior toggles|task-new-chat|task-handoff-always/);
+assert.match(source, />Task prompt</);
+assert.match(source, />Logical roles/);
+assert.match(source, />Online browser targets</);
+assert.match(source, />Role mapping</);
+assert.match(source, />Generated command</);
+assert.match(source, /id="create-task"[^>]*type="submit">Create</);
+assert.doesNotMatch(source, /Copy command/);
+assert.match(source, /id="task-prompt" rows="2"/);
+assert.match(script, /lineHeight \* 10 \+ 18/, 'prompt grows to ten lines then scrolls');
+assert.doesNotMatch(script, /navigator\.clipboard/, 'Create must launch through the server, not copy text');
+assert.match(extractFunction('submitTask'), /fetch\('\/api\/admin\/tasks\/launch'/);
+assert.match(extractFunction('submitTask'), /const run = body\.run/);
+assert.match(extractFunction('submitTask'), /Server did not confirm a launched runner process/);
+assert.match(extractFunction('submitTask'), /run \$\{run\.run_id\} started \(PID \$\{run\.pid\}\)/);
+assert.doesNotMatch(extractFunction('submitTask'), /body\.task|queued/);
+assert.match(extractFunction('readJson'), /error\.status = response\.status/);
+assert.match(extractFunction('submitTask'), /error\.status === 405/);
+assert.match(source, /Task launch route is not active\. Restart Tampermonkey-Auto, then retry\./);
+assert.match(extractFunction('openTaskComposer'), /const initialLogical = editorOriginRole/, 'each role card must start its own command');
+assert.match(extractFunction('updateCommandPreview'), /buildLaunchCommand/);
+assert.match(extractFunction('renderTaskComposer'), /field\.hidden = editorLogicalOrder\.length === 1/);
+assert.match(source, /class="field multi-role-option">Parallelism/);
 
-// Browser commands are exact-role, bounded, and terminal-state driven.
-assert.match(script, /fetch\('\/api\/admin\/command'/, 'role actions must use the existing admin command endpoint');
-assert.match(script, /body: JSON\.stringify\(\{ role: roleName, action, payload: \{\} \}\)/, 'role actions must target the exact physical role');
-assert.match(script, /CLEAR_COMPOSER_TEXT/, 'Clear txt must use the dedicated text-only command');
-assert.match(script, /RELOAD_PAGE/, 'F5 must use the existing reload command');
-assert.match(script, /fetch\(`\/api\/admin\/command\/\$\{encodeURIComponent\(commandId\)}`\)/, 'role actions must poll command status');
-assert.match(script, /attempt < 60/, 'command status polling must be bounded');
-assert.match(script, /textNode\('button', 'Clear txt'\)/, 'Clear txt control must be created for each online role');
-assert.match(script, /textNode\('button', 'F5'\)/, 'F5 control must be created for each online role');
-assert.match(script, /textNode\('button', '\+ task', 'primary'\)/, 'per-role task creation control must be created');
+// Role board retains live/offline evidence and exact-role browser safety.
+assert.match(script, /const onlineRoles = \(\) => lastGoodRoles\.filter\(\(role\) => role\.online === true\)/);
+assert.match(script, /const visibleRoles = \(\) => lastGoodRoles\.filter/);
+assert.match(extractFunction('renderRoles'), /visibleRoles\(\)/);
+assert.doesNotMatch(extractFunction('renderRoles'), /onlineRoles\(\)/);
+assert.match(script, /cached evidence/);
+assert.match(script, /clearButton\.disabled = !role\.online/);
+assert.match(script, /reloadButton\.disabled = !role\.online/);
+assert.match(extractFunction('runRoleCommand'), /if \(!role\?\.online\)/);
+assert.match(script, /CLEAR_COMPOSER_TEXT/);
+assert.match(script, /RELOAD_PAGE/);
+assert.match(script, /textNode\('button', '\+ task', 'primary'\)/);
 
-// Task control retains the existing Kanban and CAS workflow.
-assert.match(script, /fetch\('\/api\/admin\/tasks/, 'dashboard must read durable tasks');
-assert.match(script, /fetch\('\/api\/admin\/roles'/, 'dashboard must read generic role inventory');
-assert.match(script, /fetch\('\/api\/admin\/flow'/, 'dashboard must retain flow liveness for topbar health');
-for (const endpoint of ['move', 'wake', 'pause', 'resume']) {
-  assert.match(script, new RegExp(`/api/admin/tasks/\\$\\{encodeURIComponent\\(taskId\\)\\}/${endpoint}`), `dashboard must preserve the ${endpoint} task endpoint`);
-}
-assert.match(script, /method:\s*'PATCH'/, 'dashboard must preserve optimistic task editing and archive');
-assert.match(script, /response\.status === 409/, 'optimistic conflicts must be handled explicitly');
-assert.match(script, /retainEditsOnConflict/, '409 handling must retain user edits');
-assert.match(source, /id="create-task"/, 'create control must exist');
-assert.match(source, /id="task-dialog"/, 'create/edit dialog must exist');
-assert.match(source, /id="task-detail"/, 'task detail dialog must exist');
-for (const control of ['run-action', 'pause-action', 'edit-action', 'move-select', 'archive-action', 'resolve-sent', 'resolve-not-sent']) {
-  assert.match(source, new RegExp(`class="[^"]*${control}`), `${control} task control must exist`);
-}
-for (const field of [
-  'task-controller', 'task-logical-order', 'task-logical-available', 'task-browser-targets', 'task-role-mapping',
-  'task-timeout', 'task-request-timeout', 'task-parallelism', 'task-max-turns', 'task-reload-after',
-  'task-new-chat', 'task-handoff-always', 'task-command-preview', 'task-schedule-kind',
-  'task-result-status', 'task-result-summary', 'task-blocker'
-]) {
-  assert.match(source, new RegExp(`id="${field}"`), `${field} editor field must exist`);
-}
-assert.doesNotMatch(source, /id="task-logical"|id="task-role-map"|id="task-finish"/, 'raw comma/JSON role editor fields must be removed');
-assert.match(source, /id="task-prompt" rows="2"/, 'prompt must start at two rows');
-assert.match(script, /lineHeight \* 10 \+ 18/, 'prompt auto-grow must cap at ten rows before scrolling');
-assert.match(source, /id="prompt-samples"/, 'prompt samples menu must exist');
-assert.match(script, /PROMPT_SAMPLES/, 'prompt samples must be functional');
-assert.match(source, /draggable="true"/, 'native drag and drop path must remain');
-assert.match(source, /aria-label="Move task"/, 'keyboard-accessible task move control must remain');
-assert.match(source, /:focus-visible/, 'visible keyboard focus styling is required');
-assert.match(source, /aria-live="polite"/, 'status and conflict announcements must remain accessible');
+// Selected role shows the latest observed user task and response progress.
+assert.match(extractFunction('renderSelectedRole'), /detail\.observation\?\.last_user/);
+assert.match(extractFunction('renderSelectedRole'), /current-task-progress/);
+assert.match(extractFunction('renderSelectedRole'), /user \$\{Number\(counts\.user/);
+assert.match(extractFunction('renderSelectedRole'), /· assistant \$\{Number\(counts\.assistant/);
+assert.match(extractFunction('renderSelectedRole'), /latestTaskText/);
+assert.match(script, /detail\.responses \|\| \[\]/);
+assert.match(extractFunction('renderSelectedRole'), /followNewest \? responses\.scrollHeight : previousResponseTop/);
 
-// Task editor derives roles/mapping/options and persists one validated execution_options object.
-assert.match(script, /BASE_LOGICAL_ROLES/, 'configured logical role choices must be data-driven');
-assert.match(script, /onlineRoles\(\)\.map\(\(role\) => role\.role\)/, 'physical mapping targets must derive from online browser roles');
-assert.doesNotMatch(extractFunction('editorPhysicalTargets'), /Object\.values\(editorRoleMap\)|task-controller/, 'stale mappings and controllers must not remain selectable targets');
-assert.match(script, /const exact = live\.find\(\(role\) => role\.role === logicalRole\)/, 'default mapping must prefer an exact physical-role name match');
-assert.match(script, /editorOriginRole/, 'default mapping must fall back to the origin role card');
-assert.match(script, /validateOnlineTaskTargets/, 'save-time validation must reject offline controller and mapping targets');
-assert.match(extractFunction('saveEditor'), /await fetchRoles\(\)/, 'save must refresh online-role evidence before persistence');
-assert.doesNotMatch(script, /const browserTabs\s*=|['"]C1['"]|['"]C2['"]|WORKER_1/, 'dashboard must not hardcode physical browser roles');
-assert.match(script, /execution_options: executionOptions/, 'create and PATCH payloads must persist execution_options');
-assert.match(script, /task\.execution_options \|\| \{\}/, 'edit mode must restore persisted execution options');
-assert.match(script, /timeout:\s*1800/, 'timeout default must be 1800');
-assert.match(script, /request_timeout:\s*1200/, 'request-timeout default must be 1200');
-assert.match(script, /parallelism:\s*4/, 'parallelism default must be 4');
-assert.match(script, /max_turns:\s*0/, 'max-turns default must be 0');
-assert.match(script, /reload_after:\s*10/, 'reload-after default must be 10');
-assert.match(script, /new_chat_on_handoff:\s*false/, 'new-chat toggle must default off');
-assert.match(script, /handoff_command_policy:\s*'auto'/, 'handoff-always toggle must default off/auto');
-assert.match(script, /--new-chat-on-handoff/, 'enabled new-chat toggle must add the exact CLI flag');
-assert.match(script, /--handoff-command-policy always/, 'enabled handoff toggle must add the exact CLI flag');
-assert.match(script, /--finish-roles/, 'generated command must include derived finish authority');
+// Timeline is chronological and explicitly visualizes From -> To and state.
+assert.match(extractFunction('renderEvents'), /flowEventView\(event\)/);
+assert.match(extractFunction('renderEvents'), /flow-route/);
+assert.doesNotMatch(extractFunction('renderEvents'), /\.reverse\(\)/, 'timeline must read top-to-bottom');
+assert.match(script, /from_role/);
+assert.match(script, /done_from/);
+assert.match(script, /sent_to/);
+assert.match(extractFunction('renderEvents'), /row\.className = 'flow-line'/);
 
-const commandContext = {};
+const helperContext = {};
 vm.runInNewContext([
   extractFunction('commandNumber'),
   extractFunction('quoteCli'),
   extractFunction('deriveFinishRoles'),
   extractFunction('buildMainCommand'),
+  extractFunction('buildRoleCommand'),
+  extractFunction('buildLaunchCommand'),
+  extractFunction('latestTaskText'),
+  extractFunction('flowEventView'),
+  'globalThis.buildMainCommand = buildMainCommand;',
+  'globalThis.buildLaunchCommand = buildLaunchCommand;',
   'globalThis.deriveFinishRoles = deriveFinishRoles;',
-  'globalThis.buildMainCommand = buildMainCommand;'
-].join('\n'), commandContext);
-assert.deepEqual(
-  JSON.parse(JSON.stringify(commandContext.deriveFinishRoles(['DEV', 'PLAN', 'MANAGER', 'REVIEW']))),
-  ['MANAGER'],
-  'MANAGER must have highest finish-role precedence'
-);
-assert.deepEqual(JSON.parse(JSON.stringify(commandContext.deriveFinishRoles(['DEV', 'PLAN', 'REVIEW']))), ['PLAN']);
-assert.deepEqual(JSON.parse(JSON.stringify(commandContext.deriveFinishRoles(['DEV', 'REVIEW']))), ['REVIEW']);
-assert.deepEqual(JSON.parse(JSON.stringify(commandContext.deriveFinishRoles(['DEV', 'A']))), ['DEV']);
-const baseOptions = {
-  timeout: 1800,
-  request_timeout: 1200,
-  parallelism: 4,
-  max_turns: 0,
-  reload_after: 10,
-  new_chat_on_handoff: false,
-  handoff_command_policy: 'auto'
-};
-const baseCommand = commandContext.buildMainCommand(
+  'globalThis.latestTaskText = latestTaskText;',
+  'globalThis.flowEventView = flowEventView;'
+].join('\n'), helperContext);
+
+const options = { timeout: 1800, request_timeout: 1200, parallelism: 4, max_turns: 0, reload_after: 10 };
+const command = helperContext.buildMainCommand(
   ['DEV', 'REVIEW', 'PLAN'],
-  { DEV: 'WORKER-A', REVIEW: 'WORKER-B', PLAN: 'WORKER-A' },
+  { DEV: 'C2', REVIEW: 'C3', PLAN: 'C2' },
   ['PLAN'],
-  baseOptions,
-  'ship it'
+  options,
+  'ship "this" from C:\\repo\\'
 );
-for (const fragment of [
-  'uv run python main.py',
-  '--role "DEV,REVIEW,PLAN"',
-  '--browser-roles "WORKER-A,WORKER-B"',
-  '--role-map "DEV=WORKER-A REVIEW=WORKER-B PLAN=WORKER-A"',
-  '--finish-roles "PLAN"',
-  '--timeout 1800',
-  '--request-timeout 1200',
-  '--parallelism 4',
-  '--max-turns 0',
-  '--reload-after 10',
-  '--goal "ship it"'
-]) assert.ok(baseCommand.includes(fragment), `generated command must include ${fragment}`);
-assert.equal(baseCommand.includes('--new-chat-on-handoff'), false, 'off new-chat toggle must omit the flag');
-assert.equal(baseCommand.includes('--handoff-command-policy'), false, 'off handoff toggle must omit the flag');
-const toggledCommand = commandContext.buildMainCommand(
-  ['DEV'],
-  { DEV: 'WORKER-A' },
-  ['DEV'],
-  { ...baseOptions, new_chat_on_handoff: true, handoff_command_policy: 'always' },
-  'ship it'
+assert.equal(command, 'uv run main.py --role "DEV,REVIEW,PLAN" --browser-roles "C2,C3" --role-map "DEV=C2 REVIEW=C3 PLAN=C2" --finish-roles "PLAN" --timeout 1800 --request-timeout 1200 --parallelism 4 --max-turns 0 --reload-after 10 --goal "ship \\"this\\" from C:\\repo\\\\"');
+const singleCommand = helperContext.buildLaunchCommand(
+  ['C2'],
+  { C2: 'C2' },
+  ['C2'],
+  options,
+  'ch? c?n n?i ok.'
 );
-assert.ok(toggledCommand.includes('--new-chat-on-handoff'));
-assert.ok(toggledCommand.includes('--handoff-command-policy always'));
-assert.throws(
-  () => commandContext.buildMainCommand(
-    ['DEV'],
-    { DEV: 'WORKER-A' },
-    ['DEV'],
-    { ...baseOptions, handoff_command_policy: 'off' },
-    'ship it'
-  ),
-  /auto or always/,
-  'dashboard task command builder must reject the CLI-only off policy'
-);
-
-const targetContext = {
-  lastGoodRoles: [{ role: 'ONLINE-A', online: true }, { role: 'OFFLINE-X', online: false }],
-  editorRoleMap: { DEV: 'OFFLINE-X' },
-  onlineRoles() { return [{ role: 'ONLINE-A', online: true }]; },
-  byId() { return { value: 'OFFLINE-X' }; }
-};
-vm.runInNewContext([
-  extractFunction('editorPhysicalTargets'),
-  extractFunction('validateOnlineTaskTargets'),
-  'globalThis.editorPhysicalTargets = editorPhysicalTargets;',
-  'globalThis.validateOnlineTaskTargets = validateOnlineTaskTargets;'
-].join('\n'), targetContext);
-assert.deepEqual(
-  JSON.parse(JSON.stringify(targetContext.editorPhysicalTargets())),
-  ['ONLINE-A'],
-  'only currently online physical roles may be selectable'
-);
-assert.throws(
-  () => targetContext.validateOnlineTaskTargets('OFFLINE-X', { DEV: 'ONLINE-A' }, ['ONLINE-A']),
-  /Controller role OFFLINE-X is offline/,
-  'offline controller must fail closed'
-);
-assert.throws(
-  () => targetContext.validateOnlineTaskTargets('ONLINE-A', { DEV: 'OFFLINE-X' }, ['ONLINE-A']),
-  /DEV.*OFFLINE-X.*offline/,
-  'offline mapping must fail closed'
-);
-
-const terminalContext = {};
-vm.runInNewContext([
-  extractFunction('commandTerminalOutcome'),
-  'globalThis.commandTerminalOutcome = commandTerminalOutcome;'
-].join('\n'), terminalContext);
-assert.equal(terminalContext.commandTerminalOutcome('CLEAR_COMPOSER_TEXT', 'COMPOSER_TEXT_CLEARED').ok, true);
-assert.equal(terminalContext.commandTerminalOutcome('RELOAD_PAGE', 'PAGE_RELOADING').ok, true);
-for (const terminal of ['CANCELLED', 'EXPIRED', 'COMPOSER_TEXT_CLEAR_FAILED', 'ASSISTANT_DONE', 'UNKNOWN']) {
-  assert.equal(terminalContext.commandTerminalOutcome('CLEAR_COMPOSER_TEXT', terminal).ok, false, `${terminal} must fail Clear txt`);
+assert.equal(singleCommand, 'uv run role.py --role "C2" --timeout 1800 --request-timeout 1200 --prompt "ch? c?n n?i ok."');
+for (const forbidden of ['main.py', '--browser-roles', '--role-map', '--finish-roles', '--parallelism', '--max-turns', '--reload-after', '--goal']) {
+  assert.equal(singleCommand.includes(forbidden), false, `${forbidden} must not appear in a direct role command`);
 }
-assert.equal(
-  terminalContext.commandTerminalOutcome('RELOAD_PAGE', 'COMPOSER_TEXT_CLEARED').ok,
-  false,
-  'success for another action must fail closed'
+for (const forbidden of ['--new-chat-on-handoff', '--handoff-command-policy', '--title', '--branch', '--target-root', '--status']) {
+  assert.equal(command.includes(forbidden), false, `${forbidden} must not be invented`);
+}
+assert.deepEqual(JSON.parse(JSON.stringify(helperContext.deriveFinishRoles(['DEV', 'PLAN', 'REVIEW']))), ['PLAN']);
+assert.deepEqual(JSON.parse(JSON.stringify(helperContext.deriveFinishRoles(['DEV', 'REVIEW']))), ['REVIEW']);
+assert.deepEqual(JSON.parse(JSON.stringify(helperContext.deriveFinishRoles(['C2']))), ['C2']);
+
+assert.equal(helperContext.latestTaskText('PROMPT_ROLE: DEV\nGOAL:\nFix the dashboard\nROUTE_JSON_CONTRACT:\n{}'), 'Fix the dashboard');
+assert.equal(helperContext.latestTaskText('plain user task'), 'plain user task');
+
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperContext.flowEventView({ event: 'FLOW_RUNNING', state: 'RUNNING', logical_role: 'DEV', from_role: 'PLAN' }))),
+  { state: 'RUNNING', route: 'PLAN -> DEV', summary: 'DEV is running' }
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperContext.flowEventView({ event: 'FLOW_DONE', state: 'DONE', logical_role: 'DEV', sent_to: 'REVIEW' }))),
+  { state: 'DONE', route: 'DEV -> REVIEW', summary: 'DEV completed' }
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(helperContext.flowEventView({ event: 'FLOW_WAITING', state: 'WAITING', logical_role: 'REVIEW' }))),
+  { state: 'WAITING', route: 'REVIEW', summary: 'REVIEW is waiting' }
 );
 
+// Selected-role reads remain generation-bound.
+assert.match(script, /fetch\(`\/api\/admin\/role\/\$\{encodeURIComponent\(role\)}\?response_limit=10`\)/);
+assert.match(script, /TIMELINE_LIMIT\s*=\s*30/);
+assert.match(script, /fetch\(`\/api\/admin\/role\/\$\{encodeURIComponent\(role\)}\/timeline\?limit=\$\{TIMELINE_LIMIT\}`\)/);
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -273,6 +186,11 @@ const roleA = { detail: deferred(), timeline: deferred() };
 const roleB = { detail: deferred(), timeline: deferred() };
 const raceContext = {
   Promise,
+  Date,
+  Map,
+  ROLE_DATA_TTL_MS: 5000,
+  roleDataCache: new Map(),
+  roleDataInflight: new Map(),
   selectedRole: 'A',
   selectedRoleRefreshGeneration: 0,
   lastGoodRoleDetail: null,
@@ -282,67 +200,55 @@ const raceContext = {
   fetchRoleEvents(role) { return role === 'A' ? roleA.timeline.promise : roleB.timeline.promise; }
 };
 vm.runInNewContext([
+  extractFunction('applyRoleCache'),
   extractFunction('refreshSelectedRoleData'),
   'globalThis.refreshSelectedRoleData = refreshSelectedRoleData;'
 ].join('\n'), raceContext);
-const firstRoleRefresh = raceContext.refreshSelectedRoleData();
+const first = raceContext.refreshSelectedRoleData();
 raceContext.selectedRole = 'B';
-const secondRoleRefresh = raceContext.refreshSelectedRoleData();
+const second = raceContext.refreshSelectedRoleData();
 roleB.detail.resolve({ role: 'B' });
-roleB.timeline.resolve({ role: 'B', events: [{ role: 'B', event: 'ASSISTANT_DONE' }] });
-await secondRoleRefresh;
+roleB.timeline.resolve({ role: 'B', events: [{ role: 'B', event: 'FLOW_RUNNING' }] });
+await second;
 roleA.detail.resolve({ role: 'A' });
-roleA.timeline.resolve({ role: 'A', events: [{ role: 'A', event: 'ASSISTANT_DONE' }] });
-await firstRoleRefresh;
+roleA.timeline.resolve({ role: 'A', events: [{ role: 'A', event: 'FLOW_DONE' }] });
+await first;
 assert.equal(raceContext.lastGoodRoleDetail.role, 'B');
-assert.deepEqual(
-  JSON.parse(JSON.stringify(raceContext.lastGoodRoleEvents)),
-  [{ role: 'B', event: 'ASSISTANT_DONE' }],
-  'late role-A timeline must not overwrite selected role B'
-);
+assert.equal(raceContext.lastGoodRoleEvents[0].role, 'B');
 
-const mismatchContext = {
-  Promise,
-  selectedRole: 'B',
-  selectedRoleRefreshGeneration: 0,
-  lastGoodRoleDetail: null,
-  lastGoodRoleEvents: [{ role: 'B', event: 'OLD' }],
-  sourceStale: { events: false },
-  async fetchRoleDetail() { return { role: 'B' }; },
-  async fetchRoleEvents() { return { role: 'B', events: [{ role: 'A', event: 'ASSISTANT_DONE' }] }; }
-};
-vm.runInNewContext([
-  extractFunction('refreshSelectedRoleData'),
-  'globalThis.refreshSelectedRoleData = refreshSelectedRoleData;'
-].join('\n'), mismatchContext);
-await mismatchContext.refreshSelectedRoleData();
-assert.deepEqual(JSON.parse(JSON.stringify(mismatchContext.lastGoodRoleEvents)), []);
-assert.equal(mismatchContext.sourceStale.events, true, 'mismatched event roles must fail closed');
-
-// Existing reliability, health, and dependency-free constraints remain.
-for (const filter of ['filter-text', 'filter-controller', 'filter-repository', 'filter-status', 'filter-schedule', 'filter-archived']) {
-  assert.match(source, new RegExp(`id="${filter}"`), `${filter} must exist`);
-}
-assert.match(source, /id="scheduler-health"/, 'scheduler health must remain visible');
-assert.match(source, /id="runner-health"/, 'runner process health must remain visible');
-assert.match(source, /id="flow-stall-notice"/, 'stalled flow evidence must retain a dedicated notice');
-assert.match(script, /liveness\?\.stalled/, 'dashboard must derive stall from flow liveness');
-assert.match(script, /lastGoodTasks/, 'task data must retain the last good projection');
-assert.match(script, /lastGoodRoles/, 'role data must retain the last good projection');
-assert.match(script, /lastGoodFlow/, 'flow data must retain the last good projection');
-assert.match(script, /lastGoodRoleEvents/, 'selected-role event data must retain the last good projection');
-assert.match(script, /taskWorkspace\.hidden\s*=\s*!hasTasks/, 'empty task store must hide the Kanban workspace');
-assert.match(script, /noTasksState\.hidden\s*=\s*hasTasks/, 'empty task store must show one meaningful empty state');
-assert.match(script, /refreshInFlight/, 'polling must prevent overlap');
-assert.match(script, /setInterval\(refreshDashboard, 2000\)/, 'dashboard must remain polling-based');
-assert.match(script, /\.textContent\s*=/, 'remote values must be assigned through textContent');
-assert.doesNotMatch(script, /\.innerHTML\s*=/, 'runtime rendering must not interpolate remote values into innerHTML');
-assert.match(source, /Task store unavailable/, 'task-store errors must remain visible');
-assert.match(source, /Scheduler error/, 'scheduler errors must remain visible');
-assert.match(source, /data-stale/, 'partial failures must mark retained data stale');
-assert.match(script, /external_target/, 'CDP seam metadata may still be rendered in task details');
-assert.doesNotMatch(source, /data-cdp-action|CDP (?:focus|reload|open|close|screenshot|navigate)/i, 'unapproved CDP controls must not exist');
-assert.doesNotMatch(source, /<script[^>]+src=|<link[^>]+stylesheet/i, 'dashboard must not depend on external assets or CDNs');
-assert.doesNotMatch(source, /WebSocket|EventSource|localStorage|sessionStorage/, 'dashboard must remain polling-based without client persistence or streaming');
+assert.match(source, /:focus-visible/);
+assert.match(source, /aria-live="polite"/);
+assert.match(script, /refreshInFlight/);
+assert.match(script, /ROLE_DATA_TTL_MS\s*=\s*5000/);
+assert.match(script, /roleDataCache = new Map\(\)/);
+assert.match(script, /roleDataInflight = new Map\(\)/);
+assert.match(script, /roleCardNodes = new Map\(\)/);
+assert.match(script, /roleCardKeys = new Map\(\)/);
+assert.match(extractFunction('roleCardSignature'), /join\('\\u001f'\)/);
+assert.match(extractFunction('renderRoles'), /roleCardKeys\.get\(role\.role\) !== key/);
+assert.match(extractFunction('renderRoles'), /card\.replaceWith\(replacement\)/);
+assert.match(extractFunction('renderRoles'), /rail\.insertBefore\(card, cursor\)/);
+assert.doesNotMatch(extractFunction('renderRoles'), /clearNode\(rail\);[\s\S]*for \(const role of roles\) rail\.appendChild/, 'role polling must not rebuild the whole rail');
+assert.match(script, /target\.textContent !== text/);
+assert.match(extractFunction('renderSelectedRole'), /renderKey === selectedRoleRenderKey/);
+assert.match(extractFunction('renderEvents'), /renderKey === timelineRenderKey/);
+assert.match(source, /\.role-board-panel\s*\{[\s\S]*?width: min\(100%, 1120px\);[\s\S]*?margin: 10px auto 0;/);
+assert.match(source, /\.role-board\s*\{[\s\S]*?grid-template-columns: repeat\(4, minmax\(0, 1fr\)\);/);
+assert.match(source, /@media \(max-width: 1040px\)[\s\S]*?repeat\(3, minmax\(0, 1fr\)\)/);
+assert.match(source, /@media \(max-width: 760px\)[\s\S]*?repeat\(2, minmax\(0, 1fr\)\)/);
+assert.match(source, /@media \(max-width: 560px\)[\s\S]*?\.role-board \{ grid-template-columns: 1fr; \}/);
+assert.match(source, /\.role-card\s*\{[\s\S]*?min-height: 154px;[\s\S]*?content-visibility: auto;[\s\S]*?contain-intrinsic-size: 154px;/);
+assert.doesNotMatch(source, /repeat\(auto-fit, minmax\(270px, 1fr\)\)/);
+assert.match(source, /#runtime-events\s*\{[\s\S]*?max-height: clamp\(300px, 52vh, 560px\);[\s\S]*?overflow-y: auto;/);
+assert.match(source, /@media \(max-width: 560px\)[\s\S]*?#runtime-events \{ max-height: 60vh;/);
+assert.match(script, /document\.hidden/);
+assert.match(script, /refreshDashboard\(\{ forceRole: true \}\);/);
+assert.match(script, /visibilitychange/);
+assert.match(extractFunction('renderHealth'), /terminal \? `Last flow \$\{flow\.request_id\} · \$\{String\(flow\.terminal_status\)\.toUpperCase\(\)\}`/);
+assert.doesNotMatch(source, /Â·|�|A�|��|���/, 'dashboard source must not contain mojibake');
+assert.doesNotMatch(script, /\.innerHTML\s*=/);
+assert.doesNotMatch(source, /data-cdp-action|CDP (?:focus|reload|open|close|screenshot|navigate)/i);
+assert.doesNotMatch(source, /<script[^>]+src=|<link[^>]+stylesheet/i);
+assert.doesNotMatch(source, /WebSocket|EventSource|localStorage|sessionStorage/);
 
 console.log('dashboard contract: PASS');

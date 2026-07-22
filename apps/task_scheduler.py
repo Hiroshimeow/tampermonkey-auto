@@ -70,7 +70,7 @@ def build_main_command(task: dict[str, Any]) -> str:
     if policy not in {"auto", "always"}:
         raise ValueError("execution_options.handoff_command_policy must be auto or always")
     parts = [
-        "uv run python main.py",
+        "uv run main.py",
         f"--role {_quote_cli(','.join(logical_roles))}",
         f"--browser-roles {_quote_cli(','.join(physical_roles))}",
         f"--role-map {_quote_cli(role_map)}",
@@ -87,6 +87,70 @@ def build_main_command(task: dict[str, Any]) -> str:
         parts.append("--handoff-command-policy always")
     parts.append(f"--goal {_quote_cli(task['prompt'])}")
     return " ".join(parts)
+
+
+def build_main_argv(task: dict[str, Any], uv_executable: str = "uv") -> list[str]:
+    logical_roles = list(task["logical_roles"])
+    physical_roles = list(dict.fromkeys(task["physical_role_map"][role] for role in logical_roles))
+    role_map = " ".join(f"{role}={task['physical_role_map'][role]}" for role in logical_roles)
+    options = task["execution_options"]
+    argv = [
+        uv_executable,
+        "run",
+        "main.py",
+        "--role", ",".join(logical_roles),
+        "--browser-roles", ",".join(physical_roles),
+        "--role-map", role_map,
+        "--finish-roles", ",".join(task["finish_roles"]),
+        "--timeout", _command_number(options["timeout"]),
+        "--request-timeout", _command_number(options["request_timeout"]),
+        "--parallelism", str(options["parallelism"]),
+        "--max-turns", str(options["max_turns"]),
+        "--reload-after", _command_number(options["reload_after"]),
+    ]
+    if options["new_chat_on_handoff"]:
+        argv.append("--new-chat-on-handoff")
+    policy = str(options["handoff_command_policy"])
+    if policy not in {"auto", "always"}:
+        raise ValueError("execution_options.handoff_command_policy must be auto or always")
+    if policy == "always":
+        argv.extend(["--handoff-command-policy", "always"])
+    argv.extend(["--goal", str(task["prompt"])])
+    return argv
+
+
+def build_role_command(task: dict[str, Any]) -> str:
+    role = task["physical_role_map"][task["logical_roles"][0]]
+    options = task["execution_options"]
+    return " ".join([
+        "uv run role.py",
+        f"--role {_quote_cli(role)}",
+        f"--timeout {_command_number(options['timeout'])}",
+        f"--request-timeout {_command_number(options['request_timeout'])}",
+        f"--prompt {_quote_cli(task['prompt'])}",
+    ])
+
+
+def build_role_argv(task: dict[str, Any], uv_executable: str = "uv") -> list[str]:
+    role = task["physical_role_map"][task["logical_roles"][0]]
+    options = task["execution_options"]
+    return [
+        uv_executable,
+        "run",
+        "role.py",
+        "--role", role,
+        "--timeout", _command_number(options["timeout"]),
+        "--request-timeout", _command_number(options["request_timeout"]),
+        "--prompt", str(task["prompt"]),
+    ]
+
+
+def build_launch_command(task: dict[str, Any]) -> str:
+    return build_role_command(task) if len(task["logical_roles"]) == 1 else build_main_command(task)
+
+
+def build_launch_argv(task: dict[str, Any], uv_executable: str = "uv") -> list[str]:
+    return build_role_argv(task, uv_executable) if len(task["logical_roles"]) == 1 else build_main_argv(task, uv_executable)
 
 
 def build_wake_prompt(task: dict[str, Any]) -> str:

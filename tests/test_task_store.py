@@ -50,6 +50,27 @@ def test_empty_create_atomic_restart_and_deep_copy(tmp_path: Path):
     assert TaskStore(path).get(task["task_id"])["controller_role"] == "CONTROL_A"
 
 
+def test_create_with_manual_wake_is_atomic_and_reserves_controller(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks.json")
+    first = store.create(
+        payload(status="READY"),
+        manual_wake_server_instance_id="server-1",
+    )
+
+    assert first["wake"]["state"] == "CLAIMED"
+    assert first["wake"]["source"] == "manual"
+    assert first["wake"]["server_instance_id"] == "server-1"
+    assert [event["type"] for event in first["events"]] == ["created", "wake_claimed"]
+
+    with pytest.raises(TaskConflictError, match="controller_busy"):
+        store.create(
+            payload(title="conflict", status="READY"),
+            manual_wake_server_instance_id="server-1",
+        )
+
+    assert [task["task_id"] for task in store.list_tasks()] == [first["task_id"]]
+
+
 def test_execution_options_default_validate_patch_and_migrate(tmp_path: Path):
     path = tmp_path / "tasks.json"
     store = TaskStore(path)

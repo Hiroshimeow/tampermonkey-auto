@@ -4,23 +4,27 @@ All notable changes to the Tampermonkey bridge and its role orchestration flow a
 
 ## [1.0.7] - 2026-07-19
 
-Version 1.0.7 replaces the runtime-summary dashboard with an online physical-role board and makes persisted task execution options the single source of launch-command evidence.
+Version 1.0.7 replaces the runtime-summary dashboard with a physical-role board and a minimal per-role command composer.
 
 ### Role-board control surface
 
-- Render only online physical browser roles as selectable cards with configured/current logical role, turn, conversation, composer, task, command, and liveness evidence.
-- Add role-scoped response and event views using `/api/admin/role/{role}` and `/api/admin/events?role=...`, with newest-response focus limited to initial load and role changes.
-- Add exact-role `Clear txt`, `F5`, and task-creation controls. `CLEAR_COMPOSER_TEXT` succeeds only when composer text is empty and the real attachment count is unchanged.
+- Render online roles plus bounded offline-operational and recent stale roles as selectable cards, preserving last-known conversation evidence with explicit live/cached labeling; long-expired historical roles are removed.
+- Add bounded, scrollable role-scoped response and semantic timeline views using `/api/admin/role/{role}` and `/api/admin/role/{role}/timeline`, with explicit `From -> To`, `RUNNING`, `WAITING`, and `DONE` presentation on desktop and mobile.
+- Show each selected role's latest observed user task and `user -> assistant` progress counts.
+- Add exact-role `Clear txt`, `F5`, and per-role command controls. `CLEAR_COMPOSER_TEXT` succeeds only when composer text is empty and the real attachment count is unchanged.
+- Fail closed for bridge-required admin commands while the physical role is offline: dashboard browser actions are disabled and the server rejects them without creating a delayed `PENDING` command.
 
-### Task execution contract
+### Per-role command composer
 
-- Add validated, migrated `execution_options` persistence with exact defaults for timeout, request timeout, parallelism, max turns, reload delay, new-chat handoff, and handoff command policy.
-- Replace raw comma/JSON workflow fields with ordered logical-role chips, live physical-role mapping, bounded numeric inputs, approved behavior toggles, prompt samples, and an exact live `main.py` command preview.
-- Include persisted execution options and the generated command in scheduler wake evidence; create/edit/PATCH flows preserve optimistic revisions and restore the full editor state.
+- Remove the global Kanban/task-management surface from the role dashboard while leaving the durable task backend unchanged.
+- Reduce `+ task` to only the inputs present in the generated command: task prompt, logical role order, online browser mapping, timeout, request timeout, parallelism, max turns, and reload delay.
+- `Create` now launches the exact generated command with shell-free argv, clean Python environment, bounded per-run logs, readiness checks, and duplicate-role protection. Single-role tasks use `uv run role.py ... --prompt`; multi-role flows use `uv run main.py ... --goal`. It no longer creates a hidden Kanban task or asks the user to copy a command.
+- Constrain the role board to a centered four-column control deck, falling back to three, two, and one column across desktop, tablet, and phone widths; cards are compact and use clear live/cached and state accents.
+- Poll lightweight role/flow state every two seconds, cache/dedupe heavier role detail and timeline reads, pause hidden-tab polling, and update role cards by stable key instead of rebuilding the whole rail so text selection and scroll survive live updates.
 
 ### Verification
 
-- Advance dashboard contract version to 9 and userscript bridge version to 1.0.7.
+- Advance dashboard contract version to 12 and userscript bridge version to 1.0.7.
 - Add role projection, execution-option migration/API, generated-command, clear-text terminal-state, attachment-preservation, and dashboard role-board contract coverage.
 
 ## [1.0.6] - 2026-07-19

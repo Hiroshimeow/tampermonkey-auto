@@ -6,14 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from apps.task_scheduler import build_main_command
-from apps.task_store import normalize_execution_options
+from apps.task_scheduler import build_launch_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def dashboard_command(task: dict) -> str:
+def dashboard_command(payload: dict) -> str:
     node_script = r"""
 const fs = require('fs');
 const vm = require('vm');
@@ -23,8 +22,6 @@ function extractFunction(name) {
   const marker = `function ${name}`;
   let start = script.indexOf(marker);
   if (start < 0) throw new Error(`missing ${name}`);
-  const asyncStart = Math.max(0, start - 6);
-  if (script.slice(asyncStart, start) === 'async ') start = asyncStart;
   const brace = script.indexOf('{', start);
   let depth = 0;
   let quote = '';
@@ -37,10 +34,7 @@ function extractFunction(name) {
       else if (char === quote) quote = '';
       continue;
     }
-    if (char === "'" || char === '"' || char === '`') {
-      quote = char;
-      continue;
-    }
+    if (char === "'" || char === '"' || char === '`') { quote = char; continue; }
     if (char === '{') depth += 1;
     if (char === '}' && --depth === 0) return script.slice(start, index + 1);
   }
@@ -51,21 +45,23 @@ vm.runInNewContext([
   extractFunction('commandNumber'),
   extractFunction('quoteCli'),
   extractFunction('buildMainCommand'),
-  'globalThis.buildMainCommand = buildMainCommand;'
+  extractFunction('buildRoleCommand'),
+  extractFunction('buildLaunchCommand'),
+  'globalThis.buildLaunchCommand = buildLaunchCommand;'
 ].join('\n'), context);
-const task = JSON.parse(fs.readFileSync(0, 'utf8'));
-process.stdout.write(context.buildMainCommand(
-  task.logical_roles,
-  task.physical_role_map,
-  task.finish_roles,
-  task.execution_options,
-  task.prompt
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+process.stdout.write(context.buildLaunchCommand(
+  payload.logical_roles,
+  payload.physical_role_map,
+  payload.finish_roles,
+  payload.execution_options,
+  payload.prompt
 ));
 """
     result = subprocess.run(
         ["node", "-e", node_script],
         cwd=ROOT,
-        input=json.dumps(task),
+        input=json.dumps(payload),
         text=True,
         capture_output=True,
         check=False,
@@ -75,46 +71,106 @@ process.stdout.write(context.buildMainCommand(
 
 
 @pytest.mark.parametrize(
-    "options,prompt",
+    "prompt",
     [
-        (
-            {
-                "timeout": 1234.56789,
-                "request_timeout": 7654.32109,
+        'say "hello" then inspect C:\\temp\\',
+        "trailing slash \\",
+        "Unicode task: kiểm tra role C2 → C3",
+    ],
+)
+def test_compact_dashboard_command_contains_only_visible_command_inputs(prompt: str) -> None:
+    command = dashboard_command(
+        {
+            "logical_roles": ["DEV", "REVIEW", "PLAN"],
+            "physical_role_map": {"DEV": "C2", "REVIEW": "C3", "PLAN": "C2"},
+            "finish_roles": ["PLAN"],
+            "execution_options": {
+                "timeout": 1800,
+                "request_timeout": 1200,
                 "parallelism": 4,
                 "max_turns": 0,
-                "reload_after": 0.000001,
+                "reload_after": 10,
+            },
+            "prompt": prompt,
+        }
+    )
+
+    backend_command = build_launch_command(
+        {
+            "logical_roles": ["DEV", "REVIEW", "PLAN"],
+            "physical_role_map": {"DEV": "C2", "REVIEW": "C3", "PLAN": "C2"},
+            "finish_roles": ["PLAN"],
+            "execution_options": {
+                "timeout": 1800,
+                "request_timeout": 1200,
+                "parallelism": 4,
+                "max_turns": 0,
+                "reload_after": 10,
                 "new_chat_on_handoff": False,
                 "handoff_command_policy": "auto",
             },
-            'say "hello" then inspect C:\\temp\\',
-        ),
-        (
-            {
-                "timeout": 1.0000001,
-                "request_timeout": 86400,
-                "parallelism": 32,
-                "max_turns": 100000,
-                "reload_after": 0.0000001,
-                "new_chat_on_handoff": True,
-                "handoff_command_policy": "always",
-            },
-            "trailing slash \\",
-        ),
-    ],
-)
-def test_dashboard_preview_is_byte_identical_to_scheduler_evidence(options: dict, prompt: str) -> None:
-    task = {
-        "logical_roles": ["DEV", "REVIEW", "PLAN"],
-        "physical_role_map": {"DEV": "WORKER-A", "REVIEW": "WORKER-B", "PLAN": "WORKER-A"},
-        "finish_roles": ["PLAN"],
-        "execution_options": normalize_execution_options(options),
-        "prompt": prompt,
+            "prompt": prompt,
+        }
+    )
+
+    assert command == backend_command
+    assert command.startswith("uv run main.py ")
+    for fragment in (
+        '--role "DEV,REVIEW,PLAN"',
+        '--browser-roles "C2,C3"',
+        '--role-map "DEV=C2 REVIEW=C3 PLAN=C2"',
+        '--finish-roles "PLAN"',
+        "--timeout 1800",
+        "--request-timeout 1200",
+        "--parallelism 4",
+        "--max-turns 0",
+        "--reload-after 10",
+        "--goal ",
+    ):
+        assert fragment in command
+
+    for forbidden in (
+        "--title",
+        "--target-root",
+        "--branch",
+        "--controller-role",
+        "--status",
+        "--new-chat-on-handoff",
+        "--handoff-command-policy",
+    ):
+        assert forbidden not in command
+
+
+def test_single_role_dashboard_command_uses_direct_role_runner() -> None:
+    payload = {
+        "logical_roles": ["C2"],
+        "physical_role_map": {"C2": "C2"},
+        "finish_roles": ["C2"],
+        "execution_options": {
+            "timeout": 1800,
+            "request_timeout": 1200,
+            "parallelism": 4,
+            "max_turns": 0,
+            "reload_after": 10,
+        },
+        "prompt": "chỉ cần nói ok.",
     }
+    command = dashboard_command(payload)
+    backend_command = build_launch_command(
+        {
+            **payload,
+            "execution_options": {
+                **payload["execution_options"],
+                "new_chat_on_handoff": False,
+                "handoff_command_policy": "auto",
+            },
+        }
+    )
 
-    assert dashboard_command(task) == build_main_command(task)
-
-
-def test_dashboard_task_execution_policy_rejects_cli_only_off_value() -> None:
-    with pytest.raises(ValueError, match="auto or always"):
-        normalize_execution_options({"handoff_command_policy": "off"})
+    assert command == backend_command
+    assert command == (
+        'uv run role.py --role "C2" --timeout 1800 --request-timeout 1200 '
+        '--prompt "chỉ cần nói ok."'
+    )
+    for forbidden in ("main.py", "--browser-roles", "--role-map", "--finish-roles", "--parallelism", "--max-turns", "--reload-after", "--goal"):
+        assert forbidden not in command

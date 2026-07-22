@@ -531,7 +531,7 @@ class TaskStore:
                 return task
         return None
 
-    def create(self, raw: dict[str, Any]) -> dict[str, Any]:
+    def create(self, raw: dict[str, Any], *, manual_wake_server_instance_id: str = "") -> dict[str, Any]:
         with self.lock:
             self._ensure_mutable()
             if not isinstance(raw, dict):
@@ -541,6 +541,17 @@ class TaskStore:
                 raise ValueError("create body contains server-owned task fields")
             now = self._now()
             schedule, next_run_at = normalize_schedule(raw.get("schedule", {"kind": "manual"}), now)
+            wake = empty_wake()
+            if manual_wake_server_instance_id:
+                if str(raw.get("status", "BACKLOG")).strip().upper() != "READY" or schedule["kind"] != "manual":
+                    raise ValueError("manual wake creation requires a READY manual task")
+                wake.update({
+                    "state": "CLAIMED",
+                    "attempt_id": f"attempt-{uuid.uuid4().hex}",
+                    "server_instance_id": manual_wake_server_instance_id,
+                    "source": "manual",
+                    "requested_at": iso_utc(now),
+                })
             task_id = f"task-{uuid.uuid4().hex}"
             task = validate_task({
                 "task_id": task_id,
@@ -564,7 +575,7 @@ class TaskStore:
                 "last_result_status": None,
                 "last_result_summary": "",
                 "blocker": "",
-                "wake": empty_wake(),
+                "wake": wake,
                 "events": [],
                 "created_at": iso_utc(now),
                 "updated_at": iso_utc(now),
@@ -575,6 +586,8 @@ class TaskStore:
             if task_reserves_controller(task) and self._controller_conflict(task):
                 raise TaskConflictError("controller_busy")
             self._append_event(task, self._event("created", "Task created", actor_role=task["controller_role"]))
+            if manual_wake_server_instance_id:
+                self._append_event(task, self._event("wake_claimed", "manual wake occurrence claimed", actor_role=task["controller_role"]))
             return self._publish_new_task(task)
 
     def _publish_new_task(self, task: dict[str, Any]) -> dict[str, Any]:

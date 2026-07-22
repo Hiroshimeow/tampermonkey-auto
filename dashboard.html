@@ -16,12 +16,10 @@
             --text: #edf4f8;
             --muted: #9aabba;
             --cyan: #67d9e8;
+            --green: #74d59b;
             --amber: #efbb62;
             --red: #ef7c77;
-            --green: #74d59b;
             --violet: #b39aef;
-            --blue: #78a9f2;
-            --shadow: 0 16px 44px rgba(0, 0, 0, .28);
             --radius: 12px;
             font-family: "Segoe UI Variable", "Aptos", system-ui, sans-serif;
         }
@@ -43,32 +41,34 @@
             background: var(--surface-2);
             color: var(--text);
         }
-        button { cursor: pointer; padding: 8px 11px; font-weight: 650; }
+        button { cursor: pointer; padding: 8px 11px; font-weight: 700; }
         button:hover { border-color: var(--cyan); }
-        button:disabled { cursor: not-allowed; opacity: .45; }
+        button:disabled { cursor: not-allowed; opacity: .42; }
         input, select, textarea { width: 100%; padding: 8px 9px; }
-        textarea { min-height: 92px; resize: vertical; }
+        textarea { resize: vertical; }
         :focus-visible { outline: 3px solid var(--cyan); outline-offset: 2px; }
         [hidden] { display: none !important; }
-
         #dashboard-root { min-height: 100vh; padding: 14px; }
-        #dashboard-root[data-stale="true"] .topbar { border-color: var(--amber); }
+        #dashboard-root[data-stale="true"] .topbar,
+        #dashboard-root[data-stalled="true"] .topbar { border-color: var(--amber); }
+        .topbar, .panel, dialog {
+            border: 1px solid var(--line);
+            background: rgba(17, 24, 32, .97);
+            box-shadow: 0 16px 44px rgba(0, 0, 0, .28);
+        }
         .topbar {
             position: sticky;
             top: 8px;
             z-index: 20;
-            display: grid;
-            grid-template-columns: minmax(220px, 1fr) auto;
-            gap: 14px;
+            display: flex;
+            justify-content: space-between;
             align-items: center;
+            gap: 14px;
             padding: 12px 14px;
-            border: 1px solid var(--line);
             border-radius: var(--radius);
-            background: rgba(17, 24, 32, .96);
-            box-shadow: var(--shadow);
             backdrop-filter: blur(10px);
         }
-        .brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
+        .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
         .brand-mark {
             display: grid;
             width: 42px;
@@ -79,53 +79,21 @@
             color: var(--cyan);
             font: 800 13px/1 ui-monospace, Consolas, monospace;
         }
-        .brand h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
-        .brand p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+        .brand h1 { margin: 0; font-size: 18px; }
+        .brand p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
         .health-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
-        .health-pill {
-            display: inline-flex;
-            gap: 6px;
-            align-items: center;
-            min-height: 30px;
-            padding: 5px 9px;
+        .health-pill, .panel-count, .role-state, .tag {
             border: 1px solid var(--line);
             border-radius: 999px;
             background: var(--surface-2);
-            color: var(--muted);
-            font: 650 11px/1.2 ui-monospace, Consolas, monospace;
+            font: 700 10px/1.2 ui-monospace, Consolas, monospace;
         }
+        .health-pill { display: inline-flex; gap: 6px; padding: 6px 9px; color: var(--muted); }
         .health-pill strong { color: var(--text); }
-        .health-pill[data-tone="good"] strong { color: var(--green); }
-        .health-pill[data-tone="warn"] strong { color: var(--amber); }
-        .health-pill[data-tone="bad"] strong { color: var(--red); }
-        .primary { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
-        .danger { border-color: var(--red); color: #ffc5c2; }
-        .quiet { background: transparent; }
-
-        .filters {
-            display: grid;
-            grid-template-columns: minmax(220px, 2fr) minmax(150px, 1fr) auto;
-            gap: 8px;
-            margin: 12px 0;
-            padding: 10px;
-            border: 1px solid var(--line);
-            border-radius: var(--radius);
-            background: var(--surface);
-        }
-        .filter-check { display: flex; gap: 7px; align-items: center; padding: 0 8px; color: var(--muted); font-size: 12px; }
-        .filter-check input { width: auto; }
-        .advanced-filters { min-width: 150px; }
-        .advanced-filters > summary, .task-more > summary, .form-section > summary {
-            cursor: pointer;
-            color: var(--muted);
-            font-size: 12px;
-            font-weight: 700;
-        }
-        .advanced-filters > summary { min-height: 36px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); }
-        .filter-advanced { display: grid; grid-template-columns: repeat(3, minmax(140px, 1fr)) auto; gap: 8px; padding-top: 8px; }
-        .advanced-filters[open] { grid-column: 1 / -1; }
-
-        .notice-stack { display: grid; gap: 7px; margin-bottom: 10px; }
+        [data-tone="good"] { color: var(--green) !important; border-color: var(--green) !important; }
+        [data-tone="warn"] { color: var(--amber) !important; border-color: var(--amber) !important; }
+        [data-tone="bad"] { color: var(--red) !important; border-color: var(--red) !important; }
+        .notice-stack { display: grid; gap: 7px; margin: 10px 0; }
         .notice {
             padding: 9px 11px;
             border: 1px solid var(--amber);
@@ -133,491 +101,303 @@
             background: rgba(239, 187, 98, .09);
             color: #ffdca2;
             font: 600 12px/1.4 ui-monospace, Consolas, monospace;
+            white-space: pre-line;
         }
-        .notice[data-kind="error"] { border-color: var(--red); background: rgba(239, 124, 119, .09); color: #ffc1be; }
-        .notice[data-kind="stall"] { border-color: var(--amber); background: rgba(239, 187, 98, .12); color: #ffdca2; white-space: pre-line; }
-        #dashboard-root[data-stalled="true"] .topbar { border-color: var(--amber); }
-
-        .runtime-layout {
-            display: grid;
-            grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
-            gap: 10px;
-            margin: 12px 0;
-        }
-        .panel {
-            min-width: 0;
-            border: 1px solid var(--line);
-            border-radius: var(--radius);
-            background: var(--surface);
-            overflow: hidden;
-        }
+        .notice[data-kind="error"] { border-color: var(--red); color: #ffc1be; background: rgba(239, 124, 119, .09); }
+        .panel { min-width: 0; border-radius: var(--radius); overflow: hidden; }
         .panel-head {
             display: flex;
             justify-content: space-between;
-            gap: 12px;
             align-items: center;
+            gap: 12px;
             padding: 10px 12px;
             border-bottom: 1px solid var(--line);
         }
         .panel-head h2 { margin: 0; font-size: 13px; }
-        .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
-        .panel-count { min-width: 28px; padding: 4px 7px; border-radius: 99px; background: var(--surface-3); text-align: center; font: 700 11px/1 ui-monospace, Consolas, monospace; }
-        .roles-panel, .events-panel { grid-column: 1 / -1; }
-        .runtime-kv { display: grid; grid-template-columns: minmax(110px, .6fr) minmax(0, 1.4fr); gap: 0; padding: 4px 12px 10px; }
-        .runtime-kv dt, .runtime-kv dd { margin: 0; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); overflow-wrap: anywhere; }
-        .runtime-kv dt { color: var(--muted); font: 650 10px/1.35 ui-monospace, Consolas, monospace; text-transform: uppercase; }
-        .runtime-kv dd { color: var(--text); font: 11px/1.4 ui-monospace, Consolas, monospace; }
-        .flow-role-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 12px; }
-        .flow-role-chip { padding: 5px 7px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); font: 650 10px/1.3 ui-monospace, Consolas, monospace; }
-        .task-shell { margin-top: 10px; }
-        .task-shell > .panel-head { position: sticky; top: 82px; z-index: 7; background: var(--surface); }
-        .empty-state { padding: 34px 18px; color: var(--muted); text-align: center; }
-        .empty-state strong { display: block; margin-bottom: 6px; color: var(--text); font-size: 15px; }
-        #task-workspace { padding: 0 10px 10px; }
-        .board {
+        .panel-count { min-width: 28px; padding: 4px 7px; text-align: center; }
+        .role-board-panel {
+            width: min(100%, 1120px);
+            margin: 10px auto 0;
+            contain: layout paint;
+        }
+        .role-board {
             display: grid;
-            grid-template-columns: repeat(6, minmax(245px, 1fr));
-            gap: 9px;
-            min-width: 0;
-            overflow-x: auto;
-            padding-bottom: 14px;
-        }
-        .kanban-column {
-            min-height: 220px;
-            border: 1px solid var(--line);
-            border-top: 3px solid var(--state-accent, var(--line-strong));
-            border-radius: var(--radius);
-            background: rgba(17, 24, 32, .92);
-        }
-        .kanban-column[data-kanban-state="BACKLOG"] { --state-accent: var(--muted); }
-        .kanban-column[data-kanban-state="READY"] { --state-accent: var(--cyan); }
-        .kanban-column[data-kanban-state="RUNNING"] { --state-accent: var(--blue); }
-        .kanban-column[data-kanban-state="REVIEW"] { --state-accent: var(--violet); }
-        .kanban-column[data-kanban-state="BLOCKED"] { --state-accent: var(--red); }
-        .kanban-column[data-kanban-state="DONE"] { --state-accent: var(--green); }
-        .column-head {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px 11px;
-            border-bottom: 1px solid var(--line);
-            background: var(--surface);
-        }
-        .column-head h2 { margin: 0; font: 800 12px/1 ui-monospace, Consolas, monospace; letter-spacing: .08em; }
-        .column-count { min-width: 24px; padding: 3px 6px; border-radius: 99px; background: var(--surface-3); text-align: center; font-size: 11px; }
-        .task-list { min-height: 160px; padding: 8px; }
-        .task-list[data-drag-over="true"] { outline: 2px dashed var(--cyan); outline-offset: -5px; background: rgba(103, 217, 232, .05); }
-
-        .task-card {
-            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 8px;
-            margin-bottom: 8px;
-            padding: 10px;
+            padding: 8px;
+        }
+        .role-card {
+            position: relative;
+            display: flex;
+            min-width: 0;
+            min-height: 154px;
+            flex-direction: column;
+            padding: 9px;
             border: 1px solid var(--line);
-            border-radius: 10px;
-            background: var(--surface-2);
-            box-shadow: 0 8px 20px rgba(0, 0, 0, .16);
+            border-left-width: 3px;
+            border-radius: 9px;
+            background: linear-gradient(155deg, rgba(29, 42, 54, .72), rgba(23, 33, 43, .92));
+            cursor: pointer;
+            contain: layout paint style;
+            content-visibility: auto;
+            contain-intrinsic-size: 154px;
         }
-        .task-card[aria-grabbed="true"] { opacity: .55; }
-        .task-title {
-            display: block;
-            width: 100%;
-            padding: 0;
-            border: 0;
-            background: transparent;
-            color: var(--text);
-            text-align: left;
-            font-size: 14px;
-            line-height: 1.28;
-        }
-        .task-path, .task-meta, .task-note { overflow-wrap: anywhere; }
-        .task-path { color: var(--muted); font: 11px/1.45 ui-monospace, Consolas, monospace; }
-        .task-meta { display: flex; flex-wrap: wrap; gap: 5px; }
-        .tag { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); font: 650 10px/1.2 ui-monospace, Consolas, monospace; }
-        .tag[data-alert="true"] { border-color: var(--red); color: #ffaaa6; }
-        .task-note { color: #ffd1ce; font-size: 11px; line-height: 1.35; }
-        .task-actions { display: flex; flex-wrap: wrap; gap: 5px; align-items: flex-start; }
-        .task-actions button, .task-actions select { width: auto; min-height: 30px; padding: 5px 7px; font-size: 11px; }
-        .task-more { position: relative; }
-        .task-more > summary { min-height: 30px; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); list-style: none; }
-        .task-more > summary::-webkit-details-marker { display: none; }
-        .task-more-menu { display: flex; flex-wrap: wrap; gap: 5px; width: 100%; padding-top: 5px; }
-        .move-select { max-width: 116px; }
-
-        #role-rail { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 8px; padding: 10px; }
-        .role-card { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
-        .role-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
-        .role-name { font: 800 13px/1.25 ui-monospace, Consolas, monospace; }
-        .role-state { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 99px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
-        .role-state[data-tone="good"] { border-color: var(--green); color: var(--green); }
-        .role-state[data-tone="warn"] { border-color: var(--amber); color: var(--amber); }
-        .role-state[data-tone="bad"] { border-color: var(--red); color: var(--red); }
-        .role-tags { display: flex; flex-wrap: wrap; gap: 5px; }
-        .role-detail-grid { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 4px 8px; }
-        .role-detail-grid dt, .role-detail-grid dd { margin: 0; overflow-wrap: anywhere; }
-        .role-detail-grid dt { color: var(--muted); font: 650 9px/1.4 ui-monospace, Consolas, monospace; text-transform: uppercase; }
-        .role-detail-grid dd { color: var(--text); font: 10px/1.4 ui-monospace, Consolas, monospace; }
-        .role-empty { padding: 24px; color: var(--muted); text-align: center; }
-        #runtime-events { display: grid; max-height: 360px; overflow: auto; }
-        .runtime-event { display: grid; grid-template-columns: 138px 74px minmax(130px, .6fr) minmax(0, 1.4fr); gap: 8px; padding: 8px 12px; border-bottom: 1px solid rgba(65, 86, 103, .35); align-items: baseline; }
-        .runtime-event time, .runtime-event-role, .runtime-event-name { font: 650 10px/1.35 ui-monospace, Consolas, monospace; }
-        .runtime-event time, .runtime-event-role { color: var(--muted); }
-        .runtime-event-name { color: var(--cyan); }
-        .runtime-event-detail { color: var(--muted); font: 10px/1.4 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
-
-        dialog {
-            width: min(760px, calc(100vw - 24px));
-            max-height: calc(100vh - 24px);
-            padding: 0;
-            overflow: auto;
-            border: 1px solid var(--line-strong);
-            border-radius: 14px;
-            background: var(--surface);
-            color: var(--text);
-            box-shadow: var(--shadow);
-        }
-        dialog::backdrop { background: rgba(3, 7, 10, .74); backdrop-filter: blur(3px); }
-        .dialog-head { position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
-        .dialog-head h2 { margin: 0; font-size: 16px; }
-        .dialog-body { padding: 14px; }
-        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .field { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
-        .field-wide { grid-column: 1 / -1; }
-        .form-section { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 9px; background: rgba(23, 33, 43, .5); }
-        .form-section > summary { padding: 10px 11px; }
-        .form-section[open] > summary { border-bottom: 1px solid var(--line); }
-        .form-section-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 11px; }
-        .dialog-actions { position: sticky; bottom: 0; display: flex; justify-content: flex-end; gap: 8px; padding: 11px 14px; border-top: 1px solid var(--line); background: var(--surface); }
-        .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-        .detail-block { padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
-        .detail-block h3 { margin: 0 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
-        .detail-block pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font: 11px/1.5 ui-monospace, Consolas, monospace; }
-        .event-list { display: grid; gap: 6px; }
-        .event-row { padding: 7px; border-left: 2px solid var(--line-strong); color: var(--muted); font-size: 11px; }
-
-        .role-board-panel { margin: 12px 0 10px; }
-        #role-rail.role-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 9px; padding: 10px; }
-        .role-card.selectable { min-height: 224px; cursor: pointer; transition: border-color .12s ease, box-shadow .12s ease; }
-        .role-card.selectable:hover, .role-card.selected { border-color: var(--cyan); }
-        .role-card.selected { box-shadow: 0 0 0 1px rgba(103, 217, 232, .45) inset; }
-        .role-title-link { color: var(--text); text-decoration: none; font: 800 15px/1.25 ui-monospace, Consolas, monospace; }
+        .role-card[data-status-tone="good"] { border-left-color: var(--green); }
+        .role-card[data-status-tone="warn"] { border-left-color: var(--amber); }
+        .role-card[data-status-tone="bad"] { border-left-color: var(--red); }
+        .role-card:hover { background: linear-gradient(155deg, rgba(32, 48, 61, .88), rgba(23, 33, 43, .98)); }
+        .role-card.selected { border-color: var(--cyan); box-shadow: inset 0 0 0 1px rgba(103, 217, 232, .28), 0 0 0 1px rgba(103, 217, 232, .08); }
+        .role-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: start; }
+        .role-card-title { min-width: 0; }
+        .role-card-head h3 { min-width: 0; margin: 0; font: 800 12px/1.3 ui-monospace, Consolas, monospace; }
+        .role-title-link { display: block; overflow: hidden; color: var(--text); text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
         .role-title-link:hover { color: var(--cyan); text-decoration: underline; }
-        .role-subtitle, .role-chat-id { color: var(--muted); font: 10px/1.4 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
-        .role-meta { display: flex; flex-wrap: wrap; gap: 5px; }
-        .role-composer { padding-top: 8px; border-top: 1px solid rgba(65, 86, 103, .35); color: var(--muted); font: 11px/1.4 ui-monospace, Consolas, monospace; }
-        .role-composer strong[data-ready="true"] { color: var(--green); }
-        .role-card-actions { display: flex; gap: 6px; margin-top: auto; }
-        .role-card-actions button { flex: 1; min-width: 0; padding: 7px 6px; font-size: 11px; }
-        .selected-role-layout { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(360px, .88fr); gap: 10px; margin-bottom: 12px; }
-        .selected-role-layout .timeline-panel { grid-column: 1 / -1; }
+        .role-evidence { margin-top: 2px; color: var(--muted); font: 700 8px/1.2 ui-monospace, Consolas, monospace; letter-spacing: .04em; text-transform: uppercase; }
+        .role-state { padding: 3px 5px; color: var(--muted); font-size: 8px; }
+        .role-card-meta { display: flex; flex-wrap: wrap; gap: 3px 9px; margin-top: 7px; color: var(--muted); font: 9px/1.25 ui-monospace, Consolas, monospace; }
+        .role-card-meta strong { color: var(--text); font-weight: 700; }
+        .role-chat { overflow: hidden; margin: 7px 0 6px; color: var(--muted); font: 9px/1.3 ui-monospace, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+        .role-composer { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid rgba(65, 86, 103, .45); color: var(--muted); font: 9px/1.3 ui-monospace, Consolas, monospace; }
+        .role-composer strong { overflow: hidden; color: var(--green); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+        .role-card-actions { display: flex; gap: 5px; margin-top: auto; }
+        .role-card-actions button { flex: 1; min-width: 0; min-height: 28px; padding: 5px 4px; font-size: 9px; }
+        .primary { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
+        .selected-role-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(360px, .9fr); gap: 10px; margin-top: 10px; }
+        .timeline-panel { grid-column: 1 / -1; min-width: 0; }
         .role-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px 12px 0; }
         .role-metric { padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
         .role-metric span { display: block; color: var(--muted); font: 700 9px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
-        .role-metric strong { display: block; margin-top: 5px; font: 800 14px/1.25 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
-        .role-metric[data-tone="good"] strong { color: var(--green); }
-        #role-responses { display: grid; gap: 8px; height: 300px; overflow: auto; padding: 12px; }
-        .role-response { padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
+        .role-metric strong { display: block; margin-top: 5px; font: 800 14px/1.2 ui-monospace, Consolas, monospace; }
+        .current-task { margin: 10px 12px 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
+        .current-task-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+        .current-task-head strong { font-size: 12px; }
+        .current-task-progress { color: var(--cyan); font: 700 10px/1.3 ui-monospace, Consolas, monospace; }
+        .current-task pre { max-height: 170px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #d6e4ea; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .runtime-kv { display: grid; grid-template-columns: 125px minmax(0, 1fr); padding: 5px 12px 10px; }
+        .runtime-kv dt, .runtime-kv dd { margin: 0; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); overflow-wrap: anywhere; }
+        .runtime-kv dt { color: var(--muted); font: 700 9px/1.35 ui-monospace, Consolas, monospace; text-transform: uppercase; }
+        .runtime-kv dd { font: 10px/1.45 ui-monospace, Consolas, monospace; }
+        #role-responses { max-height: 430px; overflow: auto; padding: 10px; }
+        .role-response { margin-bottom: 8px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; }
         .role-response[data-latest="true"] { border-color: var(--cyan); }
         .role-response header { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font: 10px/1.3 ui-monospace, Consolas, monospace; }
         .role-response pre { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
-        .role-order, .available-roles, .browser-targets { display: flex; flex-wrap: wrap; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
-        .role-order { margin-bottom: 7px; }
-        .role-chip { display: inline-flex; gap: 5px; align-items: center; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-3); font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
-        .role-chip button { width: auto; min-height: 24px; padding: 2px 5px; }
-        .role-chip[data-source="true"] { border-color: var(--green); color: var(--green); }
-        .mapping-grid { display: grid; gap: 7px; }
-        .mapping-row { display: grid; grid-template-columns: minmax(90px, .5fr) 24px minmax(0, 1.5fr); gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font: 700 11px/1.3 ui-monospace, Consolas, monospace; }
-        .mapping-row .arrow { color: var(--cyan); text-align: center; }
-        .mapping-row select { width: 100%; }
-        .mapping-row[data-invalid="true"], select[data-invalid="true"] { border-color: var(--bad); }
-        .execution-grid { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 9px; }
-        .toggle-grid { display: grid; gap: 7px; }
-        .toggle-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
-        .toggle-row strong { display: block; font: 700 11px/1.35 ui-monospace, Consolas, monospace; }
-        .toggle-row small { color: var(--muted); font-size: 10px; }
-        .toggle-button.selected { border-color: var(--cyan); background: #15323a; color: #baf5fb; }
-        .command-preview { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; color: #cfe8ee; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
-        .prompt-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-        .prompt-samples { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+        #runtime-events {
+            position: relative;
+            max-height: clamp(300px, 52vh, 560px);
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+            touch-action: pan-y;
+            padding: 10px 12px 12px 34px;
+        }
+        #runtime-events::before { content: ""; position: absolute; left: 19px; top: 18px; bottom: 20px; width: 1px; background: var(--line-strong); }
+        .flow-line { position: relative; display: grid; grid-template-columns: 86px 86px minmax(130px, .7fr) minmax(180px, 1.3fr); gap: 8px; align-items: center; min-height: 46px; padding: 7px 0; border-bottom: 1px solid rgba(65, 86, 103, .35); font: 10px/1.4 ui-monospace, Consolas, monospace; }
+        .flow-line::before { content: ""; position: absolute; left: -20px; width: 9px; height: 9px; border: 2px solid var(--cyan); border-radius: 50%; background: var(--surface); }
+        .flow-line time { color: var(--muted); }
+        .flow-line .role-state { justify-self: start; }
+        .flow-route { color: var(--cyan); font-weight: 800; overflow-wrap: anywhere; }
+        .flow-summary { color: var(--text); }
+        .flow-evidence { grid-column: 3 / -1; }
+        .flow-evidence summary { cursor: pointer; color: var(--muted); }
+        .flow-evidence pre { margin: 6px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; color: var(--muted); }
+        .role-empty { padding: 24px 14px; color: var(--muted); text-align: center; }
+        dialog { width: min(880px, calc(100vw - 24px)); max-height: calc(100vh - 24px); padding: 0; border-color: var(--line-strong); border-radius: 14px; color: var(--text); }
+        dialog::backdrop { background: rgba(3, 7, 10, .78); }
+        .dialog-head, .dialog-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 14px; }
+        .dialog-head { border-bottom: 1px solid var(--line); }
+        .dialog-head h2 { margin: 0; font-size: 15px; }
+        .dialog-actions { justify-content: flex-end; border-top: 1px solid var(--line); }
+        .dialog-body { display: grid; gap: 12px; padding: 14px; }
+        .field { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+        .prompt-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
         #task-prompt { min-height: 58px; max-height: 218px; overflow-y: auto; line-height: 20px; }
+        .prompt-samples, .role-order, .available-roles, .browser-targets { display: flex; flex-wrap: wrap; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
         .section-label { margin: 0 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, Consolas, monospace; text-transform: uppercase; }
-        @media (max-width: 1100px) {
-            .runtime-layout, .selected-role-layout { grid-template-columns: 1fr; }
-            .selected-role-layout .timeline-panel { grid-column: auto; }
-            .roles-panel, .events-panel { grid-column: auto; }
-            #role-rail { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+        .role-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border-radius: 8px; font: 700 10px/1.2 ui-monospace, Consolas, monospace; }
+        .role-chip[data-source="true"] { border-color: var(--green); color: var(--green); }
+        .role-chip button { padding: 3px 6px; }
+        .mapping-grid { display: grid; gap: 7px; }
+        .mapping-row { display: grid; grid-template-columns: minmax(90px, .4fr) 28px minmax(180px, 1fr); gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font: 700 10px/1.3 ui-monospace, Consolas, monospace; }
+        .mapping-row .arrow { color: var(--cyan); text-align: center; }
+        .options-grid { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 9px; }
+        .command-preview { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0c1218; color: #cfe8ee; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, Consolas, monospace; }
+        .task-status { min-height: 18px; color: var(--green); font: 10px/1.4 ui-monospace, Consolas, monospace; }
+        @media (max-width: 1040px) {
+            .role-board { grid-template-columns: repeat(3, minmax(0, 1fr)); }
         }
-        @media (max-width: 820px) {
+        @media (max-width: 920px) {
+            .topbar { align-items: flex-start; flex-direction: column; }
+            .selected-role-layout { grid-template-columns: 1fr; }
+            .timeline-panel { grid-column: auto; }
+            .flow-line { grid-template-columns: 72px 78px 1fr; }
+            .flow-summary { grid-column: 3; }
+            .flow-evidence { grid-column: 3; }
+        }
+        @media (max-width: 760px) {
+            .role-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 560px) {
             #dashboard-root { padding: 8px; }
-            .topbar { position: static; grid-template-columns: 1fr; }
-            .health-strip { justify-content: flex-start; }
-            .filters { grid-template-columns: 1fr 1fr; }
-            .filter-advanced { grid-template-columns: 1fr 1fr; }
-            .column-head { top: 0; }
-            .form-grid, .form-section-grid, .detail-grid, .execution-grid { grid-template-columns: 1fr; }
+            .role-board { grid-template-columns: 1fr; }
             .role-metrics { grid-template-columns: 1fr 1fr; }
-            .runtime-event { grid-template-columns: 1fr; gap: 2px; }
-            .runtime-kv { grid-template-columns: 1fr; }
-            .field-wide { grid-column: auto; }
+            .runtime-kv { grid-template-columns: 90px minmax(0, 1fr); }
+            .options-grid { grid-template-columns: 1fr 1fr; }
+            .mapping-row { grid-template-columns: 70px 20px minmax(0, 1fr); }
+            #runtime-events { max-height: 60vh; padding: 8px 8px 10px 28px; }
+            #runtime-events::before { left: 15px; }
+            .flow-line { grid-template-columns: 62px minmax(0, 1fr); gap: 6px; padding: 9px 0; }
+            .flow-line::before { left: -17px; }
+            .flow-line .role-state { grid-column: 2; }
+            .flow-route, .flow-summary, .flow-evidence { grid-column: 2; min-width: 0; }
+            .dialog-actions button { flex: 1; }
         }
-        @media (max-width: 520px) { .filters, .filter-advanced { grid-template-columns: 1fr; } }
         @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
     </style>
 </head>
 <body>
-<main id="dashboard-root" data-dashboard-version="9" data-stale="false" data-stalled="false">
+<main id="dashboard-root" data-dashboard-version="12" data-stale="true" data-stalled="false">
     <header class="topbar">
         <div class="brand">
-            <div class="brand-mark" aria-hidden="true">SF</div>
+            <div class="brand-mark">SF</div>
             <div>
                 <h1>Stable Flow Runtime</h1>
-                <p id="flow-summary">Loading runtime state</p>
+                <p id="flow-summary">Loading runtime flow...</p>
             </div>
         </div>
         <div class="health-strip">
-            <span class="health-pill" id="connection-health"><span>Connection</span><strong>CHECKING</strong></span>
-            <span class="health-pill" id="scheduler-health"><span>Scheduler</span><strong>UNKNOWN</strong></span>
-            <span class="health-pill" id="runner-health"><span>Runner</span><strong>UNKNOWN</strong></span>
+            <span id="connection-health" class="health-pill"><span>Connection</span><strong>CHECKING</strong></span>
+            <span id="runner-health" class="health-pill"><span>Runner</span><strong>UNKNOWN</strong></span>
             <span class="health-pill"><span>Refresh</span><strong id="refresh-age">--</strong></span>
         </div>
     </header>
 
     <div class="notice-stack" aria-live="polite">
-        <div id="connection-notice" class="notice" data-kind="error" hidden>Retaining last good dashboard data.</div>
-        <div id="task-store-error" class="notice" data-kind="error" hidden>Task store unavailable</div>
-        <div id="scheduler-error" class="notice" data-kind="error" hidden>Scheduler error</div>
-        <div id="conflict-notice" class="notice" hidden>Revision conflict. Your open edits were retained; review the refreshed task before retrying.</div>
+        <div id="connection-notice" class="notice" data-kind="error" hidden></div>
         <div id="role-action-notice" class="notice" hidden></div>
-        <div id="flow-stall-notice" class="notice" data-kind="stall" hidden></div>
+        <div id="flow-stall-notice" class="notice" hidden></div>
     </div>
 
-    <section class="panel role-board-panel" aria-label="Online role board">
-        <header class="panel-head">
-            <div><h2>Role board</h2><p>Online physical browser roles; select a card for response and routing evidence</p></div>
-            <span id="role-count" class="panel-count">0</span>
-        </header>
+    <section class="panel role-board-panel" aria-label="Role board">
+        <header class="panel-head"><h2>Role board</h2><span id="role-count" class="panel-count">0</span></header>
         <div id="role-rail" class="role-board"></div>
     </section>
 
-    <section class="selected-role-layout" aria-label="Selected role details">
+    <section class="selected-role-layout" aria-label="Selected role">
         <section class="panel">
-            <header class="panel-head">
-                <div><h2 id="role-detail-title">No online role selected</h2><p>Role status, request, browser and transport evidence</p></div>
-                <span id="selected-role-state" class="role-state">OFFLINE</span>
-            </header>
+            <header class="panel-head"><h2 id="role-detail-title">No role selected</h2><span id="selected-role-state" class="role-state">OFFLINE</span></header>
             <div id="role-metrics" class="role-metrics"></div>
+            <section id="current-task" class="current-task">
+                <div class="current-task-head"><strong>Current task</strong><span id="current-task-progress" class="current-task-progress">not observed</span></div>
+                <pre id="current-task-text">No task observed.</pre>
+            </section>
             <dl id="selected-role-detail" class="runtime-kv"></dl>
         </section>
         <section class="panel">
-            <header class="panel-head"><div><h2>Responses</h2><p>Newest assistant response is focused on initial load and role selection</p></div><span id="response-count" class="panel-count">0</span></header>
+            <header class="panel-head"><h2>Responses</h2><span id="response-count" class="panel-count">0</span></header>
             <div id="role-responses"></div>
         </section>
         <section class="panel timeline-panel">
-            <header class="panel-head"><div><h2>Role timeline</h2><p>Routing, command, response, lifecycle and error events</p></div><span id="event-count" class="panel-count">0</span></header>
+            <header class="panel-head"><h2>Role timeline</h2><span id="event-count" class="panel-count">0</span></header>
             <div id="runtime-events"></div>
         </section>
     </section>
-
-    <section class="panel task-shell" aria-label="Task control">
-        <header class="panel-head">
-            <div><h2>Task control</h2><p>Kanban appears only when tasks are configured</p></div>
-            <button id="create-task" class="primary" type="button">Create task</button>
-        </header>
-        <div id="no-tasks-state" class="empty-state" hidden>
-            <strong>No tasks configured</strong>
-            Runtime state remains visible above. Create a task only when you need scheduling or Kanban control.
-        </div>
-        <div id="task-workspace" hidden>
-            <section class="filters" aria-label="Task filters">
-                <input id="filter-text" type="search" placeholder="Search title, objective, branch" aria-label="Search tasks">
-                <select id="filter-status" aria-label="Filter by status"><option value="">All states</option></select>
-                <details id="advanced-filters" class="advanced-filters">
-                    <summary>More filters</summary>
-                    <div class="filter-advanced">
-                        <select id="filter-controller" aria-label="Filter by controller"><option value="">All controllers</option></select>
-                        <select id="filter-repository" aria-label="Filter by repository"><option value="">All repositories</option></select>
-                        <select id="filter-schedule" aria-label="Filter by schedule"><option value="">All schedules</option><option value="manual">Manual</option><option value="scheduled">Scheduled</option></select>
-                        <label class="filter-check"><input id="filter-archived" type="checkbox"> Show archived</label>
-                    </div>
-                </details>
-            </section>
-            <section class="board" aria-label="Six-state task board">
-                <section class="kanban-column" data-kanban-state="BACKLOG"><header class="column-head"><h2>BACKLOG</h2><span id="count-BACKLOG" class="column-count">0</span></header><div id="column-BACKLOG" class="task-list" data-drop-state="BACKLOG"></div></section>
-                <section class="kanban-column" data-kanban-state="READY"><header class="column-head"><h2>READY</h2><span id="count-READY" class="column-count">0</span></header><div id="column-READY" class="task-list" data-drop-state="READY"></div></section>
-                <section class="kanban-column" data-kanban-state="RUNNING"><header class="column-head"><h2>RUNNING</h2><span id="count-RUNNING" class="column-count">0</span></header><div id="column-RUNNING" class="task-list" data-drop-state="RUNNING"></div></section>
-                <section class="kanban-column" data-kanban-state="REVIEW"><header class="column-head"><h2>REVIEW</h2><span id="count-REVIEW" class="column-count">0</span></header><div id="column-REVIEW" class="task-list" data-drop-state="REVIEW"></div></section>
-                <section class="kanban-column" data-kanban-state="BLOCKED"><header class="column-head"><h2>BLOCKED</h2><span id="count-BLOCKED" class="column-count">0</span></header><div id="column-BLOCKED" class="task-list" data-drop-state="BLOCKED"></div></section>
-                <section class="kanban-column" data-kanban-state="DONE"><header class="column-head"><h2>DONE</h2><span id="count-DONE" class="column-count">0</span></header><div id="column-DONE" class="task-list" data-drop-state="DONE"></div></section>
-            </section>
-        </div>
-    </section>
 </main>
 
-<template id="task-card-template">
-    <article class="task-card" draggable="true" aria-grabbed="false">
-        <button class="task-title" type="button"></button>
-        <div class="task-path"></div>
-        <div class="task-meta"></div>
-        <div class="task-note" hidden></div>
-        <div class="task-actions">
-            <button class="run-action" type="button">Run now</button>
-            <button class="pause-action" type="button">Pause</button>
-            <details class="task-more">
-                <summary>More actions</summary>
-                <div class="task-more-menu">
-                    <button class="edit-action" type="button">Edit</button>
-                    <button class="resolve-sent" type="button">Confirm sent</button>
-                    <button class="resolve-not-sent" type="button">Confirm not sent</button>
-                    <select class="move-select" aria-label="Move task"></select>
-                    <button class="archive-action danger" type="button">Archive</button>
-                </div>
-            </details>
-        </div>
-    </article>
-</template>
-
 <dialog id="task-dialog" aria-labelledby="task-dialog-title">
-    <form id="task-form" method="dialog">
+    <form id="task-form">
         <header class="dialog-head">
             <h2 id="task-dialog-title">Create task</h2>
-            <button class="quiet" type="button" data-close-dialog="task-dialog" aria-label="Close task editor">Close</button>
+            <button type="button" data-close-dialog="task-dialog" aria-label="Close task composer">Close</button>
         </header>
-        <div class="dialog-body form-grid">
-            <input id="task-id" type="hidden">
-            <input id="task-revision" type="hidden">
-            <label class="field field-wide">Title<input id="task-title" required maxlength="160"></label>
-            <label class="field">Target root<input id="task-root" required maxlength="500"></label>
-            <label class="field">Branch<input id="task-branch" required maxlength="200"></label>
-            <label class="field">Controller role<select id="task-controller" required></select></label>
-            <label class="field">Initial state<select id="task-status"><option>BACKLOG</option><option>READY</option><option>BLOCKED</option></select></label>
-            <label class="field field-wide"><span class="prompt-head"><span>Objective</span><button id="toggle-prompt-samples" type="button">Prompt samples</button></span><div id="prompt-samples" class="prompt-samples" hidden></div><textarea id="task-prompt" rows="2" required maxlength="12000"></textarea></label>
-            <details id="task-advanced" class="form-section" open>
-                <summary>Workflow and execution</summary>
-                <div class="form-section-grid">
-                    <section class="field-wide">
-                        <p class="section-label">Logical roles ? execution order</p>
-                        <div id="task-logical-order" class="role-order"></div>
-                        <div id="task-logical-available" class="available-roles"></div>
-                    </section>
-                    <section class="field-wide">
-                        <p class="section-label">Online browser targets</p>
-                        <div id="task-browser-targets" class="browser-targets"></div>
-                    </section>
-                    <section class="field-wide">
-                        <p class="section-label">Logical ? physical mapping</p>
-                        <div id="task-role-mapping" class="mapping-grid"></div>
-                    </section>
-                    <section class="field-wide">
-                        <p class="section-label">Execution options</p>
-                        <div class="execution-grid">
-                            <label class="field">Timeout<input id="task-timeout" type="number" min="1" max="86400" step="any" value="1800" required></label>
-                            <label class="field">Request timeout<input id="task-request-timeout" type="number" min="1" max="86400" step="any" value="1200" required></label>
-                            <label class="field">Parallelism<input id="task-parallelism" type="number" min="1" max="32" step="1" value="4" required></label>
-                            <label class="field">Max turns<input id="task-max-turns" type="number" min="0" max="100000" step="1" value="0" required></label>
-                            <label class="field">Reload after<input id="task-reload-after" type="number" min="0" max="3600" step="any" value="10" required></label>
-                        </div>
-                    </section>
-                    <section class="field-wide">
-                        <p class="section-label">Behavior toggles</p>
-                        <div class="toggle-grid">
-                            <div class="toggle-row"><div><strong>--new-chat-on-handoff</strong><small>Open a clean ChatGPT conversation when handoff policy permits.</small></div><button id="task-new-chat" class="toggle-button" type="button" aria-pressed="false">OFF</button></div>
-                            <div class="toggle-row"><div><strong>--handoff-command-policy always</strong><small>Always honor a valid HANDOFF block and command pair.</small></div><button id="task-handoff-always" class="toggle-button" type="button" aria-pressed="false">OFF</button></div>
-                        </div>
-                    </section>
-                    <section class="field-wide">
-                        <p class="section-label">Generated main.py command</p>
-                        <pre id="task-command-preview" class="command-preview"></pre>
-                    </section>
+        <div class="dialog-body">
+            <label class="field">
+                <span class="prompt-head"><span>Task prompt</span><button id="toggle-prompt-samples" type="button">Prompt samples</button></span>
+                <div id="prompt-samples" class="prompt-samples" hidden></div>
+                <textarea id="task-prompt" rows="2" maxlength="12000" placeholder="Describe the task..."></textarea>
+            </label>
+            <section>
+                <p class="section-label">Logical roles - execution order</p>
+                <div id="task-logical-order" class="role-order"></div>
+                <div id="task-logical-available" class="available-roles"></div>
+            </section>
+            <section>
+                <p class="section-label">Online browser targets</p>
+                <div id="task-browser-targets" class="browser-targets"></div>
+            </section>
+            <section>
+                <p class="section-label">Role mapping</p>
+                <div id="task-role-mapping" class="mapping-grid"></div>
+            </section>
+            <section>
+                <p class="section-label">Execution options</p>
+                <div class="options-grid">
+                    <label class="field">Timeout<input id="task-timeout" type="number" value="1800" min="1" max="86400"></label>
+                    <label class="field">Request timeout<input id="task-request-timeout" type="number" value="1200" min="1" max="86400"></label>
+                    <label class="field multi-role-option">Parallelism<input id="task-parallelism" type="number" value="4" min="1" max="32"></label>
+                    <label class="field multi-role-option">Max turns<input id="task-max-turns" type="number" value="0" min="0" max="100000"></label>
+                    <label class="field multi-role-option">Reload after<input id="task-reload-after" type="number" value="10" min="0" max="3600"></label>
                 </div>
-            </details>
-            <details id="task-scheduling" class="form-section">
-                <summary>Scheduling</summary>
-                <div class="form-section-grid">
-                    <label class="field">Schedule kind<select id="task-schedule-kind"><option value="manual">Manual</option><option value="once">One time</option><option value="interval">Interval minutes</option><option value="cron">Five-field cron</option></select></label>
-                    <label class="field schedule-field" data-schedule-field="once">Run at<input id="task-run-at" type="datetime-local"></label>
-                    <label class="field schedule-field" data-schedule-field="interval">Interval minutes<input id="task-minutes" type="number" min="1" step="1" value="15"></label>
-                    <label class="field schedule-field" data-schedule-field="interval">Start at<input id="task-start-at" type="datetime-local"></label>
-                    <label class="field schedule-field" data-schedule-field="cron">Cron expression<input id="task-cron" value="0 9 * * 1-5"></label>
-                    <label class="field schedule-field" data-schedule-field="cron">IANA timezone<input id="task-timezone" value="Asia/Tokyo"></label>
-                    <label class="filter-check field-wide"><input id="task-enabled" type="checkbox" checked> Scheduling enabled</label>
-                </div>
-            </details>
-            <details id="task-results" class="form-section" data-edit-only hidden>
-                <summary>Execution result</summary>
-                <div class="form-section-grid">
-                    <label class="field">Last result status<input id="task-result-status" maxlength="80"></label>
-                    <label class="field field-wide">Last result summary<textarea id="task-result-summary" maxlength="2000"></textarea></label>
-                    <label class="field field-wide">Blocker<textarea id="task-blocker" maxlength="2000"></textarea></label>
-                </div>
-            </details>
+            </section>
+            <section>
+                <p class="section-label">Generated command</p>
+                <pre id="task-command-preview" class="command-preview"></pre>
+                <div id="task-status" class="task-status" aria-live="polite"></div>
+            </section>
         </div>
         <footer class="dialog-actions">
-            <button type="button" data-close-dialog="task-dialog">Cancel</button>
-            <button class="primary" type="submit">Save task</button>
+            <button type="button" data-close-dialog="task-dialog">Close</button>
+            <button id="create-task" class="primary" type="submit">Create</button>
         </footer>
     </form>
-</dialog>
-
-<dialog id="task-detail" aria-labelledby="task-detail-title">
-    <header class="dialog-head">
-        <h2 id="task-detail-title">Task details</h2>
-        <button class="quiet" type="button" data-close-dialog="task-detail" aria-label="Close task details">Close</button>
-    </header>
-    <div id="task-detail-body" class="dialog-body detail-grid"></div>
 </dialog>
 
 <script>
 (() => {
     'use strict';
-    const DASHBOARD_CONTRACT_VERSION = 9;
-    const STATES = ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'BLOCKED', 'DONE'];
-    const MOVE_MATRIX = {
-        BACKLOG: ['READY', 'BLOCKED'],
-        READY: ['BACKLOG', 'RUNNING', 'BLOCKED'],
-        RUNNING: ['REVIEW', 'BLOCKED', 'DONE'],
-        REVIEW: ['RUNNING', 'BLOCKED', 'DONE'],
-        BLOCKED: ['BACKLOG', 'READY', 'RUNNING', 'REVIEW', 'DONE'],
-        DONE: ['BACKLOG', 'READY']
-    };
-
+    const DASHBOARD_CONTRACT_VERSION = 12;
     const BASE_LOGICAL_ROLES = ['MANAGER', 'PLAN', 'DEV', 'REVIEW', 'AUDIT', 'A', 'B'];
     const DEFAULT_EXECUTION_OPTIONS = {
         timeout: 1800,
         request_timeout: 1200,
         parallelism: 4,
         max_turns: 0,
-        reload_after: 10,
-        new_chat_on_handoff: false,
-        handoff_command_policy: 'auto'
+        reload_after: 10
     };
     const PROMPT_SAMPLES = [
-        ['Plan → DEV → REVIEW', 'Create an implementation plan, hand it to DEV, then have REVIEW verify the implementation and return blockers first.'],
-        ['Review current changes', 'Review the current repository changes for bugs, regressions, security issues, and missing tests. Return blockers first.'],
-        ['Continue exact plan', 'Read the exact .plan file provided, continue the authorized work, verify the result, and report the final status.']
+        ['Plan -> DEV -> REVIEW', 'Create a plan, implement it, then review the exact changes and tests.'],
+        ['Review current changes', 'Review the current repository changes and return blockers first.'],
+        ['Continue exact plan', 'Read the exact .plan handoff, continue only the authorized work, and verify it.']
     ];
+    const ROLE_DATA_TTL_MS = 5000;
+    const TIMELINE_LIMIT = 30;
 
-    let lastGoodTasks = [];
-    let lastGoodTaskMeta = null;
     let lastGoodRoles = [];
     let lastGoodFlow = null;
     let lastGoodRoleDetail = null;
     let lastGoodRoleEvents = [];
-    let lastGoodScheduler = null;
     let lastSuccessfulAt = 0;
     let refreshInFlight = false;
-    let sourceStale = { tasks: true, roles: true, flow: true, events: true };
-    let draggedTaskId = '';
+    let sourceStale = { roles: true, flow: true, events: true };
     let selectedRole = '';
     let selectedRoleRefreshGeneration = 0;
     let focusNewestResponse = true;
+    const roleDataCache = new Map();
+    const roleDataInflight = new Map();
+    const roleCardNodes = new Map();
+    const roleCardKeys = new Map();
+    let selectedRoleRenderKey = '';
+    let timelineRenderKey = '';
     let editorOriginRole = '';
-    let editorControllerRole = '';
     let editorLogicalOrder = [];
     let editorRoleMap = {};
-    let editorBehavior = { newChat: false, handoffAlways: false };
 
     const byId = (id) => document.getElementById(id);
-    const setText = (target, value) => { target.textContent = value == null ? '' : String(value); };
+    const setText = (target, value) => {
+        const text = value == null ? '' : String(value);
+        if (target.textContent !== text) target.textContent = text;
+    };
     const clearNode = (target) => { while (target.firstChild) target.removeChild(target.firstChild); };
     const textNode = (tag, value, className = '') => {
         const element = document.createElement(tag);
@@ -625,313 +405,103 @@
         setText(element, value);
         return element;
     };
-    const normalizeList = (value) => String(value || '').split(',').map((item) => item.trim().toUpperCase()).filter(Boolean);
     const onlineRoles = () => lastGoodRoles.filter((role) => role.online === true);
+    const visibleRoles = () => lastGoodRoles.filter((role) => (
+        role.online === true || ['OFFLINE', 'STALE'].includes(String(role.status || '').toUpperCase())
+    ));
     const roleByName = (roleName) => lastGoodRoles.find((role) => role.role === roleName);
-    const formatRoleAge = (seconds) => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function formatRoleAge(seconds) {
         if (seconds == null || !Number.isFinite(Number(seconds))) return 'unknown';
         const value = Math.max(0, Math.round(Number(seconds)));
         if (value < 60) return `${value}s`;
         if (value < 3600) return `${Math.floor(value / 60)}m`;
         return `${Math.floor(value / 3600)}h`;
-    };
-    const chatPath = (role) => String(role?.page_path || '');
-    const chatHref = (role) => chatPath(role).startsWith('/') ? `https://chatgpt.com${chatPath(role)}` : 'https://chatgpt.com/';
-    const shortConversationId = (role) => {
+    }
+
+    function chatPath(role) { return String(role?.page_path || ''); }
+    function shortConversationId(role) {
         const path = chatPath(role);
         const match = path.match(/^\/c\/([^/?#]+)/);
         return match ? match[1].slice(0, 12) : (path === '/' ? 'new chat' : 'unobserved');
-    };
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const taskById = (taskId) => lastGoodTasks.find((task) => task.task_id === taskId);
-    const isoFromLocal = (value) => value ? new Date(value).toISOString() : '';
-    const localFromIso = (value) => {
-        if (!value) return '';
-        const date = new Date(value);
-        const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
-        return local.toISOString().slice(0, 16);
-    };
-    const formatAge = (timestamp) => {
-        if (!timestamp) return 'never';
-        const seconds = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000));
-        if (seconds < 60) return `${seconds}s`;
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-        if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-        return `${Math.floor(seconds / 86400)}d`;
-    };
-    const scheduleLabel = (task) => {
-        const schedule = task.schedule || { kind: 'manual' };
-        if (schedule.kind === 'manual') return 'manual';
-        if (schedule.kind === 'once') return `once · ${task.next_run_at || 'complete'}`;
-        if (schedule.kind === 'interval') return `every ${schedule.minutes}m`;
-        return `${schedule.expression} · ${schedule.timezone}`;
-    };
+    }
 
     async function readJson(response) {
         const body = await response.json().catch(() => ({}));
         if (response.ok) return body;
-        const error = new Error(body.detail?.message || body.detail?.code || `Request failed: ${response.status}`);
+        const detail = typeof body.detail === 'string' ? body.detail : (body.detail?.message || body.detail?.code);
+        const error = new Error(detail || `Request failed: ${response.status}`);
         error.status = response.status;
-        error.body = body;
-        if (response.status === 409) error.conflict = true;
         throw error;
     }
 
-    async function fetchTasks() {
-        const response = await fetch('/api/admin/tasks?include_archived=true');
-        return readJson(response);
-    }
-    async function fetchRoles() {
-        const response = await fetch('/api/admin/roles');
-        return readJson(response);
-    }
-    async function fetchFlow() {
-        const response = await fetch('/api/admin/flow');
-        return readJson(response);
-    }
+    async function fetchRoles() { return readJson(await fetch('/api/admin/roles')); }
+    async function fetchFlow() { return readJson(await fetch('/api/admin/flow')); }
     async function fetchRoleDetail(role) {
-        const response = await fetch(`/api/admin/role/${encodeURIComponent(role)}`);
-        return readJson(response);
+        return readJson(await fetch(`/api/admin/role/${encodeURIComponent(role)}?response_limit=10`));
     }
     async function fetchRoleEvents(role) {
-        const response = await fetch(`/api/admin/role/${encodeURIComponent(role)}/timeline?limit=100`);
-        return readJson(response);
-    }
-
-    async function retainEditsOnConflict(error) {
-        const notice = byId('conflict-notice');
-        notice.hidden = false;
-        setText(notice, `Revision conflict: ${error.message}. Your editor values remain unchanged; compare them with the refreshed task before retrying.`);
-        await refreshDashboard();
-        const editingTaskId = byId('task-id').value;
-        const latest = editingTaskId ? taskById(editingTaskId) : null;
-        if (latest && byId('task-dialog').open) byId('task-revision').value = latest.revision;
-    }
-
-    async function mutate(url, options) {
-        const response = await fetch(url, {
-            ...options,
-            headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
-        });
-        try {
-            const body = await readJson(response);
-            byId('conflict-notice').hidden = true;
-            await refreshDashboard();
-            return body;
-        } catch (error) {
-            if (error.conflict) await retainEditsOnConflict(error);
-            else announceError(error.message);
-            throw error;
-        }
-    }
-
-    function announceError(message) {
-        const notice = byId('connection-notice');
-        notice.hidden = false;
-        setText(notice, message || 'Dashboard request failed. Retaining last good dashboard data.');
-    }
-
-    function filteredTasks() {
-        const text = byId('filter-text').value.trim().toLowerCase();
-        const controller = byId('filter-controller').value;
-        const repository = byId('filter-repository').value;
-        const status = byId('filter-status').value;
-        const schedule = byId('filter-schedule').value;
-        const showArchived = byId('filter-archived').checked;
-        return lastGoodTasks.filter((task) => {
-            if (!showArchived && task.archived_at) return false;
-            if (controller && task.controller_role !== controller) return false;
-            if (repository && task.target_root !== repository) return false;
-            if (status && task.status !== status) return false;
-            if (schedule === 'manual' && task.schedule?.kind !== 'manual') return false;
-            if (schedule === 'scheduled' && task.schedule?.kind === 'manual') return false;
-            if (text) {
-                const haystack = [task.title, task.prompt, task.target_root, task.branch, task.controller_role, task.last_result_summary, task.blocker].join(' ').toLowerCase();
-                if (!haystack.includes(text)) return false;
-            }
-            return true;
-        });
-    }
-
-    function addTag(container, value, alert = false) {
-        const tag = textNode('span', value, 'tag');
-        if (alert) tag.dataset.alert = 'true';
-        container.appendChild(tag);
-    }
-
-    function cardForTask(task) {
-        const card = byId('task-card-template').content.firstElementChild.cloneNode(true);
-        card.dataset.taskId = task.task_id;
-        card.addEventListener('dragstart', (event) => {
-            draggedTaskId = task.task_id;
-            card.setAttribute('aria-grabbed', 'true');
-            event.dataTransfer.setData('text/plain', task.task_id);
-            event.dataTransfer.effectAllowed = 'move';
-        });
-        card.addEventListener('dragend', () => {
-            draggedTaskId = '';
-            card.setAttribute('aria-grabbed', 'false');
-        });
-
-        const title = card.querySelector('.task-title');
-        setText(title, task.title);
-        title.addEventListener('click', () => openDetails(task.task_id));
-        setText(card.querySelector('.task-path'), `${task.target_root} · ${task.branch}`);
-        const meta = card.querySelector('.task-meta');
-        addTag(meta, task.controller_role);
-        addTag(meta, task.logical_roles.join(' → '));
-        addTag(meta, scheduleLabel(task));
-        if (task.next_run_at) addTag(meta, `next ${task.next_run_at}`);
-        addTag(meta, `rev ${task.revision}`);
-        if (!task.enabled) addTag(meta, 'PAUSED', true);
-        if (task.active_request_id) addTag(meta, task.active_request_id, true);
-        if (task.wake?.state && task.wake.state !== 'IDLE') addTag(meta, `WAKE ${task.wake.state}`, ['UNCERTAIN', 'SENT'].includes(task.wake.state));
-        addTag(meta, `updated ${formatAge(task.updated_at)} ago`);
-
-        const note = card.querySelector('.task-note');
-        const noteValue = task.blocker || task.last_result_summary || task.wake?.error || '';
-        note.hidden = !noteValue;
-        setText(note, noteValue);
-
-        const archived = Boolean(task.archived_at);
-        const runButton = card.querySelector('.run-action');
-        runButton.disabled = archived || task.status !== 'READY' || !task.enabled || !['IDLE', 'DEFERRED'].includes(task.wake?.state || 'IDLE');
-        runButton.addEventListener('click', () => wakeTask(task.task_id));
-
-        const pauseButton = card.querySelector('.pause-action');
-        setText(pauseButton, task.enabled ? 'Pause' : 'Resume');
-        pauseButton.disabled = archived;
-        pauseButton.addEventListener('click', () => task.enabled ? pauseTask(task.task_id) : resumeTask(task.task_id));
-
-        const editButton = card.querySelector('.edit-action');
-        editButton.disabled = archived;
-        editButton.addEventListener('click', () => openEditor(task.task_id));
-        const resolveSent = card.querySelector('.resolve-sent');
-        const resolveNotSent = card.querySelector('.resolve-not-sent');
-        const uncertain = task.wake?.state === 'UNCERTAIN' && !archived;
-        resolveSent.hidden = !uncertain;
-        resolveNotSent.hidden = !uncertain;
-        resolveSent.addEventListener('click', () => resolveWake(task.task_id, 'sent'));
-        resolveNotSent.addEventListener('click', () => resolveWake(task.task_id, 'not_sent'));
-        const move = card.querySelector('.move-select');
-        move.appendChild(new Option('Move…', ''));
-        for (const destination of MOVE_MATRIX[task.status] || []) move.appendChild(new Option(destination, destination));
-        move.disabled = archived;
-        move.addEventListener('change', () => {
-            const destination = move.value;
-            move.value = '';
-            if (destination) moveTask(task.task_id, destination);
-        });
-
-        const archive = card.querySelector('.archive-action');
-        archive.hidden = task.status !== 'DONE' || archived;
-        archive.addEventListener('click', () => archiveTask(task.task_id));
-        return card;
-    }
-
-    function renderBoard() {
-        const hasTasks = lastGoodTasks.length > 0;
-        const taskWorkspace = byId('task-workspace');
-        const noTasksState = byId('no-tasks-state');
-        taskWorkspace.hidden = !hasTasks;
-        noTasksState.hidden = hasTasks;
-        const tasks = hasTasks ? filteredTasks() : [];
-        for (const state of STATES) {
-            const column = byId(`column-${state}`);
-            clearNode(column);
-            const matches = tasks.filter((task) => task.status === state);
-            setText(byId(`count-${state}`), matches.length);
-            for (const task of matches) column.appendChild(cardForTask(task));
-        }
-    }
-
-    function addDefinition(list, label, value) {
-        list.appendChild(textNode('dt', label));
-        list.appendChild(textNode('dd', value == null || value === '' ? 'not available' : value));
-    }
-
-    function compactJson(value, limit = 360) {
-        if (value == null) return '';
-        const text = typeof value === 'string' ? value : JSON.stringify(value);
-        return text.length > limit ? `${text.slice(0, limit)}...` : text;
+        return readJson(await fetch(`/api/admin/role/${encodeURIComponent(role)}/timeline?limit=${TIMELINE_LIMIT}`));
     }
 
     function roleState(role) {
+        if (!role?.online) return String(role?.status || 'OFFLINE').toUpperCase() === 'STALE' ? 'STALE' : 'OFFLINE';
         if (role.current_flow_state) return String(role.current_flow_state).toUpperCase();
         if (role.active_command) return String(role.active_command.state || role.active_command.action || 'ACTIVE').toUpperCase();
         return 'IDLE';
     }
 
     function stateTone(state) {
-        if (['RUNNING', 'ONLINE'].includes(state)) return 'good';
-        if (['WAITING', 'DELIVERED', 'PENDING'].includes(state)) return 'warn';
-        if (['FAILED', 'STALLED', 'OFFLINE'].includes(state)) return 'bad';
+        const normalized = String(state || '').toUpperCase();
+        if (['RUNNING', 'ONLINE', 'DONE', 'RESPONSE'].includes(normalized)) return 'good';
+        if (['WAITING', 'DELIVERED', 'PENDING', 'COMMAND'].includes(normalized)) return 'warn';
+        if (['FAILED', 'STALLED', 'OFFLINE', 'STALE', 'ERROR'].includes(normalized)) return 'bad';
         return '';
     }
 
     function showRoleNotice(message, error = false) {
         const notice = byId('role-action-notice');
+        setText(notice, message);
         notice.hidden = !message;
         notice.dataset.kind = error ? 'error' : '';
-        setText(notice, message);
     }
 
-    async function refreshSelectedRoleData() {
-        const requestedRole = selectedRole;
-        const generation = ++selectedRoleRefreshGeneration;
-        if (!requestedRole) {
-            lastGoodRoleDetail = null;
-            lastGoodRoleEvents = [];
-            sourceStale.events = false;
-            return;
-        }
-        const results = await Promise.allSettled([fetchRoleDetail(requestedRole), fetchRoleEvents(requestedRole)]);
-        if (generation !== selectedRoleRefreshGeneration || requestedRole !== selectedRole) return;
-        if (results[0].status === 'fulfilled' && results[0].value.role === requestedRole) {
-            lastGoodRoleDetail = results[0].value;
-        }
-        if (results[1].status === 'fulfilled') {
-            const payload = results[1].value || {};
-            const events = Array.isArray(payload.events) ? payload.events : [];
-            const exactRole = payload.role === requestedRole && events.every((event) => event?.role === requestedRole);
-            lastGoodRoleEvents = exactRole ? events : [];
-            sourceStale.events = !exactRole;
-        } else {
-            sourceStale.events = true;
-        }
+    function compactJson(value, limit = 800) {
+        const text = JSON.stringify(value || {}, null, 2);
+        return text.length > limit ? `${text.slice(0, limit)}...` : text;
     }
 
-    async function selectRole(roleName) {
-        if (selectedRole !== roleName) {
-            focusNewestResponse = true;
-            lastGoodRoleDetail = null;
-            lastGoodRoleEvents = [];
-        }
-        selectedRole = roleName;
-        showRoleNotice('');
-        await refreshSelectedRoleData();
-        renderRoles();
-        renderSelectedRole();
-        renderEvents();
+    function addDefinition(container, label, value) {
+        container.appendChild(textNode('dt', label));
+        container.appendChild(textNode('dd', value));
+    }
+
+    function addMetric(container, label, value, tone = '') {
+        const metric = document.createElement('div');
+        metric.className = 'role-metric';
+        metric.appendChild(textNode('span', label));
+        const strong = textNode('strong', value);
+        if (tone) strong.dataset.tone = tone;
+        metric.appendChild(strong);
+        container.appendChild(metric);
+        return strong;
     }
 
     function commandTerminalOutcome(action, terminal) {
+        const expected = { CLEAR_COMPOSER_TEXT: 'COMPOSER_TEXT_CLEARED', RELOAD_PAGE: 'PAGE_RELOADING' };
         const normalizedAction = String(action || '').toUpperCase();
         const normalizedTerminal = String(terminal || '').toUpperCase();
-        const expected = {
-            CLEAR_COMPOSER_TEXT: 'COMPOSER_TEXT_CLEARED',
-            RELOAD_PAGE: 'PAGE_RELOADING'
-        };
-        const expectedTerminal = expected[normalizedAction] || '';
-        return {
-            ok: Boolean(expectedTerminal && normalizedTerminal === expectedTerminal),
-            terminal: normalizedTerminal || 'UNKNOWN',
-            expected: expectedTerminal
-        };
+        return { ok: expected[normalizedAction] === normalizedTerminal, terminal: normalizedTerminal || 'UNKNOWN' };
     }
 
     async function runRoleCommand(roleName, action) {
         const label = action === 'CLEAR_COMPOSER_TEXT' ? 'Clear txt' : 'F5';
+        const role = roleByName(roleName);
+        if (!role?.online) {
+            showRoleNotice(`${roleName}: ${label} rejected because the Tamper bridge is offline.`, true);
+            return;
+        }
         try {
             const body = await readJson(await fetch('/api/admin/command', {
                 method: 'POST',
@@ -940,87 +510,231 @@
             }));
             const commandId = body.command?.command_id;
             if (!commandId) throw new Error('Server did not return a command ID.');
-            showRoleNotice(`${roleName}: ${label} queued (${commandId}).`);
+            showRoleNotice(`${roleName}: ${label} queued.`);
             for (let attempt = 0; attempt < 60; attempt += 1) {
-                await sleep(500);
+                await sleep(250);
                 const status = await readJson(await fetch(`/api/admin/command/${encodeURIComponent(commandId)}`));
                 if (!status.done) continue;
-                const terminal = status.result?.state || status.status || 'UNKNOWN';
-                const outcome = commandTerminalOutcome(action, terminal);
-                const suffix = outcome.ok ? '' : ` Expected ${outcome.expected || 'an action-specific success state'}.`;
-                showRoleNotice(`${roleName}: ${outcome.terminal}.${suffix}`, !outcome.ok);
-                await refreshDashboard();
+                const result = commandTerminalOutcome(action, status.status || status.result?.state);
+                showRoleNotice(`${roleName}: ${label} ${result.ok ? 'completed' : `failed (${result.terminal})`}.`, !result.ok);
+                await refreshDashboard({ forceRole: true });
                 return;
             }
-            showRoleNotice(`${roleName}: ${label} command is still pending; inspect command ${commandId}.`, true);
+            showRoleNotice(`${roleName}: ${label} status timed out.`, true);
         } catch (error) {
-            showRoleNotice(`${roleName}: ${label} failed — ${error.message}`, true);
+            showRoleNotice(`${roleName}: ${label} failed: ${error.message}`, true);
         }
     }
 
-    function roleCard(role) {
-        const card = document.createElement('article');
-        card.className = `role-card selectable${role.role === selectedRole ? ' selected' : ''}`;
-        card.tabIndex = 0;
-        card.dataset.role = role.role;
-        card.addEventListener('click', () => selectRole(role.role));
-        card.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                selectRole(role.role);
-            }
+    function applyRoleCache(roleName) {
+        const cached = roleDataCache.get(roleName);
+        if (!cached || roleName !== selectedRole) return false;
+        lastGoodRoleDetail = cached.detail || null;
+        lastGoodRoleEvents = cached.events || [];
+        sourceStale.events = Boolean(cached.stale);
+        return true;
+    }
+
+    async function refreshSelectedRoleData(options) {
+        const force = Boolean(options && options.force);
+        const requestedRole = selectedRole;
+        if (!requestedRole) {
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+            return false;
+        }
+        const cached = roleDataCache.get(requestedRole);
+        if (cached) applyRoleCache(requestedRole);
+        if (!force && cached && Date.now() - cached.fetchedAt < ROLE_DATA_TTL_MS) return false;
+        if (roleDataInflight.has(requestedRole)) {
+            await roleDataInflight.get(requestedRole);
+            applyRoleCache(requestedRole);
+            return false;
+        }
+
+        const generation = ++selectedRoleRefreshGeneration;
+        const request = Promise.allSettled([
+            fetchRoleDetail(requestedRole),
+            fetchRoleEvents(requestedRole)
+        ]).then(([detailResult, timelineResult]) => {
+            const previous = roleDataCache.get(requestedRole) || {};
+            const detail = detailResult.status === 'fulfilled' && detailResult.value.role === requestedRole
+                ? detailResult.value
+                : previous.detail || null;
+            const timelineValid = (
+                timelineResult.status === 'fulfilled'
+                && timelineResult.value.role === requestedRole
+                && (timelineResult.value.events || []).every((event) => event.role === requestedRole)
+            );
+            roleDataCache.set(requestedRole, {
+                detail,
+                events: timelineValid ? timelineResult.value.events || [] : previous.events || [],
+                fetchedAt: Date.now(),
+                stale: detailResult.status !== 'fulfilled' || !timelineValid
+            });
+        }).finally(() => roleDataInflight.delete(requestedRole));
+        roleDataInflight.set(requestedRole, request);
+        await request;
+        if (generation !== selectedRoleRefreshGeneration || requestedRole !== selectedRole) return false;
+        return applyRoleCache(requestedRole);
+    }
+
+    async function selectRole(roleName) {
+        if (selectedRole === roleName) return;
+        selectedRole = roleName;
+        focusNewestResponse = true;
+        if (!applyRoleCache(roleName)) {
+            lastGoodRoleDetail = null;
+            lastGoodRoleEvents = [];
+        }
+        showRoleNotice('');
+        renderRoles();
+        renderSelectedRole();
+        renderEvents();
+        await refreshSelectedRoleData();
+        renderSelectedRole();
+        renderEvents();
+        renderHealth();
+    }
+
+    function roleCardSignature(role) {
+        const dom = role.dom_summary || {};
+        const command = role.active_command || {};
+        return [
+            role.role,
+            role.configured_role || '',
+            role.online ? '1' : '0',
+            role.status || '',
+            role.current_logical_role || '',
+            role.current_flow_state || '',
+            Number(role.turn || 0),
+            role.page_path || '',
+            dom.composer ? '1' : '0',
+            Number(dom.composer_text_len || 0),
+            Number(dom.composer_attachment_count || 0),
+            command.action || '',
+            command.state || ''
+        ].join('\u001f');
+    }
+    function selectedRoleSignature() {
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        const inventory = roleByName(selectedRole);
+        const dom = detail?.observation?.dom_info || {};
+        return JSON.stringify({
+            selectedRole,
+            inventory: inventory ? {
+                role: inventory.role,
+                configured_role: inventory.configured_role,
+                online: inventory.online,
+                status: inventory.status,
+                page_path: inventory.page_path,
+                current_logical_role: inventory.current_logical_role,
+                current_flow_state: inventory.current_flow_state,
+                current_task_id: inventory.current_task_id,
+                reservation_state: inventory.reservation_state,
+                active_command: inventory.active_command,
+                dom_summary: inventory.dom_summary
+            } : null,
+            detail: detail ? {
+                configured_role: detail.configured_role,
+                current_logical_role: detail.current_logical_role,
+                turn: detail.turn,
+                responses: detail.responses,
+                message_counts: detail.message_counts,
+                current_task_id: detail.current_task_id,
+                current_request_id: detail.current_request_id,
+                flow_status: detail.flow_status,
+                last_user: detail.observation?.last_user || detail.last_user,
+                composer: {
+                    ready: dom.composer,
+                    text_len: dom.composer_text_len,
+                    attachments: Array.isArray(dom.composer_attachments) ? dom.composer_attachments.length : 0
+                },
+                active_command: detail.active_command
+            } : null
         });
+    }
+
+    function timelineSignature() {
+        return JSON.stringify({ selectedRole, events: lastGoodRoleEvents });
+    }
+
+    function updateAgeLabels() {
+        for (const node of document.querySelectorAll('[data-role-age]')) {
+            const role = roleByName(node.dataset.roleAge);
+            if (role) setText(node, `seen ${formatRoleAge(role.last_seen_age_s)}`);
+        }
+        const selectedAge = byId('selected-role-age');
+        const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
+        if (selectedAge && detail) setText(selectedAge, formatRoleAge(detail.presence?.last_seen_age_s));
+    }
+
+    function roleCard(role) {
+        const stateName = roleState(role);
+        const tone = stateTone(stateName);
+        const card = document.createElement('article');
+        card.className = 'role-card';
+        card.dataset.role = role.role;
+        card.dataset.statusTone = tone;
+        card.classList.toggle('selected', role.role === selectedRole);
+        card.addEventListener('click', () => selectRole(role.role));
 
         const head = document.createElement('div');
-        head.className = 'role-head';
-        const heading = document.createElement('div');
+        head.className = 'role-card-head';
+        const title = document.createElement('div');
+        title.className = 'role-card-title';
+        const h3 = document.createElement('h3');
         const link = document.createElement('a');
         link.className = 'role-title-link';
-        link.href = chatHref(role);
+        link.href = chatPath(role).startsWith('/') ? `https://chatgpt.com${chatPath(role)}` : 'https://chatgpt.com/';
         link.target = '_blank';
         link.rel = 'noreferrer';
         setText(link, `${role.role} · ${role.configured_role || role.role} ↗`);
         link.addEventListener('click', (event) => event.stopPropagation());
-        heading.appendChild(link);
-        heading.appendChild(textNode('div', `logical ${role.current_logical_role || 'idle'}`, 'role-subtitle'));
-        head.appendChild(heading);
-        const state = textNode('span', roleState(role), 'role-state');
-        state.dataset.tone = stateTone(roleState(role));
+        h3.appendChild(link);
+        title.appendChild(h3);
+        title.appendChild(textNode('div', role.online ? 'live evidence' : 'cached evidence', 'role-evidence'));
+        head.appendChild(title);
+        const state = textNode('span', stateName, 'role-state');
+        state.dataset.tone = tone;
         head.appendChild(state);
         card.appendChild(head);
 
         const meta = document.createElement('div');
-        meta.className = 'role-meta';
-        addTag(meta, `turn ${Number(role.turn || 0)}`);
-        addTag(meta, `seen ${formatRoleAge(role.last_seen_age_s)}`);
-        if (role.current_task_id) addTag(meta, `task ${role.current_task_id}`, true);
+        meta.className = 'role-card-meta';
+        meta.appendChild(textNode('span', `logical ${role.current_logical_role || 'idle'}`));
+        meta.appendChild(textNode('span', `turn ${Number(role.turn || 0)}`));
+        const age = textNode('span', `seen ${formatRoleAge(role.last_seen_age_s)}`);
+        age.dataset.roleAge = role.role;
+        meta.appendChild(age);
         card.appendChild(meta);
-        card.appendChild(textNode('div', `${role.role} — ${shortConversationId(role)}`, 'role-chat-id'));
+        card.appendChild(textNode('div', `${role.role} · ${shortConversationId(role)}`, 'role-chat'));
 
         const dom = role.dom_summary || {};
         const composer = document.createElement('div');
         composer.className = 'role-composer';
-        composer.appendChild(document.createTextNode('Composer: '));
-        const composerValue = document.createElement('strong');
-        composerValue.dataset.ready = String(Boolean(dom.composer));
-        setText(composerValue, dom.composer
-            ? `ready · ${Number(dom.composer_text_len || 0)} chars · ${Number(dom.composer_attachment_count || 0)} files`
-            : 'not observed');
-        composer.appendChild(composerValue);
+        composer.appendChild(textNode('span', role.online ? 'composer' : 'composer · cached'));
+        composer.appendChild(textNode('strong', dom.composer
+            ? `ready · ${Number(dom.composer_text_len || 0)}c · ${Number(dom.composer_attachment_count || 0)}f`
+            : 'not observed'));
         card.appendChild(composer);
 
         const actions = document.createElement('div');
         actions.className = 'role-card-actions';
         const clearButton = textNode('button', 'Clear txt');
         clearButton.type = 'button';
-        clearButton.disabled = !dom.composer || Number(dom.composer_text_len || 0) === 0;
+        clearButton.title = 'Clear composer text';
+        clearButton.disabled = !role.online || !dom.composer || Number(dom.composer_text_len || 0) === 0;
         clearButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'CLEAR_COMPOSER_TEXT'); });
         const reloadButton = textNode('button', 'F5');
         reloadButton.type = 'button';
+        reloadButton.title = 'Reload role page';
+        reloadButton.disabled = !role.online;
         reloadButton.addEventListener('click', (event) => { event.stopPropagation(); runRoleCommand(role.role, 'RELOAD_PAGE'); });
         const taskButton = textNode('button', '+ task', 'primary');
         taskButton.type = 'button';
-        taskButton.addEventListener('click', (event) => { event.stopPropagation(); openNewTask(role.role); });
+        taskButton.title = 'Create task for this controller';
+        taskButton.addEventListener('click', (event) => { event.stopPropagation(); openTaskComposer(role.role); });
         actions.append(clearButton, reloadButton, taskButton);
         card.appendChild(actions);
         return card;
@@ -1028,64 +742,120 @@
 
     function renderRoles() {
         const rail = byId('role-rail');
-        clearNode(rail);
-        const roles = onlineRoles();
+        const roles = visibleRoles();
         setText(byId('role-count'), roles.length);
+
         if (!roles.length) {
-            rail.appendChild(textNode('div', 'No online physical browser roles.', 'role-empty'));
+            if (rail.dataset.empty !== 'true') {
+                clearNode(rail);
+                roleCardNodes.clear();
+                roleCardKeys.clear();
+                rail.appendChild(textNode('div', 'No operational browser roles.', 'role-empty'));
+                rail.dataset.empty = 'true';
+            }
             return;
         }
-        for (const role of roles) rail.appendChild(roleCard(role));
-    }
 
-    function addMetric(container, label, value, tone = '') {
-        const metric = document.createElement('div');
-        metric.className = 'role-metric';
-        if (tone) metric.dataset.tone = tone;
-        metric.appendChild(textNode('span', label));
-        metric.appendChild(textNode('strong', value));
-        container.appendChild(metric);
+        if (rail.dataset.empty === 'true') {
+            clearNode(rail);
+            rail.dataset.empty = 'false';
+        }
+
+        const activeRoles = new Set(roles.map((role) => role.role));
+        for (const [roleName, card] of roleCardNodes) {
+            if (activeRoles.has(roleName)) continue;
+            card.remove();
+            roleCardNodes.delete(roleName);
+            roleCardKeys.delete(roleName);
+        }
+
+        const orderedCards = [];
+        for (const role of roles) {
+            const key = roleCardSignature(role);
+            let card = roleCardNodes.get(role.role);
+            if (!card || roleCardKeys.get(role.role) !== key) {
+                const replacement = roleCard(role);
+                if (card) card.replaceWith(replacement);
+                else rail.appendChild(replacement);
+                card = replacement;
+                roleCardNodes.set(role.role, card);
+                roleCardKeys.set(role.role, key);
+            }
+            card.classList.toggle('selected', role.role === selectedRole);
+            orderedCards.push(card);
+        }
+
+        let cursor = rail.firstElementChild;
+        for (const card of orderedCards) {
+            if (card === cursor) cursor = cursor.nextElementSibling;
+            else rail.insertBefore(card, cursor);
+        }
+        updateAgeLabels();
+    }
+    function latestTaskText(raw) {
+        const text = String(raw || '').trim();
+        if (!text) return '';
+        for (const marker of ['GOAL', 'INSTRUCTION_FROM_CALLER', 'USER_PROMPT']) {
+            const expression = new RegExp(`(?:^|\\n)${marker}:\\s*\\n([\\s\\S]*?)(?=\\n[A-Z][A-Z0-9_ ]*:\\s*\\n|$)`);
+            const match = text.match(expression);
+            if (match?.[1]?.trim()) return match[1].trim();
+        }
+        return text;
     }
 
     function renderSelectedRole() {
+        const renderKey = selectedRoleSignature();
+        if (renderKey === selectedRoleRenderKey) {
+            updateAgeLabels();
+            return;
+        }
+        selectedRoleRenderKey = renderKey;
         const detail = lastGoodRoleDetail && lastGoodRoleDetail.role === selectedRole ? lastGoodRoleDetail : null;
         const inventory = roleByName(selectedRole);
         const metrics = byId('role-metrics');
         const definitions = byId('selected-role-detail');
         const responses = byId('role-responses');
+        const previousResponseTop = responses.scrollTop;
+        const responseWasNearBottom = responses.scrollHeight - responses.scrollTop - responses.clientHeight < 32;
         clearNode(metrics);
         clearNode(definitions);
         clearNode(responses);
         if (!selectedRole || !inventory || !detail) {
-            setText(byId('role-detail-title'), selectedRole ? `${selectedRole} · loading` : 'No online role selected');
+            setText(byId('role-detail-title'), selectedRole ? `${selectedRole} · loading` : 'No role selected');
             setText(byId('selected-role-state'), selectedRole ? 'LOADING' : 'OFFLINE');
+            setText(byId('current-task-progress'), 'not observed');
+            setText(byId('current-task-text'), 'No task observed.');
             setText(byId('response-count'), 0);
-            responses.appendChild(textNode('div', 'No selected-role response evidence.', 'role-empty'));
+            responses.appendChild(textNode('div', 'No response evidence.', 'role-empty'));
             return;
         }
+
         const state = roleState(inventory);
-        setText(byId('role-detail-title'), `${detail.role} · ${detail.configured_role} — logical ${detail.current_logical_role || 'idle'}`);
+        setText(byId('role-detail-title'), `${detail.role} · ${detail.configured_role} - logical ${detail.current_logical_role || 'idle'}`);
         const statePill = byId('selected-role-state');
         setText(statePill, state);
         statePill.dataset.tone = stateTone(state);
         const dom = detail.observation?.dom_info || {};
+        const counts = detail.message_counts || {};
         addMetric(metrics, 'Status', state, stateTone(state));
         addMetric(metrics, 'Turn', Number(detail.turn || 0));
-        addMetric(metrics, 'Last seen', formatRoleAge(detail.presence?.last_seen_age_s));
+        const selectedAge = addMetric(metrics, 'Last seen', formatRoleAge(detail.presence?.last_seen_age_s));
+        selectedAge.id = 'selected-role-age';
         addMetric(metrics, 'Composer', `${Number(dom.composer_text_len || 0)} chars`);
-        addDefinition(definitions, 'Task / request', `${detail.current_task_id || 'none'} · ${detail.current_request_id || 'none'}`);
-        addDefinition(definitions, 'Chat', `${detail.role} — ${shortConversationId(inventory)} · ${inventory.page_path || 'unobserved'}`);
-        const counts = detail.message_counts || {};
+
+        const currentTask = latestTaskText(detail.observation?.last_user || detail.last_user);
+        setText(byId('current-task-progress'), `user ${Number(counts.user || 0)} · assistant ${Number(counts.assistant || 0)} · ${state}`);
+        setText(byId('current-task-text'), currentTask || 'No task observed.');
+
+        addDefinition(definitions, 'Chat', `${detail.role} - ${shortConversationId(inventory)} · ${inventory.page_path || 'unobserved'}`);
+        addDefinition(definitions, 'Flow', flowStatusLine(detail.flow_status));
         addDefinition(definitions, 'Messages', `user ${Number(counts.user || 0)} · assistant ${Number(counts.assistant || 0)} · images ${Number(counts.images || 0)}`);
-        addDefinition(definitions, 'Observation', detail.observation?.page_instance_id ? `${detail.observation.page_instance_id} · seq ${Number(detail.observation.observation_seq || 0)}` : 'none');
         addDefinition(definitions, 'Composer', dom.composer ? `ready · text ${Number(dom.composer_text_len || 0)} · attachments ${Array.isArray(dom.composer_attachments) ? dom.composer_attachments.length : 0}` : 'not observed');
         addDefinition(definitions, 'Active command', detail.active_command ? `${detail.active_command.action} · ${detail.active_command.state}` : 'none');
-        addDefinition(definitions, 'Transport', inventory.transport || 'userscript');
-        addDefinition(definitions, 'Flow', compactJson(detail.flow_status || {}, 600) || 'none');
 
         const projected = detail.responses || [];
         setText(byId('response-count'), projected.length);
-        if (!projected.length) responses.appendChild(textNode('div', 'No assistant responses retained for this role.', 'role-empty'));
+        if (!projected.length) responses.appendChild(textNode('div', 'No assistant response retained.', 'role-empty'));
         projected.forEach((response, index) => {
             const article = document.createElement('article');
             article.className = 'role-response';
@@ -1097,222 +867,164 @@
             article.appendChild(textNode('pre', response.text || '(empty response)'));
             responses.appendChild(article);
         });
-        if (focusNewestResponse) {
-            focusNewestResponse = false;
-            requestAnimationFrame(() => { responses.scrollTop = responses.scrollHeight; });
+        const followNewest = focusNewestResponse || responseWasNearBottom;
+        focusNewestResponse = false;
+        requestAnimationFrame(() => {
+            responses.scrollTop = followNewest ? responses.scrollHeight : previousResponseTop;
+        });
+    }
+
+    function flowStatusLine(flow) {
+        if (!flow) return 'none';
+        const state = String(flow.state || 'UNKNOWN').toUpperCase();
+        const logical = flow.logical_role || selectedRole || 'role';
+        if (state === 'RUNNING') return `${flow.from_role || 'User'} -> ${logical} · RUNNING`;
+        if (state === 'DONE') return `${logical}${flow.sent_to ? ` -> ${flow.sent_to}` : ''} · DONE`;
+        return `${logical} · ${state}`;
+    }
+
+    function flowEventView(event) {
+        const name = String(event?.event || 'EVENT').toUpperCase();
+        const inferred = name.startsWith('FLOW_') ? name.slice(5) : '';
+        const state = String(event?.state || inferred || (name.includes('FAILED') ? 'ERROR' : name === 'ASSISTANT_DONE' ? 'RESPONSE' : name === 'COMMAND_CREATED' ? 'COMMAND' : 'EVENT')).toUpperCase();
+        const logical = String(event?.logical_role || event?.role || 'role');
+        if (state === 'RUNNING') {
+            return { state, route: `${event?.from_role || 'User'} -> ${logical}`, summary: `${logical} is running` };
         }
+        if (state === 'DONE') {
+            const origin = event?.done_from ? ` · from ${event.done_from}` : '';
+            return { state, route: event?.sent_to ? `${logical} -> ${event.sent_to}` : logical, summary: `${logical} completed${origin}` };
+        }
+        if (state === 'WAITING') {
+            return { state, route: logical, summary: `${logical} is waiting` };
+        }
+        if (state === 'COMMAND') {
+            return { state, route: logical, summary: `${event?.action || 'browser command'} created` };
+        }
+        if (state === 'RESPONSE') {
+            return { state, route: logical, summary: 'Assistant response completed' };
+        }
+        return { state, route: logical, summary: String(event?.reason || event?.text || name).replaceAll('_', ' ') };
     }
 
     function renderEvents() {
+        const renderKey = timelineSignature();
+        if (renderKey === timelineRenderKey) return;
+        timelineRenderKey = renderKey;
         const container = byId('runtime-events');
+        const previousTimelineTop = container.scrollTop;
+        const timelineWasNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 32;
         clearNode(container);
         setText(byId('event-count'), lastGoodRoleEvents.length);
         if (!selectedRole) {
-            container.appendChild(textNode('div', 'Select an online role to inspect its timeline.', 'role-empty'));
+            container.appendChild(textNode('div', 'Select a role to inspect its flow.', 'role-empty'));
             return;
         }
         if (!lastGoodRoleEvents.length) {
-            container.appendChild(textNode('div', `No runtime events retained for ${selectedRole}.`, 'role-empty'));
+            container.appendChild(textNode('div', `No flow events retained for ${selectedRole}.`, 'role-empty'));
             return;
         }
-        for (const event of [...lastGoodRoleEvents].reverse()) {
+        for (const event of lastGoodRoleEvents) {
+            const view = flowEventView(event);
             const row = document.createElement('article');
-            row.className = 'runtime-event';
+            row.className = 'flow-line';
             row.appendChild(textNode('time', event.ts || ''));
-            row.appendChild(textNode('span', event.role || selectedRole, 'runtime-event-role'));
-            row.appendChild(textNode('span', event.event || 'EVENT', 'runtime-event-name'));
+            const state = textNode('span', view.state, 'role-state');
+            state.dataset.tone = stateTone(view.state);
+            row.appendChild(state);
+            row.appendChild(textNode('span', view.route, 'flow-route'));
+            row.appendChild(textNode('span', view.summary, 'flow-summary'));
             const evidence = { ...event };
             delete evidence.ts;
             delete evidence.role;
             delete evidence.event;
-            row.appendChild(textNode('span', compactJson(evidence), 'runtime-event-detail'));
+            if (Object.keys(evidence).length) {
+                const details = document.createElement('details');
+                details.className = 'flow-evidence';
+                details.appendChild(textNode('summary', 'Evidence'));
+                details.appendChild(textNode('pre', compactJson(evidence)));
+                row.appendChild(details);
+            }
             container.appendChild(row);
         }
+        requestAnimationFrame(() => {
+            container.scrollTop = timelineWasNearBottom ? container.scrollHeight : previousTimelineTop;
+        });
     }
 
     function renderHealth() {
         const root = byId('dashboard-root');
-        const stale = sourceStale.tasks || sourceStale.roles || sourceStale.flow || sourceStale.events;
+        const stale = sourceStale.roles || sourceStale.flow || sourceStale.events;
         root.dataset.stale = String(stale);
         const connection = byId('connection-health');
         connection.dataset.tone = stale ? 'warn' : 'good';
         setText(connection.querySelector('strong'), stale ? 'PARTIAL' : 'CONNECTED');
-        byId('connection-notice').hidden = !stale;
-        if (stale) setText(byId('connection-notice'), 'One or more data sources failed. Retaining last good task, role, flow, and event projections independently.');
-
-        const scheduler = byId('scheduler-health');
-        const running = Boolean(lastGoodScheduler?.running);
-        scheduler.dataset.tone = running ? 'good' : 'bad';
-        setText(scheduler.querySelector('strong'), running ? 'RUNNING' : 'STOPPED');
-        const schedulerError = byId('scheduler-error');
-        schedulerError.hidden = !lastGoodScheduler?.last_error;
-        if (lastGoodScheduler?.last_error) setText(schedulerError, `Scheduler error: ${lastGoodScheduler.last_error}`);
-        setText(byId('refresh-age'), lastSuccessfulAt ? `${Math.max(0, Math.floor((Date.now() - lastSuccessfulAt) / 1000))}s` : 'never');
+        const notice = byId('connection-notice');
+        notice.hidden = !stale;
+        if (stale) setText(notice, 'One or more runtime sources failed. Last good role/flow evidence is retained.');
 
         const flow = lastGoodFlow?.flow;
         const liveness = lastGoodFlow?.liveness;
-        const runnerHealth = byId('runner-health');
         const runner = liveness?.runner || {};
-        const terminalFlow = Boolean(flow?.terminal_status);
-        const runnerState = terminalFlow ? 'IDLE' : (runner.state || 'UNKNOWN');
-        const runnerHeartbeat = runner.last_heartbeat_age_s == null ? 'no heartbeat' : `${Math.round(runner.last_heartbeat_age_s)}s`;
-        const runnerPid = runner.pid == null ? '' : ` | PID ${runner.pid}`;
-        setText(runnerHealth.querySelector('strong'), `${runnerState}${runnerPid} | ${runnerHeartbeat}`);
-        runnerHealth.dataset.tone = terminalFlow || runnerState === 'RUNNING' ? 'good' : (runnerState === 'STOPPED' || liveness?.stalled ? 'bad' : 'warn');
-        runnerHealth.title = terminalFlow ? `Flow ${flow.terminal_status}; no runner expected` : `Runner ${runnerState}; heartbeat ${runnerHeartbeat}`;
+        const runnerHealth = byId('runner-health');
+        const terminal = Boolean(flow?.terminal_status);
+        const runnerState = terminal ? 'IDLE' : (runner.state || 'UNKNOWN');
+        const heartbeat = runner.last_heartbeat_age_s == null ? 'no heartbeat' : `${Math.round(runner.last_heartbeat_age_s)}s`;
+        setText(runnerHealth.querySelector('strong'), `${runnerState}${runner.pid == null ? '' : ` · PID ${runner.pid}`} · ${heartbeat}`);
+        runnerHealth.dataset.tone = terminal || runnerState === 'RUNNING' ? 'good' : (liveness?.stalled ? 'bad' : 'warn');
+        setText(byId('refresh-age'), lastSuccessfulAt ? `${Math.max(0, Math.floor((Date.now() - lastSuccessfulAt) / 1000))}s` : 'never');
 
         const stallNotice = byId('flow-stall-notice');
         if (liveness?.stalled) {
-            const runner = liveness.runner || {};
-            const command = liveness.last_command;
-            const heartbeat = runner.last_heartbeat_age_s == null ? 'never' : `${Math.round(runner.last_heartbeat_age_s)}s ago`;
-            const lines = [
-                `${liveness.logical_role || flow?.request_id || 'flow'} · STALLED`,
-                `Reason: ${liveness.reason || 'flow did not terminate'}`
-            ];
-            if (command) lines.push(`Last command: ${command.action} · ${command.state}${command.age_s == null ? '' : ` (${Math.round(command.age_s)}s)`}`);
-            lines.push(`Runner: ${runner.state || 'UNKNOWN'}`);
-            lines.push(`Last heartbeat: ${heartbeat}`);
-            lines.push(`Next action: ${liveness.next_action || 'recover existing flow'}`);
-            setText(stallNotice, lines.join('\n'));
+            setText(stallNotice, `${liveness.logical_role || 'flow'} · STALLED\n${liveness.reason || 'Flow did not terminate'}\nNext: ${liveness.next_action || 'recover existing flow'}`);
             stallNotice.hidden = false;
             root.dataset.stalled = 'true';
-            setText(byId('flow-summary'), `${liveness.logical_role || 'flow'} · STALLED — ${liveness.reason || 'flow did not terminate'}`);
+            setText(byId('flow-summary'), `${liveness.logical_role || 'flow'} · STALLED`);
         } else {
             stallNotice.hidden = true;
             root.dataset.stalled = 'false';
-            setText(byId('flow-summary'), flow ? `Active flow ${flow.request_id} · ${flow.run_id}` : 'No active durable flow');
+            setText(byId('flow-summary'), flow ? (terminal ? `Last flow ${flow.request_id} · ${String(flow.terminal_status).toUpperCase()}` : `Active flow ${flow.request_id} · ${flow.run_id}`) : 'No active flow');
         }
-    }
-
-    function updateFilterOptions() {
-        const update = (select, values, label) => {
-            const previous = select.value;
-            while (select.options.length > 1) select.remove(1);
-            for (const value of [...new Set(values.filter(Boolean))].sort()) select.appendChild(new Option(value, value));
-            select.value = [...select.options].some((option) => option.value === previous) ? previous : '';
-            select.options[0].textContent = label;
-        };
-        update(byId('filter-controller'), lastGoodTasks.map((task) => task.controller_role), 'All controllers');
-        update(byId('filter-repository'), lastGoodTasks.map((task) => task.target_root), 'All repositories');
-        update(byId('filter-status'), STATES, 'All states');
+        updateAgeLabels();
     }
 
     function renderDashboard() {
-        updateFilterOptions();
-        renderBoard();
         renderRoles();
         renderSelectedRole();
         renderEvents();
         renderHealth();
     }
 
-    async function refreshDashboard() {
-        if (refreshInFlight) return;
+    async function refreshDashboard(options) {
+        const forceRole = Boolean(options && options.forceRole);
+        if (refreshInFlight || (document.hidden && !forceRole)) return;
         refreshInFlight = true;
         try {
-            const results = await Promise.allSettled([fetchTasks(), fetchRoles(), fetchFlow()]);
-            const taskResult = results[0];
-            const roleResult = results[1];
-            const flowResult = results[2];
-            if (taskResult.status === 'fulfilled') {
-                lastGoodTaskMeta = taskResult.value;
-                lastGoodScheduler = taskResult.value.scheduler || lastGoodScheduler;
-                const loadError = taskResult.value.load_error;
-                byId('task-store-error').hidden = !loadError;
-                if (loadError) {
-                    sourceStale.tasks = true;
-                    setText(byId('task-store-error'), `Task store unavailable: ${loadError.message || loadError.code}. Retaining the last good task data.`);
-                } else {
-                    lastGoodTasks = taskResult.value.tasks || [];
-                    sourceStale.tasks = false;
-                }
-            } else sourceStale.tasks = true;
+            const [roleResult, flowResult] = await Promise.allSettled([fetchRoles(), fetchFlow()]);
             if (roleResult.status === 'fulfilled') {
                 lastGoodRoles = roleResult.value.roles || [];
                 sourceStale.roles = false;
-                const live = onlineRoles();
-                if (!live.some((role) => role.role === selectedRole)) {
-                    selectedRole = live[0]?.role || '';
+                const roles = visibleRoles();
+                if (!roles.some((role) => role.role === selectedRole)) {
+                    selectedRole = roles[0]?.role || '';
+                    selectedRoleRefreshGeneration += 1;
                     focusNewestResponse = true;
-                    lastGoodRoleDetail = null;
-                    lastGoodRoleEvents = [];
+                    if (!applyRoleCache(selectedRole)) {
+                        lastGoodRoleDetail = null;
+                        lastGoodRoleEvents = [];
+                    }
                 }
             } else sourceStale.roles = true;
             if (flowResult.status === 'fulfilled') {
                 lastGoodFlow = flowResult.value;
                 sourceStale.flow = false;
             } else sourceStale.flow = true;
-            await refreshSelectedRoleData();
-            if (results.some((result) => result.status === 'fulfilled')) lastSuccessfulAt = Date.now();
+            if (selectedRole) await refreshSelectedRoleData({ force: forceRole });
+            lastSuccessfulAt = Date.now();
         } finally {
             refreshInFlight = false;
             renderDashboard();
         }
-    }
-
-    function currentTaskOrThrow(taskId) {
-        const task = taskById(taskId);
-        if (!task) throw new Error(`Task is no longer available: ${taskId}`);
-        return task;
-    }
-
-    async function moveTask(taskId, destination) {
-        const task = currentTaskOrThrow(taskId);
-        const actorRole = ['RUNNING', 'REVIEW', 'DONE'].includes(destination) ? task.controller_role : '';
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/move`, {
-            method: 'POST',
-            body: JSON.stringify({ expected_revision: task.revision, status: destination, actor_role: actorRole })
-        });
-    }
-    async function wakeTask(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/wake`, {
-            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
-        });
-    }
-    async function pauseTask(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/pause`, {
-            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
-        });
-    }
-    async function resumeTask(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}/resume`, {
-            method: 'POST', body: JSON.stringify({ expected_revision: task.revision })
-        });
-    }
-    async function archiveTask(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
-            method: 'PATCH', body: JSON.stringify({ expected_revision: task.revision, changes: { archived: true } })
-        });
-    }
-    async function resolveWake(taskId, resolution) {
-        const task = currentTaskOrThrow(taskId);
-        await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
-            method: 'PATCH',
-            body: JSON.stringify({ expected_revision: task.revision, changes: {}, actor_role: task.controller_role, wake_resolution: resolution })
-        });
-    }
-
-    function scheduleFromForm() {
-        const kind = byId('task-schedule-kind').value;
-        if (kind === 'manual') return { kind: 'manual' };
-        if (kind === 'once') return { kind: 'once', run_at: isoFromLocal(byId('task-run-at').value) };
-        if (kind === 'interval') {
-            const schedule = { kind: 'interval', minutes: Number(byId('task-minutes').value) };
-            const start = byId('task-start-at').value;
-            if (start) schedule.start_at = isoFromLocal(start);
-            return schedule;
-        }
-        return { kind: 'cron', expression: byId('task-cron').value.trim(), timezone: byId('task-timezone').value.trim() };
-    }
-
-    function updateScheduleFields() {
-        const kind = byId('task-schedule-kind').value;
-        for (const field of document.querySelectorAll('[data-schedule-field]')) field.hidden = field.dataset.scheduleField !== kind;
     }
 
     function logicalChoices() {
@@ -1328,11 +1040,10 @@
         return [...new Set(onlineRoles().map((role) => role.role).filter(Boolean))];
     }
 
-    function validateOnlineTaskTargets(controllerRole, roleMap, onlineRoleNames) {
+    function validateOnlineTaskTargets(roleMap, onlineRoleNames) {
         const online = new Set(onlineRoleNames);
-        if (!online.has(controllerRole)) throw new Error(`Controller role ${controllerRole || '<empty>'} is offline; select an online physical role.`);
         for (const [logicalRole, physicalRole] of Object.entries(roleMap)) {
-            if (!online.has(physicalRole)) throw new Error(`${logicalRole} maps to ${physicalRole || '<empty>'}, which is offline; remap it to an online physical role.`);
+            if (!online.has(physicalRole)) throw new Error(`${logicalRole} maps to ${physicalRole || '<empty>'}, which is offline.`);
         }
     }
 
@@ -1386,9 +1097,7 @@
             request_timeout: Number(byId('task-request-timeout').value),
             parallelism: Number(byId('task-parallelism').value),
             max_turns: Number(byId('task-max-turns').value),
-            reload_after: Number(byId('task-reload-after').value),
-            new_chat_on_handoff: editorBehavior.newChat,
-            handoff_command_policy: editorBehavior.handoffAlways ? 'always' : 'auto'
+            reload_after: Number(byId('task-reload-after').value)
         };
         for (const name of ['timeout', 'request_timeout', 'reload_after']) {
             if (!Number.isFinite(options[name])) throw new Error(`${name} must be a finite number.`);
@@ -1405,12 +1114,10 @@
     }
 
     function buildMainCommand(logicalRoles, roleMap, finishRoles, options, prompt) {
-        const policy = String(options.handoff_command_policy || '').toLowerCase();
-        if (!['auto', 'always'].includes(policy)) throw new Error('handoff_command_policy must be auto or always.');
         const physicalRoles = [...new Set(logicalRoles.map((role) => roleMap[role]).filter(Boolean))];
         const roleMapText = logicalRoles.map((role) => `${role}=${roleMap[role] || ''}`).join(' ');
-        const parts = [
-            'uv run python main.py',
+        return [
+            'uv run main.py',
             `--role ${quoteCli(logicalRoles.join(','))}`,
             `--browser-roles ${quoteCli(physicalRoles.join(','))}`,
             `--role-map ${quoteCli(roleMapText)}`,
@@ -1419,26 +1126,40 @@
             `--request-timeout ${commandNumber(options.request_timeout)}`,
             `--parallelism ${options.parallelism}`,
             `--max-turns ${options.max_turns}`,
-            `--reload-after ${commandNumber(options.reload_after)}`
-        ];
-        if (options.new_chat_on_handoff) parts.push('--new-chat-on-handoff');
-        if (policy === 'always') parts.push('--handoff-command-policy always');
-        parts.push(`--goal ${quoteCli(prompt || '<task prompt>')}`);
-        return parts.join(' ');
+            `--reload-after ${commandNumber(options.reload_after)}`,
+            `--goal ${quoteCli(prompt || '<task prompt>')}`
+        ].join(' ');
+    }
+
+    function buildRoleCommand(logicalRoles, roleMap, options, prompt) {
+        const role = roleMap[logicalRoles[0]] || '';
+        return [
+            'uv run role.py',
+            `--role ${quoteCli(role)}`,
+            `--timeout ${commandNumber(options.timeout)}`,
+            `--request-timeout ${commandNumber(options.request_timeout)}`,
+            `--prompt ${quoteCli(prompt || '<task prompt>')}`
+        ].join(' ');
+    }
+
+    function buildLaunchCommand(logicalRoles, roleMap, finishRoles, options, prompt) {
+        return logicalRoles.length === 1
+            ? buildRoleCommand(logicalRoles, roleMap, options, prompt)
+            : buildMainCommand(logicalRoles, roleMap, finishRoles, options, prompt);
     }
 
     function addLogicalRole(roleName) {
-        const normalized = String(roleName || '').trim().toUpperCase();
-        if (!normalized || editorLogicalOrder.includes(normalized)) return;
-        editorLogicalOrder.push(normalized);
-        editorRoleMap[normalized] = defaultPhysicalFor(normalized);
-        renderWorkflowEditor();
+        const role = String(roleName || '').trim().toUpperCase();
+        if (!role || editorLogicalOrder.includes(role)) return;
+        editorLogicalOrder.push(role);
+        editorRoleMap[role] = defaultPhysicalFor(role);
+        renderTaskComposer();
     }
 
     function removeLogicalRole(roleName) {
         editorLogicalOrder = editorLogicalOrder.filter((role) => role !== roleName);
         delete editorRoleMap[roleName];
-        renderWorkflowEditor();
+        renderTaskComposer();
     }
 
     function moveLogicalRole(roleName, delta) {
@@ -1446,21 +1167,10 @@
         const destination = index + delta;
         if (index < 0 || destination < 0 || destination >= editorLogicalOrder.length) return;
         [editorLogicalOrder[index], editorLogicalOrder[destination]] = [editorLogicalOrder[destination], editorLogicalOrder[index]];
-        renderWorkflowEditor();
+        renderTaskComposer();
     }
 
-    function mapLogicalRole(roleName, physicalRole) {
-        editorRoleMap[roleName] = physicalRole;
-        renderWorkflowEditor();
-    }
-
-    function setToggle(button, active) {
-        button.classList.toggle('selected', active);
-        button.setAttribute('aria-pressed', String(active));
-        setText(button, active ? 'ON' : 'OFF');
-    }
-
-    function renderWorkflowEditor() {
+    function renderTaskComposer() {
         const order = byId('task-logical-order');
         const available = byId('task-logical-available');
         const targets = byId('task-browser-targets');
@@ -1469,27 +1179,6 @@
         clearNode(available);
         clearNode(targets);
         clearNode(mapping);
-
-        const liveTargets = editorPhysicalTargets();
-        const controller = byId('task-controller');
-        clearNode(controller);
-        if (editorControllerRole && !liveTargets.includes(editorControllerRole)) {
-            const stale = new Option(`${editorControllerRole} — offline, select a replacement`, editorControllerRole);
-            stale.disabled = true;
-            stale.selected = true;
-            controller.appendChild(stale);
-        }
-        for (const roleName of liveTargets) controller.appendChild(new Option(roleName, roleName));
-        if (!editorControllerRole && liveTargets.length) editorControllerRole = liveTargets[0];
-        if (!controller.firstChild) {
-            const unavailable = new Option('No online physical roles', '');
-            unavailable.disabled = true;
-            unavailable.selected = true;
-            controller.appendChild(unavailable);
-        } else {
-            controller.value = editorControllerRole;
-        }
-        controller.dataset.invalid = String(!liveTargets.includes(editorControllerRole));
 
         editorLogicalOrder.forEach((roleName, index) => {
             const chip = document.createElement('span');
@@ -1517,68 +1206,57 @@
             button.addEventListener('click', () => addLogicalRole(roleName));
             available.appendChild(button);
         });
-        if (!available.firstChild) available.appendChild(textNode('span', 'All available roles selected.', 'role-empty'));
 
+        const liveTargets = editorPhysicalTargets();
         liveTargets.forEach((roleName) => {
             const chip = textNode('span', `${roleName} · online`, 'role-chip');
             chip.dataset.source = 'true';
             targets.appendChild(chip);
         });
-        if (!targets.firstChild) targets.appendChild(textNode('span', 'No online browser targets.', 'role-empty'));
+        if (!targets.firstChild) targets.appendChild(textNode('span', 'No online browser target.', 'role-empty'));
 
-        const physicalTargets = liveTargets;
+        document.querySelectorAll('.multi-role-option').forEach((field) => {
+            field.hidden = editorLogicalOrder.length === 1;
+        });
+
         editorLogicalOrder.forEach((roleName) => {
             if (!editorRoleMap[roleName]) editorRoleMap[roleName] = defaultPhysicalFor(roleName);
-            const currentPhysical = editorRoleMap[roleName] || '';
-            const validPhysical = physicalTargets.includes(currentPhysical);
+            const current = editorRoleMap[roleName] || '';
             const row = document.createElement('div');
             row.className = 'mapping-row';
-            row.dataset.invalid = String(!validPhysical);
             row.appendChild(textNode('span', roleName));
             row.appendChild(textNode('span', '→', 'arrow'));
             const select = document.createElement('select');
-            select.setAttribute('aria-label', `Map ${roleName} to physical browser role`);
-            if (currentPhysical && !validPhysical) {
-                const stale = new Option(`${currentPhysical} — offline, remap required`, currentPhysical);
+            select.setAttribute('aria-label', `Map ${roleName} to browser role`);
+            if (current && !liveTargets.includes(current)) {
+                const stale = new Option(`${current} - offline`, current);
                 stale.disabled = true;
                 stale.selected = true;
                 select.appendChild(stale);
             }
-            physicalTargets.forEach((physicalRole) => select.appendChild(new Option(physicalRole, physicalRole)));
-            if (!select.firstChild) {
-                const unavailable = new Option('No online physical roles', '');
-                unavailable.disabled = true;
-                unavailable.selected = true;
-                select.appendChild(unavailable);
-            } else {
-                select.value = currentPhysical;
-            }
-            select.dataset.invalid = String(!validPhysical);
-            select.addEventListener('change', () => mapLogicalRole(roleName, select.value));
+            liveTargets.forEach((physicalRole) => select.appendChild(new Option(physicalRole, physicalRole)));
+            if (select.options.length) select.value = current;
+            select.addEventListener('change', () => { editorRoleMap[roleName] = select.value; updateCommandPreview(); });
             row.appendChild(select);
             mapping.appendChild(row);
         });
-
-        setToggle(byId('task-new-chat'), editorBehavior.newChat);
-        setToggle(byId('task-handoff-always'), editorBehavior.handoffAlways);
         updateCommandPreview();
     }
 
     function updateCommandPreview() {
         try {
-            const previewMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
-            validateOnlineTaskTargets(editorControllerRole, previewMap, editorPhysicalTargets());
-            const options = executionOptionsFromForm();
-            const finishRoles = deriveFinishRoles(editorLogicalOrder);
-            setText(byId('task-command-preview'), buildMainCommand(
+            if (!editorLogicalOrder.length) throw new Error('Select at least one logical role.');
+            const roleMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
+            validateOnlineTaskTargets(roleMap, editorPhysicalTargets());
+            setText(byId('task-command-preview'), buildLaunchCommand(
                 editorLogicalOrder,
-                previewMap,
-                finishRoles,
-                options,
+                roleMap,
+                deriveFinishRoles(editorLogicalOrder),
+                executionOptionsFromForm(),
                 byId('task-prompt').value.trim()
             ));
         } catch (error) {
-            setText(byId('task-command-preview'), `Invalid execution options: ${error.message}`);
+            setText(byId('task-command-preview'), `Invalid command: ${error.message}`);
         }
     }
 
@@ -1608,252 +1286,79 @@
         });
     }
 
-    function resetEditor(originRole = '') {
-        byId('task-form').reset();
-        byId('task-id').value = '';
-        byId('task-revision').value = '';
-        byId('task-status').disabled = false;
-        byId('task-enabled').checked = true;
+    function openTaskComposer(originRole) {
         editorOriginRole = String(originRole || '').trim().toUpperCase();
-        if (!onlineRoles().some((role) => role.role === editorOriginRole)) editorOriginRole = onlineRoles()[0]?.role || '';
-        const origin = roleByName(editorOriginRole);
-        const initialLogical = origin?.configured_role || editorOriginRole || BASE_LOGICAL_ROLES[0];
+        const initialLogical = editorOriginRole || BASE_LOGICAL_ROLES[0];
         editorLogicalOrder = initialLogical ? [initialLogical] : [];
         editorRoleMap = initialLogical ? { [initialLogical]: defaultPhysicalFor(initialLogical) } : {};
-        editorBehavior = { newChat: false, handoffAlways: false };
-        editorControllerRole = editorOriginRole;
+        byId('task-prompt').value = '';
         byId('task-timeout').value = DEFAULT_EXECUTION_OPTIONS.timeout;
         byId('task-request-timeout').value = DEFAULT_EXECUTION_OPTIONS.request_timeout;
         byId('task-parallelism').value = DEFAULT_EXECUTION_OPTIONS.parallelism;
         byId('task-max-turns').value = DEFAULT_EXECUTION_OPTIONS.max_turns;
         byId('task-reload-after').value = DEFAULT_EXECUTION_OPTIONS.reload_after;
-        byId('task-schedule-kind').value = 'manual';
-        byId('task-result-status').value = '';
-        byId('task-result-summary').value = '';
-        byId('task-blocker').value = '';
         byId('prompt-samples').hidden = true;
-        for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = true;
-        byId('task-advanced').open = true;
-        byId('task-scheduling').open = false;
-        byId('task-results').open = false;
-        updateScheduleFields();
-        renderWorkflowEditor();
-        renderPromptSamples();
-        autoSizePrompt();
-    }
-
-    function openNewTask(originRole = '') {
-        resetEditor(originRole);
-        setText(byId('task-dialog-title'), editorOriginRole ? `Create task from ${editorOriginRole}` : 'Create task');
-        byId('task-dialog').showModal();
-        requestAnimationFrame(autoSizePrompt);
-        byId('task-title').focus();
-    }
-
-    function openEditor(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        resetEditor(task.controller_role);
-        setText(byId('task-dialog-title'), 'Edit task');
-        for (const field of document.querySelectorAll('[data-edit-only]')) field.hidden = false;
-        byId('task-id').value = task.task_id;
-        byId('task-revision').value = task.revision;
-        byId('task-title').value = task.title;
-        byId('task-root').value = task.target_root;
-        byId('task-branch').value = task.branch;
-        editorControllerRole = task.controller_role;
-        byId('task-status').value = task.status;
-        byId('task-status').disabled = true;
-        byId('task-prompt').value = task.prompt;
-        editorOriginRole = task.controller_role;
-        editorLogicalOrder = [...task.logical_roles];
-        editorRoleMap = { ...task.physical_role_map };
-        const options = { ...DEFAULT_EXECUTION_OPTIONS, ...(task.execution_options || {}) };
-        editorBehavior = {
-            newChat: options.new_chat_on_handoff === true,
-            handoffAlways: options.handoff_command_policy === 'always'
-        };
-        byId('task-timeout').value = options.timeout;
-        byId('task-request-timeout').value = options.request_timeout;
-        byId('task-parallelism').value = options.parallelism;
-        byId('task-max-turns').value = options.max_turns;
-        byId('task-reload-after').value = options.reload_after;
-        byId('task-enabled').checked = task.enabled;
-        const schedule = task.schedule || { kind: 'manual' };
-        byId('task-schedule-kind').value = schedule.kind;
-        byId('task-run-at').value = localFromIso(schedule.run_at);
-        byId('task-minutes').value = schedule.minutes || 15;
-        byId('task-start-at').value = localFromIso(schedule.start_at);
-        byId('task-cron').value = schedule.expression || '0 9 * * 1-5';
-        byId('task-timezone').value = schedule.timezone || 'Asia/Tokyo';
-        byId('task-result-status').value = task.last_result_status || '';
-        byId('task-result-summary').value = task.last_result_summary || '';
-        byId('task-blocker').value = task.blocker || '';
-        updateScheduleFields();
-        renderWorkflowEditor();
+        setText(byId('task-status'), '');
+        setText(byId('task-dialog-title'), `Create task from ${editorOriginRole || initialLogical}`);
+        renderTaskComposer();
         autoSizePrompt();
         byId('task-dialog').showModal();
-        requestAnimationFrame(autoSizePrompt);
-        byId('task-title').focus();
+        requestAnimationFrame(() => byId('task-prompt').focus());
     }
 
-    async function saveEditor(event) {
-        event.preventDefault();
-        const taskId = byId('task-id').value;
-        if (!editorLogicalOrder.length) {
-            announceError('Select at least one logical role.');
-            return;
+    function taskLaunchPayload() {
+        const prompt = byId('task-prompt').value.trim();
+        if (!prompt) throw new Error('Task prompt is required.');
+        if (!editorOriginRole || !editorPhysicalTargets().includes(editorOriginRole)) {
+            throw new Error(`Controller ${editorOriginRole || '<empty>'} is offline.`);
         }
-
-        let freshRolePayload;
-        try {
-            freshRolePayload = await fetchRoles();
-        } catch (error) {
-            announceError(`Cannot verify online physical roles before save: ${error.message}`);
-            return;
-        }
-        lastGoodRoles = Array.isArray(freshRolePayload.roles) ? freshRolePayload.roles : [];
-        sourceStale.roles = false;
-        renderWorkflowEditor();
-        const onlineRoleNames = editorPhysicalTargets();
-        const controllerRole = String(editorControllerRole || '').trim().toUpperCase();
-        const roleMap = {};
-        for (const logicalRole of editorLogicalOrder) {
-            roleMap[logicalRole] = String(editorRoleMap[logicalRole] || '').trim().toUpperCase();
-        }
-        try {
-            validateOnlineTaskTargets(controllerRole, roleMap, onlineRoleNames);
-        } catch (error) {
-            announceError(error.message);
-            return;
-        }
-
-        let executionOptions;
-        try {
-            executionOptions = executionOptionsFromForm();
-        } catch (error) {
-            announceError(error.message);
-            return;
-        }
-        const values = {
-            title: byId('task-title').value.trim(),
-            target_root: byId('task-root').value.trim(),
-            branch: byId('task-branch').value.trim(),
-            prompt: byId('task-prompt').value.trim(),
-            controller_role: controllerRole,
+        if (!editorLogicalOrder.length) throw new Error('Select at least one logical role.');
+        const roleMap = Object.fromEntries(editorLogicalOrder.map((role) => [role, editorRoleMap[role] || '']));
+        validateOnlineTaskTargets(roleMap, editorPhysicalTargets());
+        return {
+            controller_role: editorOriginRole,
+            prompt,
             logical_roles: [...editorLogicalOrder],
             physical_role_map: roleMap,
             finish_roles: deriveFinishRoles(editorLogicalOrder),
-            execution_options: executionOptions,
-            enabled: byId('task-enabled').checked,
-            schedule: scheduleFromForm()
+            execution_options: executionOptionsFromForm()
         };
+    }
+
+    async function submitTask(event) {
+        event.preventDefault();
+        const createButton = byId('create-task');
         try {
-            if (!taskId) {
-                const createValues = { ...values, skill_path: 'skills/ORCHESTRATOR.md', status: byId('task-status').value };
-                await mutate('/api/admin/tasks', { method: 'POST', body: JSON.stringify(createValues) });
-            } else {
-                const current = currentTaskOrThrow(taskId);
-                const candidates = {
-                    ...values,
-                    last_result_status: byId('task-result-status').value.trim(),
-                    last_result_summary: byId('task-result-summary').value.trim(),
-                    blocker: byId('task-blocker').value.trim()
-                };
-                const changes = {};
-                for (const [key, value] of Object.entries(candidates)) {
-                    if (JSON.stringify(value) !== JSON.stringify(current[key] ?? (key === 'last_result_status' ? '' : current[key]))) changes[key] = value;
-                }
-                if (!Object.keys(changes).length) {
-                    byId('task-dialog').close();
-                    return;
-                }
-                const executionKeys = ['last_result_status', 'last_result_summary', 'blocker'];
-                const actorRole = executionKeys.some((key) => Object.hasOwn(changes, key)) ? current.controller_role : '';
-                await mutate(`/api/admin/tasks/${encodeURIComponent(taskId)}`, {
-                    method: 'PATCH',
-                    body: JSON.stringify({ expected_revision: Number(byId('task-revision').value), changes, actor_role: actorRole })
-                });
+            const payload = taskLaunchPayload();
+            createButton.disabled = true;
+            setText(byId('task-status'), 'Creating...');
+            const body = await readJson(await fetch('/api/admin/tasks/launch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }));
+            const run = body.run;
+            if (!run?.run_id || !Number(run.pid)) {
+                throw new Error('Server did not confirm a launched runner process.');
             }
+            roleDataCache.delete(editorOriginRole);
             byId('task-dialog').close();
+            showRoleNotice(`${editorOriginRole}: run ${run.run_id} started (PID ${run.pid}).`);
+            await refreshDashboard({ forceRole: true });
         } catch (error) {
-            if (!error.conflict) announceError(error.message);
-        }
-    }
-
-    function detailBlock(title, value) {
-        const block = document.createElement('section');
-        block.className = 'detail-block';
-        block.appendChild(textNode('h3', title));
-        block.appendChild(textNode('pre', value));
-        return block;
-    }
-
-    function openDetails(taskId) {
-        const task = currentTaskOrThrow(taskId);
-        setText(byId('task-detail-title'), task.title);
-        const body = byId('task-detail-body');
-        clearNode(body);
-        body.appendChild(detailBlock('Task', `${task.task_id}\nrevision ${task.revision}\nstate ${task.status}\ncontroller ${task.controller_role}`));
-        body.appendChild(detailBlock('Target', `${task.target_root}\n${task.branch}`));
-        body.appendChild(detailBlock('Objective', task.prompt));
-        body.appendChild(detailBlock('Roles', `logical: ${task.logical_roles.join(', ')}\nphysical: ${JSON.stringify(task.physical_role_map, null, 2)}\nfinish: ${task.finish_roles.join(', ')}`));
-        body.appendChild(detailBlock('Schedule', `${JSON.stringify(task.schedule, null, 2)}\nnext: ${task.next_run_at || 'none'}\nenabled: ${task.enabled}`));
-        body.appendChild(detailBlock('Execution options', `${JSON.stringify(task.execution_options, null, 2)}\n\n${buildMainCommand(task.logical_roles, task.physical_role_map, task.finish_roles, task.execution_options || DEFAULT_EXECUTION_OPTIONS, task.prompt)}`));
-        body.appendChild(detailBlock('Requests and result', `active: ${task.active_request_id || 'none'}\nlast: ${task.last_request_id || 'none'}\nstatus: ${task.last_result_status || 'none'}\nsummary: ${task.last_result_summary || 'none'}\nblocker: ${task.blocker || 'none'}`));
-        body.appendChild(detailBlock('Wake', JSON.stringify(task.wake, null, 2)));
-        const seam = [`transport: ${task.transport || 'userscript'}`];
-        if (task.external_target) seam.push(`external_target: ${JSON.stringify(task.external_target, null, 2)}`);
-        body.appendChild(detailBlock('Target seam', seam.join('\n')));
-        const events = document.createElement('section');
-        events.className = 'detail-block field-wide';
-        events.appendChild(textNode('h3', 'Recent events'));
-        const list = document.createElement('div');
-        list.className = 'event-list';
-        for (const event of task.events || []) list.appendChild(textNode('div', `${event.timestamp} · ${event.type}\n${event.summary}`, 'event-row'));
-        if (!list.firstChild) list.appendChild(textNode('div', 'No task events', 'event-row'));
-        events.appendChild(list);
-        body.appendChild(events);
-        byId('task-detail').showModal();
-    }
-
-    function installDropTargets() {
-        for (const target of document.querySelectorAll('[data-drop-state]')) {
-            target.addEventListener('dragover', (event) => {
-                event.preventDefault();
-                target.dataset.dragOver = 'true';
-                event.dataTransfer.dropEffect = 'move';
-            });
-            target.addEventListener('dragleave', () => { target.dataset.dragOver = 'false'; });
-            target.addEventListener('drop', (event) => {
-                event.preventDefault();
-                target.dataset.dragOver = 'false';
-                const taskId = event.dataTransfer.getData('text/plain') || draggedTaskId;
-                const task = taskById(taskId);
-                const destination = target.dataset.dropState;
-                if (task && destination !== task.status && (MOVE_MATRIX[task.status] || []).includes(destination)) moveTask(taskId, destination);
-            });
+            const message = error.status === 405
+                ? 'Task launch route is not active. Restart Tampermonkey-Auto, then retry.'
+                : error.message;
+            setText(byId('task-status'), `Create failed: ${message}`);
+        } finally {
+            createButton.disabled = false;
         }
     }
 
     function installEvents() {
-        byId('create-task').addEventListener('click', () => openNewTask());
-        byId('task-form').addEventListener('submit', saveEditor);
-        byId('task-schedule-kind').addEventListener('change', updateScheduleFields);
-        byId('task-controller').addEventListener('change', () => {
-            editorControllerRole = byId('task-controller').value.trim().toUpperCase();
-            updateCommandPreview();
-        });
         byId('toggle-prompt-samples').addEventListener('click', () => {
             const samples = byId('prompt-samples');
             samples.hidden = !samples.hidden;
-        });
-        byId('task-new-chat').addEventListener('click', () => {
-            editorBehavior.newChat = !editorBehavior.newChat;
-            renderWorkflowEditor();
-        });
-        byId('task-handoff-always').addEventListener('click', () => {
-            editorBehavior.handoffAlways = !editorBehavior.handoffAlways;
-            renderWorkflowEditor();
         });
         byId('task-prompt').addEventListener('input', () => {
             autoSizePrompt();
@@ -1863,21 +1368,22 @@
             byId(id).addEventListener('input', updateCommandPreview);
             byId(id).addEventListener('change', updateCommandPreview);
         }
+        byId('task-form').addEventListener('submit', submitTask);
         for (const button of document.querySelectorAll('[data-close-dialog]')) {
             button.addEventListener('click', () => byId(button.dataset.closeDialog).close());
         }
-        for (const filter of document.querySelectorAll('.filters input, .filters select')) {
-            filter.addEventListener('input', renderBoard);
-            filter.addEventListener('change', renderBoard);
-        }
         renderPromptSamples();
-        installDropTargets();
     }
 
     installEvents();
-    refreshDashboard();
-    setInterval(refreshDashboard, 2000);
+    refreshDashboard({ forceRole: true });
+    setInterval(() => {
+        if (!document.hidden) refreshDashboard();
+    }, 2000);
     setInterval(renderHealth, 1000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshDashboard({ forceRole: true });
+    });
 })();
 </script>
 </body>
